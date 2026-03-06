@@ -5,6 +5,8 @@ A terminal-based BitTorrent client built with Rust.
 ![Rust](https://img.shields.io/badge/language-Rust-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
+![demo](assets/demo.gif)
+
 ## Features
 
 - **Magnet link & .torrent file support** — add torrents via magnet links or local `.torrent` files
