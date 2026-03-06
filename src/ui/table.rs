@@ -12,7 +12,14 @@ use crate::ui::layout::{format_eta, format_size, format_speed};
 use crate::ui::progress::{progress_color, render_progress_bar, SPINNER_FRAMES};
 
 const HEADER_LABELS: [&str; 8] = [
-    "#", "Name", "Size", "Progress", "\u{2193} Speed", "Peers", "ETA", "Status",
+    "#",
+    "Name",
+    "Size",
+    "Progress",
+    "\u{2193} Speed",
+    "Peers",
+    "ETA",
+    "Status",
 ];
 
 pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -73,10 +80,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             };
 
             let (status_text, status_style) = if torrent.throttle_paused {
-                (
-                    "Throttled".to_string(),
-                    Style::default().fg(Color::Cyan),
-                )
+                ("Throttled".to_string(), Style::default().fg(Color::Cyan))
             } else {
                 (
                     torrent.status.to_string(),

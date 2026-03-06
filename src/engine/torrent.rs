@@ -16,11 +16,20 @@ pub enum EngineCommand {
     AddTorrent(String),
     Pause(usize),
     Resume(usize),
-    Delete { id: usize, delete_files: bool },
+    Delete {
+        id: usize,
+        delete_files: bool,
+    },
     PauseAll,
     ResumeAll,
-    SetSpeedLimits { download_kbps: u64, upload_kbps: u64 },
-    SetSelectedFiles { id: usize, file_indices: Vec<usize> },
+    SetSpeedLimits {
+        download_kbps: u64,
+        upload_kbps: u64,
+    },
+    SetSelectedFiles {
+        id: usize,
+        file_indices: Vec<usize>,
+    },
     Shutdown,
 }
 
@@ -47,10 +56,7 @@ impl TorrentEngine {
         Ok(Self { session })
     }
 
-    pub async fn add_torrent(
-        &self,
-        source: &str,
-    ) -> Result<(usize, ManagedTorrentHandle, bool)> {
+    pub async fn add_torrent(&self, source: &str) -> Result<(usize, ManagedTorrentHandle, bool)> {
         let source = source.trim();
         let add_torrent = if source.starts_with("magnet:") {
             AddTorrent::from_url(source)
@@ -63,9 +69,7 @@ impl TorrentEngine {
         let response = self.session.add_torrent(add_torrent, None).await?;
 
         match response {
-            AddTorrentResponse::Added(id, handle) => {
-                Ok((id, handle, false))
-            }
+            AddTorrentResponse::Added(id, handle) => Ok((id, handle, false)),
             AddTorrentResponse::AlreadyManaged(id, handle) => Ok((id, handle, true)),
             AddTorrentResponse::ListOnly(_) => {
                 anyhow::bail!("Torrent was list-only")
@@ -224,6 +228,7 @@ pub async fn run_engine(
     // Per-torrent last state change time to prevent rapid oscillation
     let mut per_torrent_last_change: HashMap<usize, std::time::Instant> = HashMap::new();
 
+    #[allow(clippy::too_many_arguments)]
     async fn push_state(
         engine: &TorrentEngine,
         state_tx: &mpsc::Sender<Vec<TorrentInfo>>,
@@ -249,7 +254,9 @@ pub async fn run_engine(
         for t in &mut torrents {
             if matches!(t.status, TorrentStatus::Complete) && !finished_set.contains(&t.id) {
                 finished_set.insert(t.id);
-                let _ = msg_tx.send(format!("\u{2713} \"{}\" complete", t.name)).await;
+                let _ = msg_tx
+                    .send(format!("\u{2713} \"{}\" complete", t.name))
+                    .await;
                 eprint!("\x07");
             }
             // Show stable "Throttled" for all managed torrents (even during active bursts)
@@ -514,7 +521,7 @@ pub async fn run_engine(
                             // Minimum 1 second between state changes per torrent
                             let can_change = per_torrent_last_change
                                 .get(&t.id)
-                                .map_or(true, |lc| now.duration_since(*lc).as_millis() >= 1000);
+                                .is_none_or(|lc| now.duration_since(*lc).as_millis() >= 1000);
 
                             if *tokens < 0 {
                                 // This torrent exceeded its share, pause it
@@ -533,13 +540,12 @@ pub async fn run_engine(
                                 if can_change
                                     && (throttle_paused.contains(&t.id)
                                         || matches!(t.status, TorrentStatus::Paused))
+                                    && !user_paused.contains(&t.id)
                                 {
-                                    if !user_paused.contains(&t.id) {
-                                        if let Some(handle) = engine.get_handle(t.id) {
-                                            let _ = engine.unpause(&handle).await;
-                                            throttle_paused.remove(&t.id);
-                                            per_torrent_last_change.insert(t.id, now);
-                                        }
+                                    if let Some(handle) = engine.get_handle(t.id) {
+                                        let _ = engine.unpause(&handle).await;
+                                        throttle_paused.remove(&t.id);
+                                        per_torrent_last_change.insert(t.id, now);
                                     }
                                 }
                             }

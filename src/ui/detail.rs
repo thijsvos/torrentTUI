@@ -184,10 +184,7 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
         };
 
         lines.push(Line::from(vec![
-            Span::styled(
-                if is_highlighted { "> " } else { "  " },
-                highlight_style,
-            ),
+            Span::styled(if is_highlighted { "> " } else { "  " }, highlight_style),
             Span::styled(format!("{} ", checkbox), checkbox_style),
             Span::styled(format!("{:<45}", truncate(&file.name, 45)), file_style),
             Span::styled(format!("{:>10}", format_size(file.size_bytes)), file_style),

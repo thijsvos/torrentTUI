@@ -10,7 +10,10 @@ use anyhow::Result;
 use app::App;
 use clap::Parser;
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -70,7 +73,11 @@ async fn main() -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     if let Err(e) = result {
@@ -100,9 +107,7 @@ async fn run_app(
     // Spawn engine
     let engine_config = config.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx).await
-        {
+        if let Err(e) = engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx).await {
             tracing::error!("Engine error: {}", e);
         }
     });
@@ -310,9 +315,7 @@ async fn handle_normal_mode(
 ) {
     match key.code {
         KeyCode::Char('q') => {
-            {
-                app.mode = AppMode::ConfirmQuit;
-            }
+            app.mode = AppMode::ConfirmQuit;
         }
         KeyCode::Char('j') | KeyCode::Down => app.next(),
         KeyCode::Char('k') | KeyCode::Up => app.previous(),
@@ -452,8 +455,7 @@ async fn handle_detail_mode(
                 if let Some(torrent) = app.selected_torrent() {
                     let file_count = torrent.files.len();
                     if file_count > 0 {
-                        app.detail_file_index =
-                            (app.detail_file_index + 1).min(file_count - 1);
+                        app.detail_file_index = (app.detail_file_index + 1).min(file_count - 1);
                     }
                 }
             }

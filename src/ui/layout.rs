@@ -87,12 +87,10 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Build right-aligned speed section
-    let mut right_spans = vec![
-        Span::styled(
-            format!("\u{2193} {}", down_speed),
-            Style::default().fg(Color::Green),
-        ),
-    ];
+    let mut right_spans = vec![Span::styled(
+        format!("\u{2193} {}", down_speed),
+        Style::default().fg(Color::Green),
+    )];
     if app.speed_limit_download_kbps > 0 {
         right_spans.push(Span::styled(
             format!(" [{}]", format_speed(app.speed_limit_download_kbps * 1024)),
@@ -112,10 +110,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     }
 
     // Calculate width of speed section for the right column
-    let right_text_width: u16 = right_spans
-        .iter()
-        .map(|s| s.content.len() as u16)
-        .sum();
+    let right_text_width: u16 = right_spans.iter().map(|s| s.content.len() as u16).sum();
 
     // Build left section: hints, counts, disk, filter
     let mut left_spans = vec![
@@ -152,15 +147,12 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(right_text_width),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(right_text_width)])
         .split(inner);
 
     let left_widget = Paragraph::new(Line::from(left_spans));
-    let right_widget = Paragraph::new(Line::from(right_spans))
-        .alignment(ratatui::layout::Alignment::Right);
+    let right_widget =
+        Paragraph::new(Line::from(right_spans)).alignment(ratatui::layout::Alignment::Right);
 
     f.render_widget(left_widget, columns[0]);
     f.render_widget(right_widget, columns[1]);
