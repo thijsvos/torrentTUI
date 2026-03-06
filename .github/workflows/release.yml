@@ -111,6 +111,7 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/torrenttui ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
+          shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
           tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
@@ -119,6 +120,7 @@ jobs:
         shell: pwsh
         run: |
           cp target/${{ matrix.target }}/release/torrenttui.exe ${{ matrix.artifact }}.exe
+          (Get-FileHash "${{ matrix.artifact }}.exe" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.artifact }}.exe" | Out-File "${{ matrix.artifact }}.exe.sha256" -Encoding ASCII
           Compress-Archive -Path "${{ matrix.artifact }}.exe" -DestinationPath "${{ matrix.artifact }}.zip"
           (Get-FileHash "${{ matrix.artifact }}.zip" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.artifact }}.zip" | Out-File "${{ matrix.artifact }}.zip.sha256" -Encoding ASCII
 
@@ -127,6 +129,10 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}${{ matrix.ext }}
+            ${{ matrix.artifact }}.sha256
+            ${{ matrix.artifact }}${{ matrix.ext }}.sha256
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.tar.gz.sha256
             ${{ matrix.artifact }}.zip
@@ -156,6 +162,7 @@ jobs:
           mv torrenttui-macos-aarch64 torrenttui-aarch64
           lipo -create torrenttui-x86_64 torrenttui-aarch64 -output torrenttui-macos-universal
           chmod +x torrenttui-macos-universal
+          shasum -a 256 torrenttui-macos-universal > torrenttui-macos-universal.sha256
           tar czf torrenttui-macos-universal.tar.gz torrenttui-macos-universal
           shasum -a 256 torrenttui-macos-universal.tar.gz > torrenttui-macos-universal.tar.gz.sha256
 
@@ -164,6 +171,8 @@ jobs:
         with:
           name: torrenttui-macos-universal
           path: |
+            torrenttui-macos-universal
+            torrenttui-macos-universal.sha256
             torrenttui-macos-universal.tar.gz
             torrenttui-macos-universal.tar.gz.sha256
 
@@ -201,7 +210,7 @@ jobs:
       - name: Collect release files
         run: |
           mkdir release-files
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec cp {} release-files/ \;
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" -o -name "*.exe" -o -name "torrenttui-*" \) -exec cp {} release-files/ \;
           ls -la release-files/
 
       - name: Generate changelog
@@ -225,22 +234,24 @@ jobs:
             echo ""
             echo "## Installation"
             echo ""
-            echo "Download the appropriate binary for your platform, extract it, and place it in your PATH."
+            echo "Download the binary for your platform and place it in your PATH."
             echo ""
             echo "**Linux (x86_64):**"
             echo "\`\`\`bash"
-            echo "tar xzf torrenttui-linux-x86_64.tar.gz"
+            echo "chmod +x torrenttui-linux-x86_64"
             echo "sudo mv torrenttui-linux-x86_64 /usr/local/bin/torrenttui"
             echo "\`\`\`"
             echo ""
             echo "**macOS (Universal):**"
             echo "\`\`\`bash"
-            echo "tar xzf torrenttui-macos-universal.tar.gz"
+            echo "chmod +x torrenttui-macos-universal"
             echo "sudo mv torrenttui-macos-universal /usr/local/bin/torrenttui"
             echo "\`\`\`"
             echo ""
             echo "**Windows:**"
-            echo "Extract \`torrenttui-windows-x86_64.zip\` and add the directory to your PATH."
+            echo "Download \`torrenttui-windows-x86_64.exe\` and add its directory to your PATH."
+            echo ""
+            echo "Tarballs and checksums are also available for each platform."
           } > changelog.md
 
       - name: Create GitHub Release

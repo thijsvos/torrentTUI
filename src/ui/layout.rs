@@ -24,7 +24,7 @@ pub fn get_layout(area: Rect) -> Vec<Rect> {
 pub fn render_header(f: &mut Frame, area: Rect) {
     let title = Paragraph::new(Line::from(vec![
         Span::styled("TorrentTUI", Style::default().fg(Color::Cyan)),
-        Span::raw(" v0.3.0"),
+        Span::raw(" v0.3.1"),
     ]))
     .block(
         Block::default()
