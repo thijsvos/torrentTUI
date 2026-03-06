@@ -170,6 +170,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Determine version
         id: version
@@ -198,30 +200,51 @@ jobs:
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec cp {} release-files/ \;
           ls -la release-files/
 
+      - name: Generate changelog
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Find the previous tag
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${VERSION}$" | head -1)
+          if [ -n "$PREV_TAG" ]; then
+            echo "Generating changelog from ${PREV_TAG} to HEAD"
+            CHANGES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" --no-merges | grep -v "^- Trigger release" || true)
+          else
+            echo "No previous tag found, using all commits"
+            CHANGES=$(git log --pretty=format:"- %s" --no-merges | grep -v "^- Trigger release" || true)
+          fi
+          # Write to file to preserve formatting
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "$CHANGES"
+            echo ""
+            echo "## Installation"
+            echo ""
+            echo "Download the appropriate binary for your platform, extract it, and place it in your PATH."
+            echo ""
+            echo "**Linux (x86_64):**"
+            echo "\`\`\`bash"
+            echo "tar xzf torrenttui-linux-x86_64.tar.gz"
+            echo "sudo mv torrenttui-linux-x86_64 /usr/local/bin/torrenttui"
+            echo "\`\`\`"
+            echo ""
+            echo "**macOS (Universal):**"
+            echo "\`\`\`bash"
+            echo "tar xzf torrenttui-macos-universal.tar.gz"
+            echo "sudo mv torrenttui-macos-universal /usr/local/bin/torrenttui"
+            echo "\`\`\`"
+            echo ""
+            echo "**Windows:**"
+            echo "Extract \`torrenttui-windows-x86_64.zip\` and add the directory to your PATH."
+          } > changelog.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: TorrentTUI ${{ steps.version.outputs.version }}
-          body: |
-            ## Installation
-
-            Download the appropriate binary for your platform, extract it, and place it in your PATH.
-
-            **Linux (x86_64):**
-            ```bash
-            tar xzf torrenttui-linux-x86_64.tar.gz
-            sudo mv torrenttui-linux-x86_64 /usr/local/bin/torrenttui
-            ```
-
-            **macOS (Universal):**
-            ```bash
-            tar xzf torrenttui-macos-universal.tar.gz
-            sudo mv torrenttui-macos-universal /usr/local/bin/torrenttui
-            ```
-
-            **Windows:**
-            Extract `torrenttui-windows-x86_64.zip` and add the directory to your PATH.
+          body_path: changelog.md
           draft: false
           prerelease: false
           files: release-files/*
