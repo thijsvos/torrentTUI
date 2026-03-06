@@ -335,9 +335,9 @@ async fn handle_normal_mode(
                 let paused_count = ids
                     .iter()
                     .filter(|id| {
-                        app.torrents
-                            .iter()
-                            .any(|t| t.id == **id && matches!(t.status, types::TorrentStatus::Paused))
+                        app.torrents.iter().any(|t| {
+                            t.id == **id && matches!(t.status, types::TorrentStatus::Paused)
+                        })
                     })
                     .count();
                 let should_resume = paused_count > ids.len() / 2;

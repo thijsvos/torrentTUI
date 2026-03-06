@@ -136,7 +136,10 @@ mod tests {
 
     #[test]
     fn status_display() {
-        assert_eq!(TorrentStatus::FetchingMetadata.to_string(), "Fetching Metadata");
+        assert_eq!(
+            TorrentStatus::FetchingMetadata.to_string(),
+            "Fetching Metadata"
+        );
         assert_eq!(TorrentStatus::Downloading.to_string(), "Downloading");
         assert_eq!(TorrentStatus::Paused.to_string(), "Paused");
         assert_eq!(TorrentStatus::Complete.to_string(), "Complete");

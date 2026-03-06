@@ -262,16 +262,29 @@ pub async fn run_engine(
                 eprint!("\x07");
 
                 if enable_notifications {
-                    let name = t.name.clone();
-                    let size = crate::ui::layout::format_size(t.size_bytes);
-                    tokio::task::spawn_blocking(move || {
-                        let _ = notify_rust::Notification::new()
+                    #[cfg(target_os = "macos")]
+                    {
+                        tokio::task::spawn_blocking(|| {
+                            let _ = std::process::Command::new("afplay")
+                                .arg("/System/Library/Sounds/Glass.aiff")
+                                .output();
+                        });
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let name = t.name.clone();
+                        let size = crate::ui::layout::format_size(t.size_bytes);
+                        tokio::task::spawn_blocking(move || match notify_rust::Notification::new()
                             .summary("Download Complete")
                             .body(&format!("{} ({})", name, size))
                             .appname("TorrentTUI")
                             .timeout(5000)
-                            .show();
-                    });
+                            .show()
+                        {
+                            Ok(_) => tracing::info!("System notification sent"),
+                            Err(e) => tracing::error!("System notification failed: {}", e),
+                        });
+                    }
                 }
             }
             // Show stable "Throttled" for all managed torrents (even during active bursts)

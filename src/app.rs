@@ -328,9 +328,12 @@ mod tests {
 
     #[test]
     fn sorted_torrents_filter_no_matches() {
-        let mut app = app_with_torrents(vec![
-            make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
-        ]);
+        let mut app = app_with_torrents(vec![make_torrent(
+            0,
+            "Alpha",
+            100,
+            TorrentStatus::Downloading,
+        )]);
         app.filter_text = "zzz".to_string();
         assert!(app.sorted_torrents().is_empty());
     }
@@ -397,9 +400,8 @@ mod tests {
 
     #[test]
     fn next_single_item() {
-        let mut app = app_with_torrents(vec![
-            make_torrent(0, "A", 100, TorrentStatus::Downloading),
-        ]);
+        let mut app =
+            app_with_torrents(vec![make_torrent(0, "A", 100, TorrentStatus::Downloading)]);
         app.next();
         assert_eq!(app.selected_index, 0); // stays at 0
     }
@@ -421,9 +423,8 @@ mod tests {
 
     #[test]
     fn previous_at_zero() {
-        let mut app = app_with_torrents(vec![
-            make_torrent(0, "A", 100, TorrentStatus::Downloading),
-        ]);
+        let mut app =
+            app_with_torrents(vec![make_torrent(0, "A", 100, TorrentStatus::Downloading)]);
         app.previous();
         assert_eq!(app.selected_index, 0);
     }
@@ -453,9 +454,8 @@ mod tests {
 
     #[test]
     fn toggle_mark() {
-        let mut app = app_with_torrents(vec![
-            make_torrent(0, "A", 100, TorrentStatus::Downloading),
-        ]);
+        let mut app =
+            app_with_torrents(vec![make_torrent(0, "A", 100, TorrentStatus::Downloading)]);
         assert!(!app.has_marks());
         app.toggle_mark();
         assert!(app.has_marks());
