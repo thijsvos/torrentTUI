@@ -4,6 +4,7 @@ A terminal-based BitTorrent client built with Rust.
 
 ![Rust](https://img.shields.io/badge/language-Rust-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
+[![X](https://img.shields.io/badge/X-@thijsvos-000000?logo=x)](https://x.com/thijsvos)
 
 ![demo](assets/demo.gif)
 
