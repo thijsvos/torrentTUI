@@ -49,6 +49,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let sort_col = app.sort_column.clone();
     let sort_rev = app.sort_reversed;
     let spinner_tick = app.spinner_tick;
+    let marked_ids = &app.marked_ids;
 
     // Build header with sort indicator
     let header_cells = HEADER_LABELS.iter().enumerate().map(|(i, h)| {
@@ -70,6 +71,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let rows: Vec<Row> = sorted
         .iter()
         .map(|torrent| {
+            let is_marked = marked_ids.contains(&torrent.id);
             let percent = torrent.progress_percent();
             let progress_bar = match torrent.status {
                 TorrentStatus::FetchingMetadata => {
@@ -99,8 +101,14 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                 _ => Style::default().fg(progress_color(percent)),
             };
 
-            Row::new(vec![
-                Cell::from(format!("{}", torrent.id)),
+            let id_text = if is_marked {
+                format!("\u{25cf} {}", torrent.id)
+            } else {
+                format!("  {}", torrent.id)
+            };
+
+            let row = Row::new(vec![
+                Cell::from(id_text),
                 Cell::from(torrent.name.clone()),
                 Cell::from(format_size(torrent.size_bytes)),
                 Cell::from(progress_bar).style(progress_style),
@@ -111,7 +119,13 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                 )),
                 Cell::from(format_eta(torrent.eta_seconds)),
                 Cell::from(status_text).style(status_style),
-            ])
+            ]);
+
+            if is_marked {
+                row.style(Style::default().bg(Color::Indexed(236)))
+            } else {
+                row
+            }
         })
         .collect();
 
@@ -121,7 +135,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(3),  // #
+            Constraint::Length(5),  // #
             Constraint::Min(20),    // Name
             Constraint::Length(10), // Size
             Constraint::Length(24), // Progress

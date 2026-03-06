@@ -40,6 +40,8 @@ pub struct NetworkConfig {
 pub struct UiConfig {
     #[serde(default = "default_refresh_rate")]
     pub refresh_rate_ms: u64,
+    #[serde(default = "default_true")]
+    pub enable_notifications: bool,
 }
 
 fn default_download_dir() -> String {
@@ -96,6 +98,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             refresh_rate_ms: default_refresh_rate(),
+            enable_notifications: true,
         }
     }
 }
@@ -137,5 +140,70 @@ impl Config {
         let content = toml::to_string_pretty(self)?;
         std::fs::write(&path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_defaults() {
+        let config = Config::default();
+        assert_eq!(config.general.max_concurrent_downloads, 5);
+        assert!(config.general.confirm_on_quit);
+        assert_eq!(config.network.listen_port, 6881);
+        assert_eq!(config.network.max_peers_per_torrent, 50);
+        assert!(config.network.enable_dht);
+        assert_eq!(config.network.max_download_speed_kbps, 0);
+        assert_eq!(config.network.max_upload_speed_kbps, 0);
+        assert_eq!(config.ui.refresh_rate_ms, 100);
+        assert!(config.ui.enable_notifications);
+    }
+
+    #[test]
+    fn test_partial_toml() {
+        let toml_str = r#"
+[general]
+max_concurrent_downloads = 10
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.general.max_concurrent_downloads, 10);
+        assert!(config.general.confirm_on_quit);
+        assert_eq!(config.network.listen_port, 6881);
+        assert_eq!(config.ui.refresh_rate_ms, 100);
+        assert!(config.ui.enable_notifications);
+    }
+
+    #[test]
+    fn test_full_toml() {
+        let toml_str = r#"
+[general]
+download_dir = "/tmp/downloads"
+max_concurrent_downloads = 3
+confirm_on_quit = false
+
+[network]
+listen_port = 7000
+max_peers_per_torrent = 100
+enable_dht = false
+max_download_speed_kbps = 500
+max_upload_speed_kbps = 100
+
+[ui]
+refresh_rate_ms = 200
+enable_notifications = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.general.download_dir, "/tmp/downloads");
+        assert_eq!(config.general.max_concurrent_downloads, 3);
+        assert!(!config.general.confirm_on_quit);
+        assert_eq!(config.network.listen_port, 7000);
+        assert_eq!(config.network.max_peers_per_torrent, 100);
+        assert!(!config.network.enable_dht);
+        assert_eq!(config.network.max_download_speed_kbps, 500);
+        assert_eq!(config.network.max_upload_speed_kbps, 100);
+        assert_eq!(config.ui.refresh_rate_ms, 200);
+        assert!(!config.ui.enable_notifications);
     }
 }

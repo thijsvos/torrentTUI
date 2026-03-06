@@ -24,7 +24,7 @@ pub fn get_layout(area: Rect) -> Vec<Rect> {
 pub fn render_header(f: &mut Frame, area: Rect) {
     let title = Paragraph::new(Line::from(vec![
         Span::styled("TorrentTUI", Style::default().fg(Color::Cyan)),
-        Span::raw(" v0.1.0"),
+        Span::raw(" v0.2.0"),
     ]))
     .block(
         Block::default()
@@ -74,7 +74,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
             if app.torrents.is_empty() {
                 "a:add  /:filter  ?:help  q:quit"
             } else {
-                "a:add  p:(un)pause  d:delete  Enter:detail  /:filter  t:throttle  ?:help  q:quit"
+                "a:add  Space:mark  p:(un)pause  d:delete  Enter:detail  /:filter  t:throttle  ?:help  q:quit"
             }
         }
         AppMode::Input => "Enter:submit  Esc:cancel",
@@ -135,6 +135,14 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         left_spans.push(Span::styled(
             format!("filter: \"{}\"", app.filter_text),
             Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    if app.has_marks() {
+        left_spans.push(Span::raw("  \u{2502}  "));
+        left_spans.push(Span::styled(
+            format!("{} marked", app.marked_count()),
+            Style::default().fg(Color::Cyan),
         ));
     }
 
@@ -242,5 +250,76 @@ pub fn format_eta(seconds: Option<u64>) -> String {
                 format!("{}s", secs)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speed_zero() {
+        assert_eq!(format_speed(0), "0 B/s");
+    }
+
+    #[test]
+    fn speed_kilobytes() {
+        assert_eq!(format_speed(1536), "1.5 KB/s");
+        assert_eq!(format_speed(1024), "1.0 KB/s");
+    }
+
+    #[test]
+    fn speed_megabytes() {
+        assert_eq!(format_speed(1024 * 1024), "1.0 MB/s");
+    }
+
+    #[test]
+    fn speed_gigabytes() {
+        assert_eq!(format_speed(1024 * 1024 * 1024), "1.00 GB/s");
+    }
+
+    #[test]
+    fn size_zero() {
+        assert_eq!(format_size(0), "0 B");
+    }
+
+    #[test]
+    fn size_kilobytes() {
+        assert_eq!(format_size(2048), "2 KB");
+    }
+
+    #[test]
+    fn size_megabytes() {
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn size_gigabytes() {
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn eta_none() {
+        assert_eq!(format_eta(None), "\u{2014}");
+    }
+
+    #[test]
+    fn eta_zero() {
+        assert_eq!(format_eta(Some(0)), "\u{2014}");
+    }
+
+    #[test]
+    fn eta_seconds_only() {
+        assert_eq!(format_eta(Some(45)), "45s");
+    }
+
+    #[test]
+    fn eta_minutes_seconds() {
+        assert_eq!(format_eta(Some(125)), "2m 5s");
+    }
+
+    #[test]
+    fn eta_hours_minutes() {
+        assert_eq!(format_eta(Some(3661)), "1h 1m");
     }
 }

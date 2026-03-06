@@ -93,3 +93,56 @@ impl SortColumn {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_torrent(id: usize, size: u64, downloaded: u64) -> TorrentInfo {
+        TorrentInfo {
+            id,
+            name: format!("torrent_{}", id),
+            size_bytes: size,
+            downloaded_bytes: downloaded,
+            download_speed: 0,
+            upload_speed: 0,
+            peers_connected: 0,
+            peers_total: 0,
+            status: TorrentStatus::Downloading,
+            eta_seconds: None,
+            magnet_link: String::new(),
+            files: Vec::new(),
+            throttle_paused: false,
+        }
+    }
+
+    #[test]
+    fn progress_percent_normal() {
+        let t = make_torrent(0, 100, 50);
+        assert!((t.progress_percent() - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn progress_percent_complete() {
+        let t = make_torrent(0, 100, 100);
+        assert!((t.progress_percent() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn progress_percent_zero_size() {
+        let t = make_torrent(0, 0, 0);
+        assert!((t.progress_percent() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn status_display() {
+        assert_eq!(TorrentStatus::FetchingMetadata.to_string(), "Fetching Metadata");
+        assert_eq!(TorrentStatus::Downloading.to_string(), "Downloading");
+        assert_eq!(TorrentStatus::Paused.to_string(), "Paused");
+        assert_eq!(TorrentStatus::Complete.to_string(), "Complete");
+        assert_eq!(
+            TorrentStatus::Error("disk full".to_string()).to_string(),
+            "Error: disk full"
+        );
+    }
+}

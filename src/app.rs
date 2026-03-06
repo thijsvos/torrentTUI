@@ -35,6 +35,8 @@ pub struct App {
     // Feature 7: File selection
     pub detail_file_index: usize,
     pub deselected_files: HashMap<usize, HashSet<usize>>,
+    // Multi-select
+    pub marked_ids: HashSet<usize>,
 }
 
 impl App {
@@ -68,6 +70,7 @@ impl App {
             table_area: None,
             detail_file_index: 0,
             deselected_files: HashMap::new(),
+            marked_ids: HashSet::new(),
         }
     }
 
@@ -237,8 +240,251 @@ impl App {
             self.disk_space_timer = Some(std::time::Instant::now());
         }
     }
+
+    pub fn toggle_mark(&mut self) {
+        if let Some(torrent) = self.selected_torrent() {
+            let id = torrent.id;
+            if self.marked_ids.contains(&id) {
+                self.marked_ids.remove(&id);
+            } else {
+                self.marked_ids.insert(id);
+            }
+        }
+    }
+
+    pub fn clear_marks(&mut self) {
+        self.marked_ids.clear();
+    }
+
+    pub fn mark_all(&mut self) {
+        let ids: Vec<usize> = self.sorted_torrents().iter().map(|t| t.id).collect();
+        self.marked_ids.extend(ids);
+    }
+
+    pub fn has_marks(&self) -> bool {
+        !self.marked_ids.is_empty()
+    }
+
+    pub fn marked_count(&self) -> usize {
+        self.marked_ids.len()
+    }
 }
 
 fn get_free_space(path: &str) -> Option<u64> {
     fs4::available_space(path).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::TorrentStatus;
+
+    fn make_torrent(id: usize, name: &str, size: u64, status: TorrentStatus) -> TorrentInfo {
+        TorrentInfo {
+            id,
+            name: name.to_string(),
+            size_bytes: size,
+            downloaded_bytes: 0,
+            download_speed: 0,
+            upload_speed: 0,
+            peers_connected: 0,
+            peers_total: 0,
+            status,
+            eta_seconds: None,
+            magnet_link: String::new(),
+            files: Vec::new(),
+            throttle_paused: false,
+        }
+    }
+
+    fn app_with_torrents(torrents: Vec<TorrentInfo>) -> App {
+        let mut app = App::new();
+        app.torrents = torrents;
+        app
+    }
+
+    // --- sorted_torrents / filter ---
+
+    #[test]
+    fn sorted_torrents_no_filter() {
+        let app = app_with_torrents(vec![
+            make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
+            make_torrent(1, "Beta", 200, TorrentStatus::Paused),
+        ]);
+        assert_eq!(app.sorted_torrents().len(), 2);
+    }
+
+    #[test]
+    fn sorted_torrents_filter_case_insensitive() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
+            make_torrent(1, "Beta", 200, TorrentStatus::Paused),
+        ]);
+        app.filter_text = "alpha".to_string();
+        let sorted = app.sorted_torrents();
+        assert_eq!(sorted.len(), 1);
+        assert_eq!(sorted[0].name, "Alpha");
+    }
+
+    #[test]
+    fn sorted_torrents_filter_no_matches() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
+        ]);
+        app.filter_text = "zzz".to_string();
+        assert!(app.sorted_torrents().is_empty());
+    }
+
+    // --- sort ---
+
+    #[test]
+    fn sorted_by_name() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "Zeta", 100, TorrentStatus::Downloading),
+            make_torrent(1, "Alpha", 200, TorrentStatus::Downloading),
+        ]);
+        app.sort_column = SortColumn::Name;
+        let sorted = app.sorted_torrents();
+        assert_eq!(sorted[0].name, "Alpha");
+        assert_eq!(sorted[1].name, "Zeta");
+    }
+
+    #[test]
+    fn sorted_by_name_reversed() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
+            make_torrent(1, "Zeta", 200, TorrentStatus::Downloading),
+        ]);
+        app.sort_column = SortColumn::Name;
+        app.sort_reversed = true;
+        let sorted = app.sorted_torrents();
+        assert_eq!(sorted[0].name, "Zeta");
+    }
+
+    #[test]
+    fn sorted_by_size() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "Big", 1000, TorrentStatus::Downloading),
+            make_torrent(1, "Small", 100, TorrentStatus::Downloading),
+        ]);
+        app.sort_column = SortColumn::Size;
+        let sorted = app.sorted_torrents();
+        assert_eq!(sorted[0].name, "Small");
+        assert_eq!(sorted[1].name, "Big");
+    }
+
+    #[test]
+    fn sorted_eta_none_last() {
+        let mut t1 = make_torrent(0, "A", 100, TorrentStatus::Downloading);
+        t1.eta_seconds = Some(60);
+        let mut t2 = make_torrent(1, "B", 100, TorrentStatus::Downloading);
+        t2.eta_seconds = None;
+        let mut app = app_with_torrents(vec![t2, t1]);
+        app.sort_column = SortColumn::Eta;
+        let sorted = app.sorted_torrents();
+        assert_eq!(sorted[0].name, "A"); // Some(60) first
+        assert_eq!(sorted[1].name, "B"); // None last
+    }
+
+    // --- navigation ---
+
+    #[test]
+    fn next_empty_list() {
+        let mut app = App::new();
+        app.next(); // should not panic
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn next_single_item() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "A", 100, TorrentStatus::Downloading),
+        ]);
+        app.next();
+        assert_eq!(app.selected_index, 0); // stays at 0
+    }
+
+    #[test]
+    fn next_advances() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "A", 100, TorrentStatus::Downloading),
+            make_torrent(1, "B", 100, TorrentStatus::Downloading),
+            make_torrent(2, "C", 100, TorrentStatus::Downloading),
+        ]);
+        app.next();
+        assert_eq!(app.selected_index, 1);
+        app.next();
+        assert_eq!(app.selected_index, 2);
+        app.next();
+        assert_eq!(app.selected_index, 2); // clamped at end
+    }
+
+    #[test]
+    fn previous_at_zero() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "A", 100, TorrentStatus::Downloading),
+        ]);
+        app.previous();
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn previous_moves_up() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "A", 100, TorrentStatus::Downloading),
+            make_torrent(1, "B", 100, TorrentStatus::Downloading),
+        ]);
+        app.selected_index = 1;
+        app.previous();
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn selected_torrent_returns_correct() {
+        let app = app_with_torrents(vec![
+            make_torrent(0, "A", 100, TorrentStatus::Downloading),
+            make_torrent(1, "B", 200, TorrentStatus::Downloading),
+        ]);
+        let t = app.selected_torrent().unwrap();
+        assert_eq!(t.name, "A");
+    }
+
+    // --- multi-select ---
+
+    #[test]
+    fn toggle_mark() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "A", 100, TorrentStatus::Downloading),
+        ]);
+        assert!(!app.has_marks());
+        app.toggle_mark();
+        assert!(app.has_marks());
+        assert_eq!(app.marked_count(), 1);
+        app.toggle_mark(); // unmark
+        assert!(!app.has_marks());
+    }
+
+    #[test]
+    fn mark_all_and_clear() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "A", 100, TorrentStatus::Downloading),
+            make_torrent(1, "B", 100, TorrentStatus::Downloading),
+            make_torrent(2, "C", 100, TorrentStatus::Downloading),
+        ]);
+        app.mark_all();
+        assert_eq!(app.marked_count(), 3);
+        app.clear_marks();
+        assert!(!app.has_marks());
+    }
+
+    #[test]
+    fn marks_tracked_by_id() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(5, "A", 100, TorrentStatus::Downloading),
+            make_torrent(10, "B", 100, TorrentStatus::Downloading),
+        ]);
+        app.toggle_mark(); // marks id=5 (first in sorted)
+        assert!(app.marked_ids.contains(&5));
+        assert!(!app.marked_ids.contains(&10));
+    }
 }

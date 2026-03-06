@@ -191,9 +191,15 @@ async fn run_app(
                     ui::help::render_help(f, f.area());
                 }
                 if app.mode == AppMode::ConfirmDelete {
-                    if let Some(torrent) = app.selected_torrent() {
-                        let name = torrent.name.clone();
-                        ui::dialogs::render_delete_dialog(f, f.area(), &name);
+                    let label = if app.has_marks() {
+                        format!("{} selected torrents", app.marked_count())
+                    } else {
+                        app.selected_torrent()
+                            .map(|t| t.name.clone())
+                            .unwrap_or_default()
+                    };
+                    if !label.is_empty() {
+                        ui::dialogs::render_delete_dialog(f, f.area(), &label);
                     }
                 }
                 if app.mode == AppMode::ConfirmQuit {
@@ -324,10 +330,28 @@ async fn handle_normal_mode(
             input_widget.clear();
         }
         KeyCode::Char('p') => {
-            if let Some(torrent) = app.selected_torrent() {
+            if app.has_marks() {
+                let ids: Vec<usize> = app.marked_ids.iter().copied().collect();
+                let paused_count = ids
+                    .iter()
+                    .filter(|id| {
+                        app.torrents
+                            .iter()
+                            .any(|t| t.id == **id && matches!(t.status, types::TorrentStatus::Paused))
+                    })
+                    .count();
+                let should_resume = paused_count > ids.len() / 2;
+                for id in &ids {
+                    if should_resume {
+                        let _ = cmd_tx.send(EngineCommand::Resume(*id)).await;
+                    } else {
+                        let _ = cmd_tx.send(EngineCommand::Pause(*id)).await;
+                    }
+                }
+                app.clear_marks();
+            } else if let Some(torrent) = app.selected_torrent() {
                 let id = torrent.id;
                 if torrent.throttle_paused {
-                    // Throttled = effectively downloading, user wants to pause
                     let _ = cmd_tx.send(EngineCommand::Pause(id)).await;
                 } else {
                     match torrent.status {
@@ -402,6 +426,19 @@ async fn handle_normal_mode(
             } else {
                 String::new()
             };
+        }
+        KeyCode::Char(' ') => {
+            app.toggle_mark();
+            app.next();
+        }
+        KeyCode::Char('v') => {
+            app.mark_all();
+        }
+        KeyCode::Char('V') => {
+            app.clear_marks();
+        }
+        KeyCode::Esc => {
+            app.clear_marks();
         }
         _ => {}
     }
@@ -585,7 +622,18 @@ async fn handle_delete_mode(
 ) {
     match key.code {
         KeyCode::Char('k') => {
-            if let Some(torrent) = app.selected_torrent() {
+            if app.has_marks() {
+                let ids: Vec<usize> = app.marked_ids.iter().copied().collect();
+                for id in ids {
+                    let _ = cmd_tx
+                        .send(EngineCommand::Delete {
+                            id,
+                            delete_files: false,
+                        })
+                        .await;
+                }
+                app.clear_marks();
+            } else if let Some(torrent) = app.selected_torrent() {
                 let id = torrent.id;
                 let _ = cmd_tx
                     .send(EngineCommand::Delete {
@@ -597,7 +645,18 @@ async fn handle_delete_mode(
             app.mode = AppMode::Normal;
         }
         KeyCode::Char('d') => {
-            if let Some(torrent) = app.selected_torrent() {
+            if app.has_marks() {
+                let ids: Vec<usize> = app.marked_ids.iter().copied().collect();
+                for id in ids {
+                    let _ = cmd_tx
+                        .send(EngineCommand::Delete {
+                            id,
+                            delete_files: true,
+                        })
+                        .await;
+                }
+                app.clear_marks();
+            } else if let Some(torrent) = app.selected_torrent() {
                 let id = torrent.id;
                 let _ = cmd_tx
                     .send(EngineCommand::Delete {

@@ -85,3 +85,60 @@ pub fn validate_magnet(link: &str) -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_hex_magnet() {
+        let link = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        assert!(validate_magnet(link).is_ok());
+    }
+
+    #[test]
+    fn valid_hex_magnet_with_params() {
+        let link = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=test";
+        assert!(validate_magnet(link).is_ok());
+    }
+
+    #[test]
+    fn valid_base32_magnet() {
+        let link = "magnet:?xt=urn:btih:ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        assert!(validate_magnet(link).is_ok());
+    }
+
+    #[test]
+    fn missing_magnet_prefix() {
+        assert!(validate_magnet("http://example.com").is_err());
+    }
+
+    #[test]
+    fn missing_btih() {
+        assert!(validate_magnet("magnet:?dn=test").is_err());
+    }
+
+    #[test]
+    fn wrong_hash_length() {
+        let link = "magnet:?xt=urn:btih:0123456789";
+        let err = validate_magnet(link).unwrap_err();
+        assert!(err.contains("40 hex or 32 base32"));
+    }
+
+    #[test]
+    fn invalid_hex_chars() {
+        let link = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef0123456g";
+        assert!(validate_magnet(link).is_err());
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        let link = "  magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567  ";
+        assert!(validate_magnet(link).is_ok());
+    }
+
+    #[test]
+    fn torrent_file_not_found() {
+        assert!(validate_torrent_source("/nonexistent/path.torrent").is_err());
+    }
+}

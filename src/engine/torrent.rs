@@ -200,6 +200,7 @@ pub async fn run_engine(
     msg_tx: mpsc::Sender<String>,
 ) -> Result<()> {
     let engine = TorrentEngine::new(&config).await?;
+    let enable_notifications = config.ui.enable_notifications;
     let mut cmd_rx = cmd_rx;
 
     // Track finished torrents for completion notification
@@ -239,6 +240,7 @@ pub async fn run_engine(
         cached_peers: &mut HashMap<usize, (u32, u32)>,
         cached_upload_speed: &mut HashMap<usize, u64>,
         speed_tracker: &mut HashMap<usize, (std::time::Instant, u64, u64)>,
+        enable_notifications: bool,
     ) {
         let now = std::time::Instant::now();
         let mut torrents = engine.get_all_torrents();
@@ -258,6 +260,19 @@ pub async fn run_engine(
                     .send(format!("\u{2713} \"{}\" complete", t.name))
                     .await;
                 eprint!("\x07");
+
+                if enable_notifications {
+                    let name = t.name.clone();
+                    let size = crate::ui::layout::format_size(t.size_bytes);
+                    tokio::task::spawn_blocking(move || {
+                        let _ = notify_rust::Notification::new()
+                            .summary("Download Complete")
+                            .body(&format!("{} ({})", name, size))
+                            .appname("TorrentTUI")
+                            .timeout(5000)
+                            .show();
+                    });
+                }
             }
             // Show stable "Throttled" for all managed torrents (even during active bursts)
             if throttle_managed.contains(&t.id) && !matches!(t.status, TorrentStatus::Complete) {
@@ -465,7 +480,7 @@ pub async fn run_engine(
                         break;
                     }
                 }
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker).await;
+                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications).await;
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                 // Token-bucket speed limiting (per-torrent for fair bandwidth sharing)
@@ -602,7 +617,7 @@ pub async fn run_engine(
                     per_torrent_last_change.retain(|id, _| current_ids.contains(id));
                 }
 
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker).await;
+                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications).await;
             }
         }
     }
