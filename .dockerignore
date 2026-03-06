@@ -1,0 +1,7 @@
+target/
+.git/
+.github/
+.cargo/
+.gitignore
+*.md
+LICENSE

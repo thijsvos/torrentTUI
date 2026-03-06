@@ -115,6 +115,36 @@ max_download_speed_kbps = 0  # 0 = unlimited
 max_upload_speed_kbps = 0    # 0 = unlimited
 ```
 
+## Docker
+
+### Build
+
+```bash
+cd torrenttui
+docker build -t torrenttui .
+```
+
+### Run
+
+```bash
+docker run -it \
+  -v ~/Downloads/torrents:/downloads \
+  -v ~/.config/torrenttui:/home/torrenttui/.config/torrenttui \
+  -p 6881-6890:6881-6890 \
+  torrenttui
+```
+
+Add a magnet link on startup:
+
+```bash
+docker run -it \
+  -v ~/Downloads/torrents:/downloads \
+  -p 6881:6881 \
+  torrenttui -d /downloads "magnet:?xt=urn:btih:..."
+```
+
+The `-it` flags are required since TorrentTUI is an interactive terminal application. The config volume is optional but enables session persistence across container restarts.
+
 ## Built with
 
 - [librqbit](https://github.com/ikatson/librqbit) — BitTorrent engine
