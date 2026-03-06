@@ -1,6 +1,6 @@
 [package]
 name = "torrenttui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A terminal BitTorrent client for magnet link downloads"
 
@@ -11,7 +11,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tui-textarea = { version = "0.7", features = ["crossterm", "ratatui"] }
 
 # BitTorrent engine
-librqbit = { version = "8", default-features = false, features = ["rust-tls"] }
+librqbit = { version = "8", default-features = false, features = ["rust-tls", "watch"] }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

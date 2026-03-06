@@ -89,6 +89,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                     match torrent.status {
                         TorrentStatus::Downloading => Style::default().fg(Color::Blue),
                         TorrentStatus::Complete => Style::default().fg(Color::Green),
+                        TorrentStatus::Seeding => Style::default().fg(Color::Green),
                         TorrentStatus::Paused => Style::default().fg(Color::Yellow),
                         TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
                         TorrentStatus::Error(_) => Style::default().fg(Color::Red),

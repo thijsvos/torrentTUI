@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::types::{FileInfo, TorrentInfo, TorrentStatus};
+use crate::types::{FileInfo, PeerInfo, TorrentInfo, TorrentStatus};
 use anyhow::Result;
 use librqbit::{
     AddTorrent, AddTorrentResponse, ManagedTorrent, Session, SessionOptions,
@@ -103,11 +103,20 @@ impl TorrentEngine {
                     .name()
                     .unwrap_or_else(|| "Fetching metadata...".to_string());
 
+                let uploaded_bytes = stats.uploaded_bytes;
+
                 let status = match stats.state {
                     TorrentStatsState::Initializing => TorrentStatus::FetchingMetadata,
                     TorrentStatsState::Live => {
                         if stats.finished {
-                            TorrentStatus::Complete
+                            let ul_speed = stats.live.as_ref()
+                                .map(|l| (l.upload_speed.mbps * 125_000.0) as u64)
+                                .unwrap_or(0);
+                            if ul_speed > 0 {
+                                TorrentStatus::Seeding
+                            } else {
+                                TorrentStatus::Complete
+                            }
                         } else {
                             TorrentStatus::Downloading
                         }
@@ -157,11 +166,34 @@ impl TorrentEngine {
                     })
                     .unwrap_or_default();
 
+                let info_hash = handle.info_hash().as_string();
+                let trackers: Vec<String> = handle.shared().trackers.iter().map(|u| u.to_string()).collect();
+                let piece_length = handle.with_metadata(|m| m.info.piece_length).ok();
+
+                let peers: Vec<PeerInfo> = handle.live()
+                    .map(|live| {
+                        // Default PeerStatsFilter has state=Live, which is what we want
+                        let snapshot = live.per_peer_stats_snapshot(Default::default());
+                        let mut peers: Vec<PeerInfo> = snapshot.peers.into_iter().map(|(addr, ps)| {
+                            PeerInfo {
+                                address: addr,
+                                state: ps.state.to_string(),
+                                downloaded_bytes: ps.counters.fetched_bytes,
+                                pieces: ps.counters.downloaded_and_checked_pieces,
+                                errors: ps.counters.errors,
+                            }
+                        }).collect();
+                        peers.sort_by(|a, b| b.downloaded_bytes.cmp(&a.downloaded_bytes));
+                        peers
+                    })
+                    .unwrap_or_default();
+
                 TorrentInfo {
                     id,
                     name,
                     size_bytes: stats.total_bytes,
                     downloaded_bytes: stats.progress_bytes,
+                    uploaded_bytes,
                     download_speed,
                     upload_speed,
                     peers_connected,
@@ -170,6 +202,10 @@ impl TorrentEngine {
                     eta_seconds,
                     magnet_link: String::new(),
                     files,
+                    peers,
+                    info_hash,
+                    trackers,
+                    piece_length,
                     throttle_paused: false, // set by push_state
                 }
             })
@@ -200,6 +236,15 @@ pub async fn run_engine(
     msg_tx: mpsc::Sender<String>,
 ) -> Result<()> {
     let engine = TorrentEngine::new(&config).await?;
+
+    // Watch folder for auto-adding torrents
+    if let Some(ref dir) = config.general.watch_dir {
+        let path = PathBuf::from(dir);
+        std::fs::create_dir_all(&path)?;
+        engine.session().watch_folder(&path);
+        tracing::info!("Watching folder: {}", dir);
+    }
+
     let enable_notifications = config.ui.enable_notifications;
     let mut cmd_rx = cmd_rx;
 
@@ -254,7 +299,7 @@ pub async fn run_engine(
         let managed_count = throttle_managed.len().max(1) as u64;
 
         for t in &mut torrents {
-            if matches!(t.status, TorrentStatus::Complete) && !finished_set.contains(&t.id) {
+            if matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding) && !finished_set.contains(&t.id) {
                 finished_set.insert(t.id);
                 let _ = msg_tx
                     .send(format!("\u{2713} \"{}\" complete", t.name))
@@ -288,7 +333,7 @@ pub async fn run_engine(
                 }
             }
             // Show stable "Throttled" for all managed torrents (even during active bursts)
-            if throttle_managed.contains(&t.id) && !matches!(t.status, TorrentStatus::Complete) {
+            if throttle_managed.contains(&t.id) && !matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding) {
                 t.throttle_paused = true;
                 // Compute actual effective speed from real byte progress over 5s window
                 let tracker = speed_tracker
@@ -521,7 +566,7 @@ pub async fn run_engine(
                         let active_count = torrents.iter()
                             .filter(|t| throttle_managed.contains(&t.id)
                                 && !user_paused.contains(&t.id)
-                                && !matches!(t.status, TorrentStatus::Complete))
+                                && !matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding))
                             .count()
                             .max(1) as u64;
                         let per_torrent_limit = download_limit_bps / active_count;
@@ -531,7 +576,7 @@ pub async fn run_engine(
                         for t in &torrents {
                             if !throttle_managed.contains(&t.id)
                                 || user_paused.contains(&t.id)
-                                || matches!(t.status, TorrentStatus::Complete)
+                                || matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding)
                             {
                                 continue;
                             }
@@ -609,7 +654,7 @@ pub async fn run_engine(
 
                     // Remove completed torrents from throttle tracking
                     for t in &torrents {
-                        if matches!(t.status, TorrentStatus::Complete) {
+                        if matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding) {
                             throttle_managed.remove(&t.id);
                             throttle_paused.remove(&t.id);
                             per_torrent_tokens.remove(&t.id);

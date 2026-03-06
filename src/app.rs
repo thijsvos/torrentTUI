@@ -37,6 +37,8 @@ pub struct App {
     pub deselected_files: HashMap<usize, HashSet<usize>>,
     // Multi-select
     pub marked_ids: HashSet<usize>,
+    // Peer list scrolling in detail view
+    pub detail_peer_index: usize,
 }
 
 impl App {
@@ -71,6 +73,7 @@ impl App {
             detail_file_index: 0,
             deselected_files: HashMap::new(),
             marked_ids: HashSet::new(),
+            detail_peer_index: 0,
         }
     }
 
@@ -170,6 +173,14 @@ impl App {
 
     pub fn total_upload_speed(&self) -> u64 {
         self.torrents.iter().map(|t| t.upload_speed).sum()
+    }
+
+    pub fn total_uploaded_bytes(&self) -> u64 {
+        self.torrents.iter().map(|t| t.uploaded_bytes).sum()
+    }
+
+    pub fn total_downloaded_bytes(&self) -> u64 {
+        self.torrents.iter().map(|t| t.downloaded_bytes).sum()
     }
 
     pub fn active_count(&self) -> usize {
@@ -285,6 +296,7 @@ mod tests {
             name: name.to_string(),
             size_bytes: size,
             downloaded_bytes: 0,
+            uploaded_bytes: 0,
             download_speed: 0,
             upload_speed: 0,
             peers_connected: 0,
@@ -293,6 +305,10 @@ mod tests {
             eta_seconds: None,
             magnet_link: String::new(),
             files: Vec::new(),
+            peers: Vec::new(),
+            info_hash: String::new(),
+            trackers: Vec::new(),
+            piece_length: None,
             throttle_paused: false,
         }
     }

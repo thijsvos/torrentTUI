@@ -6,6 +6,7 @@ pub enum TorrentStatus {
     Downloading,
     Paused,
     Complete,
+    Seeding,
     Error(String),
 }
 
@@ -16,6 +17,7 @@ impl fmt::Display for TorrentStatus {
             TorrentStatus::Downloading => write!(f, "Downloading"),
             TorrentStatus::Paused => write!(f, "Paused"),
             TorrentStatus::Complete => write!(f, "Complete"),
+            TorrentStatus::Seeding => write!(f, "Seeding"),
             TorrentStatus::Error(e) => write!(f, "Error: {}", e),
         }
     }
@@ -27,6 +29,7 @@ pub struct TorrentInfo {
     pub name: String,
     pub size_bytes: u64,
     pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
     pub download_speed: u64,
     pub upload_speed: u64,
     pub peers_connected: u32,
@@ -35,6 +38,10 @@ pub struct TorrentInfo {
     pub eta_seconds: Option<u64>,
     pub magnet_link: String,
     pub files: Vec<FileInfo>,
+    pub peers: Vec<PeerInfo>,
+    pub info_hash: String,
+    pub trackers: Vec<String>,
+    pub piece_length: Option<u32>,
     /// True when paused by the throttle system, not by the user
     pub throttle_paused: bool,
 }
@@ -44,6 +51,15 @@ pub struct FileInfo {
     pub name: String,
     pub size_bytes: u64,
     pub progress_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub address: String,
+    pub state: String,
+    pub downloaded_bytes: u64,
+    pub pieces: u32,
+    pub errors: u32,
 }
 
 impl TorrentInfo {
@@ -104,6 +120,7 @@ mod tests {
             name: format!("torrent_{}", id),
             size_bytes: size,
             downloaded_bytes: downloaded,
+            uploaded_bytes: 0,
             download_speed: 0,
             upload_speed: 0,
             peers_connected: 0,
@@ -112,6 +129,10 @@ mod tests {
             eta_seconds: None,
             magnet_link: String::new(),
             files: Vec::new(),
+            peers: Vec::new(),
+            info_hash: String::new(),
+            trackers: Vec::new(),
+            piece_length: None,
             throttle_paused: false,
         }
     }
@@ -143,6 +164,7 @@ mod tests {
         assert_eq!(TorrentStatus::Downloading.to_string(), "Downloading");
         assert_eq!(TorrentStatus::Paused.to_string(), "Paused");
         assert_eq!(TorrentStatus::Complete.to_string(), "Complete");
+        assert_eq!(TorrentStatus::Seeding.to_string(), "Seeding");
         assert_eq!(
             TorrentStatus::Error("disk full".to_string()).to_string(),
             "Error: disk full"

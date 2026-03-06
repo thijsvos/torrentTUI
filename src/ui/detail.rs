@@ -41,7 +41,7 @@ pub fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(header, chunks[0]);
 
     // Tabs
-    let tab_titles = vec!["Stats", "Files", "Peers"];
+    let tab_titles = vec!["Stats", "Info", "Files", "Peers"];
     let tabs = Tabs::new(tab_titles)
         .select(app.detail_tab_index)
         .style(Style::default().fg(Color::DarkGray))
@@ -60,8 +60,9 @@ pub fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     // Tab content
     match app.detail_tab_index {
         0 => render_stats_tab(f, chunks[2], app),
-        1 => render_files_tab(f, chunks[2], app),
-        2 => render_peers_tab(f, chunks[2], app),
+        1 => render_info_tab(f, chunks[2], app),
+        2 => render_files_tab(f, chunks[2], app),
+        3 => render_peers_tab(f, chunks[2], app),
         _ => {}
     }
 }
@@ -91,6 +92,18 @@ fn render_stats_tab(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("  Progress:  ", Style::default().fg(Color::DarkGray)),
             Span::raw(progress),
+        ]),
+        Line::from(vec![
+            Span::styled("  Uploaded:  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format_size(torrent.uploaded_bytes)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ratio:     ", Style::default().fg(Color::DarkGray)),
+            Span::raw(if torrent.downloaded_bytes > 0 {
+                format!("{:.2}", torrent.uploaded_bytes as f64 / torrent.downloaded_bytes as f64)
+            } else {
+                "\u{2014}".to_string()
+            }),
         ]),
         Line::from(vec![
             Span::styled("  Down:      ", Style::default().fg(Color::DarkGray)),
@@ -126,6 +139,61 @@ fn render_stats_tab(f: &mut Frame, area: Rect, app: &App) {
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     f.render_widget(stats, area);
+}
+
+fn render_info_tab(f: &mut Frame, area: Rect, app: &App) {
+    let torrent = match app.selected_torrent() {
+        Some(t) => t,
+        None => return,
+    };
+
+    let ratio = if torrent.downloaded_bytes > 0 {
+        format!("{:.2}", torrent.uploaded_bytes as f64 / torrent.downloaded_bytes as f64)
+    } else {
+        "\u{2014}".to_string()
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  Info Hash:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&torrent.info_hash, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Uploaded:     ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}  (ratio: {})", format_size(torrent.uploaded_bytes), ratio)),
+        ]),
+    ];
+
+    if let Some(pl) = torrent.piece_length {
+        lines.push(Line::from(vec![
+            Span::styled("  Piece Size:   ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format_size(pl as u64)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Trackers:",
+        Style::default().fg(Color::DarkGray),
+    )));
+    if torrent.trackers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (DHT only)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for tracker in &torrent.trackers {
+            lines.push(Line::from(format!("    {}", tracker)));
+        }
+    }
+
+    let info_widget = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Info ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(info_widget, area);
 }
 
 fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
@@ -222,26 +290,83 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
         None => return,
     };
 
-    let text = vec![
-        Line::from(""),
+    if torrent.peers.is_empty() {
+        let text = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Connected:  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", torrent.peers_connected)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Total seen: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}", torrent.peers_total)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No peers connected",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let peers_widget = Paragraph::new(text).block(
+            Block::default()
+                .title(" Peers ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        f.render_widget(peers_widget, area);
+        return;
+    }
+
+    let mut lines = vec![
         Line::from(vec![
-            Span::styled("  Connected:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Connected: ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{}", torrent.peers_connected)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Total seen: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  /  Total seen: ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{}", torrent.peers_total)),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Per-peer details require API extensions.",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(vec![
+            Span::styled(
+                format!("  {:<22} {:<12} {:>12} {:>8} {:>6}",
+                    "Address", "State", "Downloaded", "Pieces", "Errs"),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]),
     ];
 
-    let peers_widget = Paragraph::new(text).block(
+    // Respect scroll offset
+    let visible_height = area.height.saturating_sub(6) as usize; // borders + header lines
+    let scroll_offset = if torrent.peers.len() > visible_height {
+        app.detail_peer_index.min(torrent.peers.len().saturating_sub(visible_height))
+    } else {
+        0
+    };
+
+    for (i, peer) in torrent.peers.iter().enumerate().skip(scroll_offset).take(visible_height) {
+        let is_selected = i == app.detail_peer_index;
+        let prefix = if is_selected { "> " } else { "  " };
+        let style = if is_selected {
+            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        lines.push(Line::from(Span::styled(
+            format!("{}{:<22} {:<12} {:>12} {:>8} {:>6}",
+                prefix,
+                truncate(&peer.address, 22),
+                truncate(&peer.state, 12),
+                format_size(peer.downloaded_bytes),
+                peer.pieces,
+                peer.errors),
+            style,
+        )));
+    }
+
+    let peers_widget = Paragraph::new(lines).block(
         Block::default()
-            .title(" Peers ")
+            .title(format!(" Peers ({}) - j/k:scroll ", torrent.peers.len()))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)),
     );

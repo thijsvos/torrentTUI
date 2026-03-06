@@ -27,8 +27,8 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         ("?", "Toggle this help"),
         ("q / Esc", "Quit / back"),
         ("", ""),
-        ("", "-- Detail View (Files tab) --"),
-        ("j / k", "Navigate files"),
+        ("", "-- Detail View --"),
+        ("j / k", "Navigate files / peers"),
         ("Space", "Toggle file selection"),
         ("S", "Apply file selection"),
     ];

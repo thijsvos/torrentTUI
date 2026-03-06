@@ -24,7 +24,7 @@ pub fn get_layout(area: Rect) -> Vec<Rect> {
 pub fn render_header(f: &mut Frame, area: Rect) {
     let title = Paragraph::new(Line::from(vec![
         Span::styled("TorrentTUI", Style::default().fg(Color::Cyan)),
-        Span::raw(" v0.2.0"),
+        Span::raw(" v0.3.0"),
     ]))
     .block(
         Block::default()
@@ -78,7 +78,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
             }
         }
         AppMode::Input => "Enter:submit  Esc:cancel",
-        AppMode::Detail => "Tab:switch tab  j/k:navigate files  Space:toggle  S:apply  Esc:back",
+        AppMode::Detail => "Tab:switch tab  j/k:navigate  Space:toggle  S:apply  Esc:back",
         AppMode::Help => "Esc/?:close",
         AppMode::ConfirmDelete => "k:keep files  d:delete files  c:cancel",
         AppMode::ConfirmQuit => "y:quit  n:cancel",
@@ -98,6 +98,21 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
     right_spans.push(Span::raw("  "));
+
+    let total_up = app.total_uploaded_bytes();
+    let total_down = app.total_downloaded_bytes();
+    if total_up > 0 || total_down > 0 {
+        let ratio = if total_down > 0 {
+            total_up as f64 / total_down as f64
+        } else {
+            0.0
+        };
+        right_spans.push(Span::styled(
+            format!("R:{:.2}  ", ratio),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
     right_spans.push(Span::styled(
         format!("\u{2191} {} ", up_speed),
         Style::default().fg(Color::Magenta),

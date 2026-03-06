@@ -483,27 +483,37 @@ async fn handle_detail_mode(
             app.mode = AppMode::Normal;
         }
         KeyCode::Tab => {
-            app.detail_tab_index = (app.detail_tab_index + 1) % 3;
+            app.detail_tab_index = (app.detail_tab_index + 1) % 4;
             app.detail_file_index = 0;
+            app.detail_peer_index = 0;
         }
-        // File navigation (Files tab only)
+        // Navigation (Files tab = 2, Peers tab = 3)
         KeyCode::Char('j') | KeyCode::Down => {
-            if app.detail_tab_index == 1 {
+            if app.detail_tab_index == 2 {
                 if let Some(torrent) = app.selected_torrent() {
                     let file_count = torrent.files.len();
                     if file_count > 0 {
                         app.detail_file_index = (app.detail_file_index + 1).min(file_count - 1);
                     }
                 }
+            } else if app.detail_tab_index == 3 {
+                if let Some(torrent) = app.selected_torrent() {
+                    let peer_count = torrent.peers.len();
+                    if peer_count > 0 {
+                        app.detail_peer_index = (app.detail_peer_index + 1).min(peer_count - 1);
+                    }
+                }
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if app.detail_tab_index == 1 {
+            if app.detail_tab_index == 2 {
                 app.detail_file_index = app.detail_file_index.saturating_sub(1);
+            } else if app.detail_tab_index == 3 {
+                app.detail_peer_index = app.detail_peer_index.saturating_sub(1);
             }
         }
         KeyCode::Char(' ') => {
-            if app.detail_tab_index == 1 {
+            if app.detail_tab_index == 2 {
                 if let Some(torrent) = app.selected_torrent() {
                     let torrent_id = torrent.id;
                     let file_count = torrent.files.len();
@@ -521,7 +531,7 @@ async fn handle_detail_mode(
             }
         }
         KeyCode::Char('S') => {
-            if app.detail_tab_index == 1 {
+            if app.detail_tab_index == 2 {
                 if let Some(torrent) = app.selected_torrent() {
                     let torrent_id = torrent.id;
                     let total_files = torrent.files.len();

@@ -20,6 +20,8 @@ pub struct GeneralConfig {
     pub max_concurrent_downloads: usize,
     #[serde(default = "default_true")]
     pub confirm_on_quit: bool,
+    #[serde(default = "default_watch_dir")]
+    pub watch_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +54,10 @@ fn default_download_dir() -> String {
         .to_string()
 }
 
+fn default_watch_dir() -> Option<String> {
+    Some("/tmp/torrent-watch".to_string())
+}
+
 fn default_max_concurrent() -> usize {
     5
 }
@@ -78,6 +84,7 @@ impl Default for GeneralConfig {
             download_dir: default_download_dir(),
             max_concurrent_downloads: default_max_concurrent(),
             confirm_on_quit: true,
+            watch_dir: default_watch_dir(),
         }
     }
 }
