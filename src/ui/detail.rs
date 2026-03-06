@@ -100,7 +100,10 @@ fn render_stats_tab(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("  Ratio:     ", Style::default().fg(Color::DarkGray)),
             Span::raw(if torrent.downloaded_bytes > 0 {
-                format!("{:.2}", torrent.uploaded_bytes as f64 / torrent.downloaded_bytes as f64)
+                format!(
+                    "{:.2}",
+                    torrent.uploaded_bytes as f64 / torrent.downloaded_bytes as f64
+                )
             } else {
                 "\u{2014}".to_string()
             }),
@@ -148,7 +151,10 @@ fn render_info_tab(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let ratio = if torrent.downloaded_bytes > 0 {
-        format!("{:.2}", torrent.uploaded_bytes as f64 / torrent.downloaded_bytes as f64)
+        format!(
+            "{:.2}",
+            torrent.uploaded_bytes as f64 / torrent.downloaded_bytes as f64
+        )
     } else {
         "\u{2014}".to_string()
     };
@@ -160,7 +166,11 @@ fn render_info_tab(f: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("  Uploaded:     ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}  (ratio: {})", format_size(torrent.uploaded_bytes), ratio)),
+            Span::raw(format!(
+                "{}  (ratio: {})",
+                format_size(torrent.uploaded_bytes),
+                ratio
+            )),
         ]),
     ];
 
@@ -326,40 +336,53 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(format!("{}", torrent.peers_total)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                format!("  {:<22} {:<12} {:>12} {:>8} {:>6}",
-                    "Address", "State", "Downloaded", "Pieces", "Errs"),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Line::from(vec![Span::styled(
+            format!(
+                "  {:<22} {:<12} {:>12} {:>8} {:>6}",
+                "Address", "State", "Downloaded", "Pieces", "Errs"
             ),
-        ]),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
     ];
 
     // Respect scroll offset
     let visible_height = area.height.saturating_sub(6) as usize; // borders + header lines
     let scroll_offset = if torrent.peers.len() > visible_height {
-        app.detail_peer_index.min(torrent.peers.len().saturating_sub(visible_height))
+        app.detail_peer_index
+            .min(torrent.peers.len().saturating_sub(visible_height))
     } else {
         0
     };
 
-    for (i, peer) in torrent.peers.iter().enumerate().skip(scroll_offset).take(visible_height) {
+    for (i, peer) in torrent
+        .peers
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+    {
         let is_selected = i == app.detail_peer_index;
         let prefix = if is_selected { "> " } else { "  " };
         let style = if is_selected {
-            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
 
         lines.push(Line::from(Span::styled(
-            format!("{}{:<22} {:<12} {:>12} {:>8} {:>6}",
+            format!(
+                "{}{:<22} {:<12} {:>12} {:>8} {:>6}",
                 prefix,
                 truncate(&peer.address, 22),
                 truncate(&peer.state, 12),
                 format_size(peer.downloaded_bytes),
                 peer.pieces,
-                peer.errors),
+                peer.errors
+            ),
             style,
         )));
     }
