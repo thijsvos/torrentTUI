@@ -2,6 +2,7 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags:
       - 'v*'
 
@@ -12,8 +13,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check-version:
+    name: Check for version change
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check if version tag exists
+        id: check
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=v${VERSION}" >> $GITHUB_OUTPUT
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
   build-release:
     name: Build ${{ matrix.name }}
+    needs: check-version
+    if: |
+      (needs.check-version.result == 'success' && needs.check-version.outputs.should_release == 'true') ||
+      (needs.check-version.result == 'skipped' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -137,10 +165,27 @@ jobs:
 
   publish-release:
     name: Publish Release
-    needs: [build-release, create-macos-universal]
+    needs: [check-version, build-release, create-macos-universal]
+    if: always() && needs.build-release.result == 'success' && needs.create-macos-universal.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "version=v${VERSION}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create tag (if from main branch)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git tag "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -153,39 +198,32 @@ jobs:
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec cp {} release-files/ \;
           ls -la release-files/
 
-      - name: Generate release notes
-        id: notes
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          cat > notes.md << 'EOF'
-          ## Installation
-
-          Download the appropriate binary for your platform, extract it, and place it in your PATH.
-
-          **Linux (x86_64):**
-          ```bash
-          tar xzf torrenttui-linux-x86_64.tar.gz
-          sudo mv torrenttui-linux-x86_64 /usr/local/bin/torrenttui
-          ```
-
-          **macOS (Universal):**
-          ```bash
-          tar xzf torrenttui-macos-universal.tar.gz
-          sudo mv torrenttui-macos-universal /usr/local/bin/torrenttui
-          ```
-
-          **Windows:**
-          Extract `torrenttui-windows-x86_64.zip` and add the directory to your PATH.
-          EOF
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: TorrentTUI ${{ steps.notes.outputs.version }}
-          body_path: notes.md
+          tag_name: ${{ steps.version.outputs.version }}
+          name: TorrentTUI ${{ steps.version.outputs.version }}
+          body: |
+            ## Installation
+
+            Download the appropriate binary for your platform, extract it, and place it in your PATH.
+
+            **Linux (x86_64):**
+            ```bash
+            tar xzf torrenttui-linux-x86_64.tar.gz
+            sudo mv torrenttui-linux-x86_64 /usr/local/bin/torrenttui
+            ```
+
+            **macOS (Universal):**
+            ```bash
+            tar xzf torrenttui-macos-universal.tar.gz
+            sudo mv torrenttui-macos-universal /usr/local/bin/torrenttui
+            ```
+
+            **Windows:**
+            Extract `torrenttui-windows-x86_64.zip` and add the directory to your PATH.
           draft: false
-          prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          prerelease: false
           files: release-files/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
