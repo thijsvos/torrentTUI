@@ -36,7 +36,6 @@ pub struct TorrentInfo {
     pub peers_total: u32,
     pub status: TorrentStatus,
     pub eta_seconds: Option<u64>,
-    pub magnet_link: String,
     pub files: Vec<FileInfo>,
     pub peers: Vec<PeerInfo>,
     pub info_hash: String,
@@ -67,7 +66,7 @@ impl TorrentInfo {
         if self.size_bytes == 0 {
             return 0.0;
         }
-        (self.downloaded_bytes as f64 / self.size_bytes as f64) * 100.0
+        ((self.downloaded_bytes as f64 / self.size_bytes as f64) * 100.0).clamp(0.0, 100.0)
     }
 }
 
@@ -83,30 +82,59 @@ pub enum AppMode {
     ThrottleInput,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortColumn {
-    Index,
-    Name,
-    Size,
-    Progress,
-    Speed,
-    Peers,
-    Eta,
-    Status,
+    Index = 0,
+    Name = 1,
+    Size = 2,
+    Progress = 3,
+    Speed = 4,
+    Peers = 5,
+    Eta = 6,
+    Status = 7,
 }
 
 impl SortColumn {
     pub fn column_index(&self) -> usize {
+        *self as u8 as usize
+    }
+
+    pub fn next(self) -> Self {
         match self {
-            SortColumn::Index => 0,
-            SortColumn::Name => 1,
-            SortColumn::Size => 2,
-            SortColumn::Progress => 3,
-            SortColumn::Speed => 4,
-            SortColumn::Peers => 5,
-            SortColumn::Eta => 6,
-            SortColumn::Status => 7,
+            SortColumn::Index => SortColumn::Name,
+            SortColumn::Name => SortColumn::Size,
+            SortColumn::Size => SortColumn::Progress,
+            SortColumn::Progress => SortColumn::Speed,
+            SortColumn::Speed => SortColumn::Peers,
+            SortColumn::Peers => SortColumn::Eta,
+            SortColumn::Eta => SortColumn::Status,
+            SortColumn::Status => SortColumn::Index,
         }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DetailTab {
+    Stats = 0,
+    Info = 1,
+    Files = 2,
+    Peers = 3,
+}
+
+impl DetailTab {
+    pub fn next(self) -> Self {
+        match self {
+            DetailTab::Stats => DetailTab::Info,
+            DetailTab::Info => DetailTab::Files,
+            DetailTab::Files => DetailTab::Peers,
+            DetailTab::Peers => DetailTab::Stats,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        self as u8 as usize
     }
 }
 
@@ -127,7 +155,6 @@ mod tests {
             peers_total: 0,
             status: TorrentStatus::Downloading,
             eta_seconds: None,
-            magnet_link: String::new(),
             files: Vec::new(),
             peers: Vec::new(),
             info_hash: String::new(),
@@ -156,6 +183,13 @@ mod tests {
     }
 
     #[test]
+    fn progress_percent_clamped_to_100() {
+        // librqbit can briefly report downloaded > size after rechecks.
+        let t = make_torrent(0, 100, 200);
+        assert!((t.progress_percent() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn status_display() {
         assert_eq!(
             TorrentStatus::FetchingMetadata.to_string(),
@@ -169,5 +203,38 @@ mod tests {
             TorrentStatus::Error("disk full".to_string()).to_string(),
             "Error: disk full"
         );
+    }
+
+    #[test]
+    fn sort_column_indices() {
+        assert_eq!(SortColumn::Index.column_index(), 0);
+        assert_eq!(SortColumn::Name.column_index(), 1);
+        assert_eq!(SortColumn::Status.column_index(), 7);
+    }
+
+    #[test]
+    fn sort_column_next_cycles() {
+        let mut col = SortColumn::Index;
+        for _ in 0..8 {
+            col = col.next();
+        }
+        assert_eq!(col, SortColumn::Index);
+    }
+
+    #[test]
+    fn detail_tab_next_cycles() {
+        let mut tab = DetailTab::Stats;
+        for _ in 0..4 {
+            tab = tab.next();
+        }
+        assert_eq!(tab, DetailTab::Stats);
+    }
+
+    #[test]
+    fn detail_tab_index_matches_repr() {
+        assert_eq!(DetailTab::Stats.index(), 0);
+        assert_eq!(DetailTab::Info.index(), 1);
+        assert_eq!(DetailTab::Files.index(), 2);
+        assert_eq!(DetailTab::Peers.index(), 3);
     }
 }

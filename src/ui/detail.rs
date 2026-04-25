@@ -7,8 +7,10 @@ use ratatui::{
 };
 
 use crate::app::App;
+use crate::types::{DetailTab, PeerInfo};
 use crate::ui::layout::{format_eta, format_size, format_speed};
 use crate::ui::progress::render_progress_bar;
+use crate::ui::util::truncate;
 
 pub fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     let torrent = match app.selected_torrent() {
@@ -43,7 +45,7 @@ pub fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     // Tabs
     let tab_titles = vec!["Stats", "Info", "Files", "Peers"];
     let tabs = Tabs::new(tab_titles)
-        .select(app.detail_tab_index)
+        .select(app.detail_tab.index())
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
             Style::default()
@@ -58,12 +60,11 @@ pub fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(tabs, chunks[1]);
 
     // Tab content
-    match app.detail_tab_index {
-        0 => render_stats_tab(f, chunks[2], app),
-        1 => render_info_tab(f, chunks[2], app),
-        2 => render_files_tab(f, chunks[2], app),
-        3 => render_peers_tab(f, chunks[2], app),
-        _ => {}
+    match app.detail_tab {
+        DetailTab::Stats => render_stats_tab(f, chunks[2], app),
+        DetailTab::Info => render_info_tab(f, chunks[2], app),
+        DetailTab::Files => render_files_tab(f, chunks[2], app),
+        DetailTab::Peers => render_peers_tab(f, chunks[2], app),
     }
 }
 
@@ -230,7 +231,7 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     for (idx, file) in torrent.files.iter().enumerate() {
         let percent = if file.size_bytes > 0 {
-            file.progress_bytes as f64 / file.size_bytes as f64 * 100.0
+            (file.progress_bytes as f64 / file.size_bytes as f64 * 100.0).clamp(0.0, 100.0)
         } else {
             0.0
         };
@@ -286,14 +287,6 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(files_widget, area);
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len - 3])
-    } else {
-        s.to_string()
-    }
-}
-
 fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
     let torrent = match app.selected_torrent() {
         Some(t) => t,
@@ -328,6 +321,11 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // Sort lazily here so the engine doesn't sort every torrent's peers on
+    // every state push (only the selected torrent is ever displayed).
+    let mut peers: Vec<&PeerInfo> = torrent.peers.iter().collect();
+    peers.sort_by(|a, b| b.downloaded_bytes.cmp(&a.downloaded_bytes));
+
     let mut lines = vec![
         Line::from(vec![
             Span::styled("  Connected: ", Style::default().fg(Color::DarkGray)),
@@ -349,21 +347,21 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
 
     // Respect scroll offset
     let visible_height = area.height.saturating_sub(6) as usize; // borders + header lines
-    let scroll_offset = if torrent.peers.len() > visible_height {
-        app.detail_peer_index
-            .min(torrent.peers.len().saturating_sub(visible_height))
+    let peer_count = peers.len();
+    let peer_index = app.detail_peer_index.min(peer_count.saturating_sub(1));
+    let scroll_offset = if peer_count > visible_height {
+        peer_index.min(peer_count.saturating_sub(visible_height))
     } else {
         0
     };
 
-    for (i, peer) in torrent
-        .peers
+    for (i, peer) in peers
         .iter()
         .enumerate()
         .skip(scroll_offset)
         .take(visible_height)
     {
-        let is_selected = i == app.detail_peer_index;
+        let is_selected = i == peer_index;
         let prefix = if is_selected { "> " } else { "  " };
         let style = if is_selected {
             Style::default()
@@ -389,7 +387,7 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
 
     let peers_widget = Paragraph::new(lines).block(
         Block::default()
-            .title(format!(" Peers ({}) - j/k:scroll ", torrent.peers.len()))
+            .title(format!(" Peers ({}) - j/k:scroll ", peer_count))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
