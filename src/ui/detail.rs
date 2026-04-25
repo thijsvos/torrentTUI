@@ -324,7 +324,7 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
     // Sort lazily here so the engine doesn't sort every torrent's peers on
     // every state push (only the selected torrent is ever displayed).
     let mut peers: Vec<&PeerInfo> = torrent.peers.iter().collect();
-    peers.sort_by(|a, b| b.downloaded_bytes.cmp(&a.downloaded_bytes));
+    peers.sort_by_key(|p| std::cmp::Reverse(p.downloaded_bytes));
 
     let mut lines = vec![
         Line::from(vec![
