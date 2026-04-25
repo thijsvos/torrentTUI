@@ -81,7 +81,8 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                 _ => render_progress_bar(percent, 15),
             };
 
-            let (status_text, status_style) = status_cell_style(&torrent.status, torrent.throttle_paused);
+            let (status_text, status_style) =
+                status_cell_style(&torrent.status, torrent.throttle_paused);
 
             let progress_style = match torrent.status {
                 TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
@@ -192,8 +193,7 @@ mod tests {
 
     #[test]
     fn error_text_includes_message() {
-        let (text, _) =
-            status_cell_style(&TorrentStatus::Error("disk full".to_string()), false);
+        let (text, _) = status_cell_style(&TorrentStatus::Error("disk full".to_string()), false);
         assert!(text.contains("disk full"));
     }
 }

@@ -61,8 +61,8 @@ async fn main() -> Result<()> {
     let log_dir = config::Config::config_dir();
     std::fs::create_dir_all(&log_dir)?;
     let log_file = std::fs::File::create(log_dir.join("torrenttui.log"))?;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("torrenttui=warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("torrenttui=warn"));
     tracing_subscriber::fmt()
         .with_writer(log_file)
         .with_ansi(false)
@@ -77,7 +77,10 @@ async fn main() -> Result<()> {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("Failed to load config, using defaults: {e}");
-            (config::Config::default(), Some(format!("Config load failed: {e}")))
+            (
+                config::Config::default(),
+                Some(format!("Config load failed: {e}")),
+            )
         }
     };
     if let Some(ref dir) = cli.download_dir {
@@ -148,12 +151,7 @@ async fn run_app(
     if let Some(ref source) = cli.torrent_source {
         match validate_torrent_source(source) {
             Ok(()) => {
-                send_cmd(
-                    &cmd_tx,
-                    EngineCommand::AddTorrent(source.clone()),
-                    &mut app,
-                )
-                .await;
+                send_cmd(&cmd_tx, EngineCommand::AddTorrent(source.clone()), &mut app).await;
             }
             Err(e) => app.set_error(e),
         }
@@ -513,8 +511,7 @@ async fn handle_detail_mode(
                 if let Some(torrent) = app.selected_torrent() {
                     let file_count = torrent.files.len();
                     if file_count > 0 {
-                        app.detail_file_index =
-                            (app.detail_file_index + 1).min(file_count - 1);
+                        app.detail_file_index = (app.detail_file_index + 1).min(file_count - 1);
                     }
                 }
             }
@@ -522,8 +519,7 @@ async fn handle_detail_mode(
                 if let Some(torrent) = app.selected_torrent() {
                     let peer_count = torrent.peers.len();
                     if peer_count > 0 {
-                        app.detail_peer_index =
-                            (app.detail_peer_index + 1).min(peer_count - 1);
+                        app.detail_peer_index = (app.detail_peer_index + 1).min(peer_count - 1);
                     }
                 }
             }

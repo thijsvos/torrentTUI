@@ -220,9 +220,7 @@ impl TorrentEngine {
                             .map(|(i, fi)| {
                                 let progress = stats.file_progress.get(i).copied().unwrap_or(0);
                                 FileInfo {
-                                    name: sanitize_display(
-                                        &fi.relative_filename.to_string_lossy(),
-                                    ),
+                                    name: sanitize_display(&fi.relative_filename.to_string_lossy()),
                                     size_bytes: fi.len,
                                     progress_bytes: progress,
                                 }
@@ -322,9 +320,7 @@ fn derive_status(stats: &librqbit::TorrentStats) -> TorrentStatus {
             }
         }
         TorrentStatsState::Paused => TorrentStatus::Paused,
-        TorrentStatsState::Error => {
-            TorrentStatus::Error(stats.error.clone().unwrap_or_default())
-        }
+        TorrentStatsState::Error => TorrentStatus::Error(stats.error.clone().unwrap_or_default()),
     }
 }
 
@@ -373,14 +369,8 @@ pub async fn run_engine(
 
     // Speed-limit state. Use saturating_mul to avoid u64 overflow when the
     // user types an unreasonably large limit.
-    let mut download_limit_bps: u64 = config
-        .network
-        .max_download_speed_kbps
-        .saturating_mul(1024);
-    let mut upload_limit_bps: u64 = config
-        .network
-        .max_upload_speed_kbps
-        .saturating_mul(1024);
+    let mut download_limit_bps: u64 = config.network.max_download_speed_kbps.saturating_mul(1024);
+    let mut upload_limit_bps: u64 = config.network.max_upload_speed_kbps.saturating_mul(1024);
     let mut throttle_paused: HashSet<usize> = HashSet::new();
     let mut throttle_managed: HashSet<usize> = HashSet::new();
     let mut user_paused: HashSet<usize> = HashSet::new();
