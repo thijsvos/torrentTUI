@@ -270,29 +270,32 @@ async fn run_app(
                         }
                         needs_render = true;
                     }
-                    Some(Ok(Event::Mouse(mouse))) => {
-                        if app.mode == AppMode::Normal {
-                            if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind {
-                                if let Some(area) = app.table_area {
-                                    // Table has 1-cell border top + 1-row header
-                                    let content_y = area.y + 2;
-                                    let content_bottom = area.y + area.height.saturating_sub(1);
-                                    if mouse.row >= content_y && mouse.row < content_bottom
-                                        && mouse.column >= area.x && mouse.column < area.x + area.width
-                                    {
-                                        // Account for table scroll: the visible
-                                        // top row is the table state's offset.
-                                        let visible_offset = (mouse.row - content_y) as usize;
-                                        let clicked_index =
-                                            app.table_state.offset() + visible_offset;
-                                        let count = app.sorted_torrents().len();
-                                        if clicked_index < count {
-                                            app.selected_index = clicked_index;
-                                            app.update_selected_id();
-                                            app.table_state.select(Some(clicked_index));
-                                            needs_render = true;
-                                        }
-                                    }
+                    Some(Ok(Event::Mouse(mouse)))
+                        if app.mode == AppMode::Normal
+                            && matches!(
+                                mouse.kind,
+                                MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                            ) =>
+                    {
+                        if let Some(area) = app.table_area {
+                            // Table has 1-cell border top + 1-row header
+                            let content_y = area.y + 2;
+                            let content_bottom = area.y + area.height.saturating_sub(1);
+                            if mouse.row >= content_y
+                                && mouse.row < content_bottom
+                                && mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                            {
+                                // Account for table scroll: the visible top row
+                                // is the table state's offset.
+                                let visible_offset = (mouse.row - content_y) as usize;
+                                let clicked_index = app.table_state.offset() + visible_offset;
+                                let count = app.sorted_torrents().len();
+                                if clicked_index < count {
+                                    app.selected_index = clicked_index;
+                                    app.update_selected_id();
+                                    app.table_state.select(Some(clicked_index));
+                                    needs_render = true;
                                 }
                             }
                         }
@@ -410,18 +413,14 @@ async fn handle_normal_mode(
             };
             send_cmd(cmd_tx, cmd, app).await;
         }
-        KeyCode::Char('d') => {
-            if !app.torrents.is_empty() {
-                app.mode = AppMode::ConfirmDelete;
-            }
+        KeyCode::Char('d') if !app.torrents.is_empty() => {
+            app.mode = AppMode::ConfirmDelete;
         }
-        KeyCode::Enter => {
-            if !app.sorted_torrents().is_empty() {
-                app.mode = AppMode::Detail;
-                app.detail_tab = DetailTab::Stats;
-                app.detail_file_index = 0;
-                app.detail_peer_index = 0;
-            }
+        KeyCode::Enter if !app.sorted_torrents().is_empty() => {
+            app.mode = AppMode::Detail;
+            app.detail_tab = DetailTab::Stats;
+            app.detail_file_index = 0;
+            app.detail_peer_index = 0;
         }
         KeyCode::Char('?') => {
             app.mode = AppMode::Help;
@@ -534,33 +533,13 @@ async fn handle_detail_mode(
             }
             _ => {}
         },
-        KeyCode::Char(' ') => {
-            if app.detail_tab == DetailTab::Files {
-                if let Some(torrent) = app.selected_torrent() {
-                    let torrent_id = torrent.id;
-                    let file_count = torrent.files.len();
-                    if app.detail_file_index < file_count {
-                        app.toggle_file_selection(torrent_id, app.detail_file_index);
-                        let selected = app.selected_file_indices(torrent_id, file_count);
-                        send_cmd(
-                            cmd_tx,
-                            EngineCommand::SetSelectedFiles {
-                                id: torrent_id,
-                                file_indices: selected,
-                            },
-                            app,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-        KeyCode::Char('S') => {
-            if app.detail_tab == DetailTab::Files {
-                if let Some(torrent) = app.selected_torrent() {
-                    let torrent_id = torrent.id;
-                    let total_files = torrent.files.len();
-                    let selected = app.selected_file_indices(torrent_id, total_files);
+        KeyCode::Char(' ') if app.detail_tab == DetailTab::Files => {
+            if let Some(torrent) = app.selected_torrent() {
+                let torrent_id = torrent.id;
+                let file_count = torrent.files.len();
+                if app.detail_file_index < file_count {
+                    app.toggle_file_selection(torrent_id, app.detail_file_index);
+                    let selected = app.selected_file_indices(torrent_id, file_count);
                     send_cmd(
                         cmd_tx,
                         EngineCommand::SetSelectedFiles {
@@ -571,6 +550,22 @@ async fn handle_detail_mode(
                     )
                     .await;
                 }
+            }
+        }
+        KeyCode::Char('S') if app.detail_tab == DetailTab::Files => {
+            if let Some(torrent) = app.selected_torrent() {
+                let torrent_id = torrent.id;
+                let total_files = torrent.files.len();
+                let selected = app.selected_file_indices(torrent_id, total_files);
+                send_cmd(
+                    cmd_tx,
+                    EngineCommand::SetSelectedFiles {
+                        id: torrent_id,
+                        file_indices: selected,
+                    },
+                    app,
+                )
+                .await;
             }
         }
         _ => {}
