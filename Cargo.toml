@@ -6,9 +6,8 @@ description = "A terminal BitTorrent client for magnet link downloads"
 
 [dependencies]
 # TUI
-ratatui = { version = "0.29", features = ["all-widgets"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
-tui-textarea = { version = "0.7", features = ["crossterm", "ratatui"] }
+ratatui = { version = "0.30", features = ["all-widgets"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # BitTorrent engine
 librqbit = { version = "8", default-features = false, features = ["rust-tls", "watch"] }
