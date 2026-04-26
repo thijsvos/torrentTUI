@@ -337,7 +337,7 @@ async fn run_app(
 
 async fn handle_normal_mode(
     app: &mut App,
-    input_widget: &mut InputWidget<'_>,
+    input_widget: &mut InputWidget,
     key: crossterm::event::KeyEvent,
     cmd_tx: &mpsc::Sender<EngineCommand>,
 ) {
@@ -464,7 +464,7 @@ async fn handle_normal_mode(
 
 async fn handle_input_mode(
     app: &mut App,
-    input_widget: &mut InputWidget<'_>,
+    input_widget: &mut InputWidget,
     key: crossterm::event::KeyEvent,
     cmd_tx: &mpsc::Sender<EngineCommand>,
 ) {
@@ -485,9 +485,13 @@ async fn handle_input_mode(
                 }
             }
         }
-        _ => {
-            input_widget.textarea.input(key);
+        KeyCode::Backspace => {
+            input_widget.pop();
         }
+        KeyCode::Char(c) => {
+            input_widget.push(c);
+        }
+        _ => {}
     }
 }
 
