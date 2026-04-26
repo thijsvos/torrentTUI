@@ -8,6 +8,10 @@ on:
 
 permissions:
   contents: write
+  # actions/attest-build-provenance needs id-token + attestations to publish
+  # a Sigstore-backed provenance attestation alongside each release artifact.
+  id-token: write
+  attestations: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -124,6 +128,20 @@ jobs:
           Compress-Archive -Path "${{ matrix.artifact }}.exe" -DestinationPath "${{ matrix.artifact }}.zip"
           (Get-FileHash "${{ matrix.artifact }}.zip" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.artifact }}.zip" | Out-File "${{ matrix.artifact }}.zip.sha256" -Encoding ASCII
 
+      # Attest the binary itself. Users can verify with:
+      #   gh attestation verify <binary> --repo thijsvos/torrentTUI
+      - name: Attest binary provenance (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ matrix.artifact }}
+
+      - name: Attest binary provenance (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ matrix.artifact }}.exe
+
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
@@ -165,6 +183,11 @@ jobs:
           shasum -a 256 torrenttui-macos-universal > torrenttui-macos-universal.sha256
           tar czf torrenttui-macos-universal.tar.gz torrenttui-macos-universal
           shasum -a 256 torrenttui-macos-universal.tar.gz > torrenttui-macos-universal.tar.gz.sha256
+
+      - name: Attest universal binary provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: torrenttui-macos-universal
 
       - name: Upload universal binary
         uses: actions/upload-artifact@v6
