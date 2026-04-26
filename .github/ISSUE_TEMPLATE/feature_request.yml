@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an enhancement or new capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an idea. If you're not sure whether something is in scope, [open a Discussion](https://github.com/thijsvos/torrentTUI/discussions) first instead of an issue.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the use case or pain point. "I want X" is harder to act on than "When I do Y, the result is Z, and I'd expect W."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Optional — sketch how you imagine it working (keybindings, config flag, UI element).
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional — workarounds you've tried, similar features in other clients.
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Optional — links, screenshots, prior discussion.

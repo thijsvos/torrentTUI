@@ -1,0 +1,85 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Before submitting, please make sure you're on the [latest release](https://github.com/thijsvos/torrentTUI/releases).
+
+  - type: input
+    id: version
+    attributes:
+      label: TorrentTUI version
+      description: Output of `torrenttui --version`, or the release tag you installed.
+      placeholder: v0.4.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows
+        - Other (specify in "Additional context")
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal emulator
+      description: e.g. Alacritty 0.13, iTerm2 3.5, Windows Terminal 1.20, GNOME Terminal 3.50
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Be as specific as possible. If a particular torrent triggers it, mention size / file count rather than the torrent itself.
+      placeholder: |
+        1. Launch `torrenttui`
+        2. Press `a`, paste a magnet link with 100+ files
+        3. Press `Enter` on the row
+        4. Observe the crash on the Files tab
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt
+      description: |
+        Relevant lines from `~/.config/torrenttui/torrenttui.log` (or `%APPDATA%\torrenttui\torrenttui.log` on Windows).
+        **Privacy note:** if you ran with elevated `RUST_LOG`, redact peer IPs and tracker URLs before posting.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Anything else — screenshots, related issues, hardware details.
+    validations:
+      required: false

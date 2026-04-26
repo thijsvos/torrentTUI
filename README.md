@@ -1,12 +1,19 @@
 # TorrentTUI
 
-A terminal-based BitTorrent client built with Rust.
+A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 
+[![CI](https://github.com/thijsvos/torrentTUI/actions/workflows/ci.yml/badge.svg)](https://github.com/thijsvos/torrentTUI/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/thijsvos/torrentTUI?sort=semver)](https://github.com/thijsvos/torrentTUI/releases/latest)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue)
 ![Rust](https://img.shields.io/badge/language-Rust-orange)
-![License](https://img.shields.io/badge/license-MIT-blue)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![@thijsvos](https://img.shields.io/badge/@thijsvos-000000?logo=x)](https://x.com/thijsvos)
 
 ![demo](assets/demo.gif)
+
+## Contents
+
+- [Features](#features) · [Installation](#installation) · [Usage](#usage) · [Keybindings](#keybindings) · [Configuration](#configuration) · [Privacy](#privacy) · [Docker](#docker) · [Contributing](#contributing) · [License](#license)
 
 ## Features
 
@@ -45,6 +52,8 @@ Extract `torrenttui-windows-x86_64.zip` and add the directory to your PATH.
 
 ### From source
 
+Requires Rust 1.95 or newer (any recent stable toolchain works).
+
 ```bash
 git clone https://github.com/thijsvos/torrentTUI.git
 cd torrentTUI
@@ -54,6 +63,19 @@ cargo build --release
 The binary will be at `target/release/torrenttui`.
 
 ## Usage
+
+```bash
+torrenttui [OPTIONS] [TORRENT_SOURCE]
+```
+
+| Option | Description |
+|--------|-------------|
+| `<TORRENT_SOURCE>` | Magnet link or `.torrent` file path to add on startup (positional) |
+| `-d`, `--download-dir <PATH>` | Override download directory (otherwise read from config) |
+| `-h`, `--help` | Print help |
+| `-V`, `--version` | Print version |
+
+Examples:
 
 ```bash
 # Launch the TUI
@@ -131,14 +153,23 @@ enable_notifications = true
 
 ### Logging
 
-By default only `torrenttui=warn` is logged to `~/.config/torrenttui/torrenttui.log`. Set `RUST_LOG` to bump verbosity (e.g. `RUST_LOG=torrenttui=debug,librqbit=info`). Note that librqbit's default tracing emits peer IPs and tracker URLs, which is why it is silenced by default.
+By default only `torrenttui=warn` is logged to `~/.config/torrenttui/torrenttui.log`. Set `RUST_LOG` to bump verbosity (e.g. `RUST_LOG=torrenttui=debug,librqbit=info`).
+
+## Privacy
+
+A few defaults worth knowing:
+
+- **Logging is filtered.** Only TorrentTUI's own warnings are written to disk; librqbit's INFO-level output (peer IPs, tracker URLs, info hashes) is silenced. Bumping `RUST_LOG` re-enables it — redact before sharing logs.
+- **UPnP is off by default.** Enabling it (`network.enable_upnp = true`) opens an external port via your router and exposes you to peers outside your LAN.
+- **No telemetry.** TorrentTUI makes no outbound connections except to BitTorrent peers, trackers, and (if DHT is enabled) the DHT network.
+- **Notifications.** Torrent names are sanitized before being sent to the OS notification daemon (Pango/HTML escaped on Linux). Disable entirely with `ui.enable_notifications = false`.
 
 ## Docker
 
 ### Build
 
 ```bash
-cd torrenttui
+cd torrentTUI
 docker build -t torrenttui .
 ```
 
@@ -165,11 +196,15 @@ The `-it` flags are required since TorrentTUI is an interactive terminal applica
 
 ## Built with
 
-- [librqbit](https://github.com/ikatson/librqbit) — BitTorrent engine
+- [librqbit](https://github.com/ikatson/librqbit) — BitTorrent engine (also handles fastresume / session persistence)
 - [ratatui](https://github.com/ratatui/ratatui) — Terminal UI framework
 - [crossterm](https://github.com/crossterm-rs/crossterm) — Terminal manipulation
 - [tokio](https://github.com/tokio-rs/tokio) — Async runtime
 
+## Contributing
+
+PRs are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the dev setup, lint commands, and release process. Found a bug? [Open an issue](https://github.com/thijsvos/torrentTUI/issues/new/choose). Found a security problem? See [SECURITY.md](./SECURITY.md) — please don't open a public issue.
+
 ## License
 
-MIT
+[MIT](./LICENSE) © Thijs Vos
