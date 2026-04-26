@@ -143,7 +143,7 @@ jobs:
           subject-path: ${{ matrix.artifact }}.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -190,7 +190,7 @@ jobs:
           subject-path: torrenttui-macos-universal
 
       - name: Upload universal binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: torrenttui-macos-universal
           path: |
