@@ -74,26 +74,32 @@ torrenttui -d /path/to/downloads
 | Key | Action |
 |-----|--------|
 | `a` | Add magnet link or .torrent file |
-| `p` | Pause/unpause selected torrent |
+| `p` | Pause/unpause selected (or all marked) torrents |
 | `P` | Pause/unpause all torrents |
-| `d` | Delete selected torrent |
+| `d` | Delete selected (or all marked) torrents |
 | `Enter` | Open detail view |
-| `j` / `k` | Move selection down/up |
+| `j` / `k` (or `↓` / `↑`) | Move selection down/up |
 | `Tab` | Cycle sort column / detail tab |
 | `r` | Reverse sort order |
 | `/` | Search/filter torrents |
 | `t` | Set speed limits |
+| `Space` | Mark/unmark current torrent (then advances selection) |
+| `v` | Mark all visible torrents |
+| `V` | Clear all marks |
+| `Esc` | Clear marks (or close current dialog) |
 | `?` | Toggle help |
 | `q` | Quit |
 | `Ctrl+C` | Quit (double press to force) |
 
-### Detail view (Files tab)
+### Detail view
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate files |
-| `Space` | Toggle file selection |
-| `Esc` | Back to list |
+| `Tab` | Cycle tabs (Stats → Info → Files → Peers) |
+| `j` / `k` | Navigate files (Files tab) or peers (Peers tab) |
+| `Space` | Toggle file selection (Files tab) |
+| `S` | Apply current file selection to engine (Files tab) |
+| `Esc` / `q` | Back to list |
 
 ## Configuration
 
@@ -107,16 +113,25 @@ Config file is created automatically at:
 ```toml
 [general]
 download_dir = "~/Downloads/torrents"
-max_concurrent_downloads = 5
 confirm_on_quit = true
+# watch_dir = "/path/to/watch"  # optional; auto-add .torrent files dropped here
 
 [network]
 listen_port = 6881
 max_peers_per_torrent = 50
 enable_dht = true
-max_download_speed_kbps = 0  # 0 = unlimited
-max_upload_speed_kbps = 0    # 0 = unlimited
+enable_upnp = false           # opt in to open an external port via UPnP
+max_download_speed_kbps = 0   # 0 = unlimited
+max_upload_speed_kbps = 0     # 0 = unlimited
+
+[ui]
+refresh_rate_ms = 100
+enable_notifications = true
 ```
+
+### Logging
+
+By default only `torrenttui=warn` is logged to `~/.config/torrenttui/torrenttui.log`. Set `RUST_LOG` to bump verbosity (e.g. `RUST_LOG=torrenttui=debug,librqbit=info`). Note that librqbit's default tracing emits peer IPs and tracker URLs, which is why it is silenced by default.
 
 ## Docker
 

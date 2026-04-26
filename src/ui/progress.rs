@@ -1,10 +1,23 @@
 use ratatui::style::Color;
 
+const FILLED: char = '█';
+const EMPTY: char = '░';
+
 pub fn render_progress_bar(percent: f64, width: usize) -> String {
-    let filled = ((percent / 100.0) * width as f64).round() as usize;
-    let empty = width.saturating_sub(filled);
-    let bar: String = "█".repeat(filled) + &"░".repeat(empty);
-    format!("{} {:>5.1}%", bar, percent)
+    let percent = percent.clamp(0.0, 100.0);
+    let filled = (((percent / 100.0) * width as f64).round() as usize).min(width);
+    let empty = width - filled;
+    // Each char above is 3 bytes UTF-8; +8 for trailing " 100.0%".
+    let mut bar = String::with_capacity(width * 3 + 8);
+    for _ in 0..filled {
+        bar.push(FILLED);
+    }
+    for _ in 0..empty {
+        bar.push(EMPTY);
+    }
+    use std::fmt::Write;
+    let _ = write!(bar, " {:>5.1}%", percent);
+    bar
 }
 
 pub fn progress_color(percent: f64) -> Color {
@@ -52,6 +65,21 @@ mod tests {
     fn progress_bar_zero_width() {
         let bar = render_progress_bar(50.0, 0);
         assert!(bar.contains("50.0%"));
+    }
+
+    #[test]
+    fn progress_bar_clamps_over_100() {
+        // Defensive clamp: filled must never exceed width.
+        let bar = render_progress_bar(150.0, 10);
+        assert!(bar.starts_with("██████████"));
+        assert!(bar.contains("100.0%"));
+    }
+
+    #[test]
+    fn progress_bar_clamps_negative() {
+        let bar = render_progress_bar(-10.0, 10);
+        assert!(bar.starts_with("░░░░░░░░░░"));
+        assert!(bar.contains("0.0%"));
     }
 
     #[test]

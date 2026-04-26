@@ -6,6 +6,8 @@ use ratatui::{
     Frame,
 };
 
+use crate::ui::util::truncate;
+
 pub fn render_delete_dialog(f: &mut Frame, area: Rect, torrent_name: &str) {
     let popup = centered_rect(50, 25, area);
     f.render_widget(Clear, popup);
@@ -13,7 +15,7 @@ pub fn render_delete_dialog(f: &mut Frame, area: Rect, torrent_name: &str) {
     let text = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  Delete \"{}\"?", truncate_name(torrent_name, 40)),
+            format!("  Delete \"{}\"?", truncate(torrent_name, 40)),
             Style::default().fg(Color::White),
         )),
         Line::from(""),
@@ -95,12 +97,4 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let x = r.x + (r.width.saturating_sub(popup_width)) / 2;
     let y = r.y + (r.height.saturating_sub(popup_height)) / 2;
     Rect::new(x, y, popup_width, popup_height)
-}
-
-fn truncate_name(name: &str, max_len: usize) -> String {
-    if name.len() > max_len {
-        format!("{}...", &name[..max_len - 3])
-    } else {
-        name.to_string()
-    }
 }

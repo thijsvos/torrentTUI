@@ -46,7 +46,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         return;
     }
 
-    let sort_col = app.sort_column.clone();
+    let sort_col = app.sort_column;
     let sort_rev = app.sort_reversed;
     let spinner_tick = app.spinner_tick;
     let marked_ids = &app.marked_ids;
@@ -81,21 +81,8 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                 _ => render_progress_bar(percent, 15),
             };
 
-            let (status_text, status_style) = if torrent.throttle_paused {
-                ("Throttled".to_string(), Style::default().fg(Color::Cyan))
-            } else {
-                (
-                    torrent.status.to_string(),
-                    match torrent.status {
-                        TorrentStatus::Downloading => Style::default().fg(Color::Blue),
-                        TorrentStatus::Complete => Style::default().fg(Color::Green),
-                        TorrentStatus::Seeding => Style::default().fg(Color::Green),
-                        TorrentStatus::Paused => Style::default().fg(Color::Yellow),
-                        TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
-                        TorrentStatus::Error(_) => Style::default().fg(Color::Red),
-                    },
-                )
-            };
+            let (status_text, status_style) =
+                status_cell_style(&torrent.status, torrent.throttle_paused);
 
             let progress_style = match torrent.status {
                 TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
@@ -161,4 +148,52 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     .highlight_symbol("\u{25b6} ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+/// Map a torrent's status (and the throttle-paused override) to the cell text
+/// and style. Throttle takes precedence over the underlying engine state so
+/// the user sees the higher-signal label.
+pub fn status_cell_style(status: &TorrentStatus, throttle_paused: bool) -> (String, Style) {
+    if throttle_paused {
+        return ("Throttled".to_string(), Style::default().fg(Color::Cyan));
+    }
+    let style = match status {
+        TorrentStatus::Downloading => Style::default().fg(Color::Blue),
+        TorrentStatus::Complete | TorrentStatus::Seeding => Style::default().fg(Color::Green),
+        TorrentStatus::Paused => Style::default().fg(Color::Yellow),
+        TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
+        TorrentStatus::Error(_) => Style::default().fg(Color::Red),
+    };
+    (status.to_string(), style)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn throttle_paused_overrides_status() {
+        let (text, _) = status_cell_style(&TorrentStatus::Downloading, true);
+        assert_eq!(text, "Throttled");
+    }
+
+    #[test]
+    fn downloading_is_blue() {
+        let (text, style) = status_cell_style(&TorrentStatus::Downloading, false);
+        assert_eq!(text, "Downloading");
+        assert_eq!(style, Style::default().fg(Color::Blue));
+    }
+
+    #[test]
+    fn complete_and_seeding_share_color() {
+        let (_, c) = status_cell_style(&TorrentStatus::Complete, false);
+        let (_, s) = status_cell_style(&TorrentStatus::Seeding, false);
+        assert_eq!(c, s);
+    }
+
+    #[test]
+    fn error_text_includes_message() {
+        let (text, _) = status_cell_style(&TorrentStatus::Error("disk full".to_string()), false);
+        assert!(text.contains("disk full"));
+    }
 }

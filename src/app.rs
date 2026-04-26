@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{AppMode, SortColumn, TorrentInfo, TorrentStatus};
+use crate::types::{AppMode, DetailTab, SortColumn, TorrentInfo, TorrentStatus};
 use ratatui::widgets::TableState;
 
 pub struct App {
@@ -9,7 +9,7 @@ pub struct App {
     pub selected_index: usize,
     pub selected_torrent_id: Option<usize>,
     pub mode: AppMode,
-    pub detail_tab_index: usize,
+    pub detail_tab: DetailTab,
     pub sort_column: SortColumn,
     pub sort_reversed: bool,
     pub error_message: Option<String>,
@@ -18,27 +18,23 @@ pub struct App {
     pub info_timer: Option<std::time::Instant>,
     pub spinner_tick: usize,
     pub should_quit: bool,
-    // Feature 2: Filter
     pub filter_text: String,
-    // Feature 4: Disk space
     pub free_disk_space: Option<u64>,
     pub disk_space_timer: Option<std::time::Instant>,
-    // Feature 6: Throttle
     pub throttle_step: u8, // 0 = download, 1 = upload
     pub throttle_input_buf: String,
     pub throttle_download_value: u64,
     pub throttle_upload_value: u64,
     pub speed_limit_download_kbps: u64,
     pub speed_limit_upload_kbps: u64,
-    // Mouse support: track the table content area for click mapping
     pub table_area: Option<ratatui::layout::Rect>,
-    // Feature 7: File selection
     pub detail_file_index: usize,
     pub deselected_files: HashMap<usize, HashSet<usize>>,
-    // Multi-select
     pub marked_ids: HashSet<usize>,
-    // Peer list scrolling in detail view
     pub detail_peer_index: usize,
+    /// Wired from `config.general.confirm_on_quit`; when false, `q` quits
+    /// immediately instead of opening the confirmation dialog.
+    pub confirm_on_quit: bool,
 }
 
 impl App {
@@ -51,7 +47,7 @@ impl App {
             selected_index: 0,
             selected_torrent_id: None,
             mode: AppMode::Normal,
-            detail_tab_index: 0,
+            detail_tab: DetailTab::Stats,
             sort_column: SortColumn::Index,
             sort_reversed: false,
             error_message: None,
@@ -74,7 +70,16 @@ impl App {
             deselected_files: HashMap::new(),
             marked_ids: HashSet::new(),
             detail_peer_index: 0,
+            confirm_on_quit: true,
         }
+    }
+
+    pub fn confirm_on_quit_required(&self) -> bool {
+        self.confirm_on_quit
+            && self
+                .torrents
+                .iter()
+                .any(|t| matches!(t.status, TorrentStatus::Downloading))
     }
 
     pub fn sorted_torrents(&self) -> Vec<&TorrentInfo> {
@@ -83,7 +88,7 @@ impl App {
             .torrents
             .iter()
             .filter(|t| {
-                if self.filter_text.is_empty() {
+                if filter_lower.is_empty() {
                     true
                 } else {
                     t.name.to_lowercase().contains(&filter_lower)
@@ -91,10 +96,27 @@ impl App {
             })
             .collect();
 
+        // Pre-compute lowercase keys once when sorting by Name (instead of
+        // allocating two Strings per comparison).
+        if self.sort_column == SortColumn::Name {
+            let lc: Vec<String> = torrents.iter().map(|t| t.name.to_lowercase()).collect();
+            let mut indices: Vec<usize> = (0..torrents.len()).collect();
+            indices.sort_by(|&a, &b| {
+                let cmp = lc[a].cmp(&lc[b]);
+                if self.sort_reversed {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
+            });
+            torrents = indices.into_iter().map(|i| torrents[i]).collect();
+            return torrents;
+        }
+
         torrents.sort_by(|a, b| {
             let cmp = match self.sort_column {
                 SortColumn::Index => a.id.cmp(&b.id),
-                SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortColumn::Name => unreachable!(),
                 SortColumn::Size => a.size_bytes.cmp(&b.size_bytes),
                 SortColumn::Progress => a
                     .progress_percent()
@@ -150,21 +172,40 @@ impl App {
     }
 
     pub fn restore_selection(&mut self) {
-        let sorted = self.sorted_torrents();
-        if let Some(id) = self.selected_torrent_id {
-            if let Some(pos) = sorted.iter().position(|t| t.id == id) {
-                self.selected_index = pos;
-            } else if !sorted.is_empty() {
-                self.selected_index = self.selected_index.min(sorted.len() - 1);
+        let (new_index, new_id) = {
+            let sorted = self.sorted_torrents();
+            let len = sorted.len();
+            let new_index = if let Some(id) = self.selected_torrent_id {
+                if let Some(pos) = sorted.iter().position(|t| t.id == id) {
+                    pos
+                } else if len > 0 {
+                    self.selected_index.min(len - 1)
+                } else {
+                    0
+                }
+            } else if len > 0 {
+                self.selected_index.min(len - 1)
             } else {
-                self.selected_index = 0;
-            }
-        } else if !sorted.is_empty() {
-            self.selected_index = self.selected_index.min(sorted.len() - 1);
-        } else {
-            self.selected_index = 0;
-        }
+                0
+            };
+            // Refresh the cached id from the resolved index so callers don't
+            // see a stale value between user actions.
+            let new_id = sorted.get(new_index).map(|t| t.id);
+            (new_index, new_id)
+        };
+        self.selected_index = new_index;
+        self.selected_torrent_id = new_id;
         self.table_state.select(Some(self.selected_index));
+    }
+
+    /// Drop UI-side bookkeeping for torrents that are no longer in the list.
+    /// The engine prunes its own maps; this mirrors the same pattern on the UI
+    /// side (called from the state-update arm of the main loop).
+    pub fn prune_stale_state(&mut self) {
+        let current_ids: HashSet<usize> = self.torrents.iter().map(|t| t.id).collect();
+        self.marked_ids.retain(|id| current_ids.contains(id));
+        self.deselected_files
+            .retain(|id, _| current_ids.contains(id));
     }
 
     pub fn total_download_speed(&self) -> u64 {
@@ -190,13 +231,26 @@ impl App {
             .count()
     }
 
+    pub fn has_fetching_metadata(&self) -> bool {
+        self.torrents
+            .iter()
+            .any(|t| matches!(t.status, TorrentStatus::FetchingMetadata))
+    }
+
     pub fn set_error(&mut self, msg: String) {
         self.error_message = Some(msg);
         self.error_timer = Some(std::time::Instant::now());
     }
 
     pub fn set_info(&mut self, msg: String) {
-        self.info_message = Some(msg);
+        // If a previous info message is still on screen, append the new one so
+        // burst notifications (e.g. multiple completions in one tick) don't
+        // overwrite each other silently.
+        if let Some(existing) = self.info_message.take() {
+            self.info_message = Some(format!("{} | {}", existing, msg));
+        } else {
+            self.info_message = Some(msg);
+        }
         self.info_timer = Some(std::time::Instant::now());
     }
 
@@ -247,7 +301,7 @@ impl App {
             Some(t) => t.elapsed() > std::time::Duration::from_secs(5),
         };
         if should_update {
-            self.free_disk_space = get_free_space(download_dir);
+            self.free_disk_space = fs4::available_space(download_dir).ok();
             self.disk_space_timer = Some(std::time::Instant::now());
         }
     }
@@ -281,10 +335,6 @@ impl App {
     }
 }
 
-fn get_free_space(path: &str) -> Option<u64> {
-    fs4::available_space(path).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,7 +353,6 @@ mod tests {
             peers_total: 0,
             status,
             eta_seconds: None,
-            magnet_link: String::new(),
             files: Vec::new(),
             peers: Vec::new(),
             info_hash: String::new(),
@@ -318,8 +367,6 @@ mod tests {
         app.torrents = torrents;
         app
     }
-
-    // --- sorted_torrents / filter ---
 
     #[test]
     fn sorted_torrents_no_filter() {
@@ -353,8 +400,6 @@ mod tests {
         app.filter_text = "zzz".to_string();
         assert!(app.sorted_torrents().is_empty());
     }
-
-    // --- sort ---
 
     #[test]
     fn sorted_by_name() {
@@ -404,8 +449,6 @@ mod tests {
         assert_eq!(sorted[0].name, "A"); // Some(60) first
         assert_eq!(sorted[1].name, "B"); // None last
     }
-
-    // --- navigation ---
 
     #[test]
     fn next_empty_list() {
@@ -466,8 +509,6 @@ mod tests {
         assert_eq!(t.name, "A");
     }
 
-    // --- multi-select ---
-
     #[test]
     fn toggle_mark() {
         let mut app =
@@ -476,7 +517,7 @@ mod tests {
         app.toggle_mark();
         assert!(app.has_marks());
         assert_eq!(app.marked_count(), 1);
-        app.toggle_mark(); // unmark
+        app.toggle_mark();
         assert!(!app.has_marks());
     }
 
@@ -502,5 +543,52 @@ mod tests {
         app.toggle_mark(); // marks id=5 (first in sorted)
         assert!(app.marked_ids.contains(&5));
         assert!(!app.marked_ids.contains(&10));
+    }
+
+    #[test]
+    fn restore_selection_refreshes_cached_id() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(5, "A", 100, TorrentStatus::Downloading),
+            make_torrent(10, "B", 100, TorrentStatus::Downloading),
+        ]);
+        app.selected_index = 1;
+        app.update_selected_id();
+        assert_eq!(app.selected_torrent_id, Some(10));
+
+        // Remove the torrent currently selected and call restore_selection.
+        app.torrents.retain(|t| t.id != 10);
+        app.restore_selection();
+        assert_eq!(app.selected_index, 0);
+        // The cached id must follow the new selection, not stay stale on 10.
+        assert_eq!(app.selected_torrent_id, Some(5));
+    }
+
+    #[test]
+    fn prune_stale_state_drops_marks_and_deselections() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(1, "A", 100, TorrentStatus::Downloading),
+            make_torrent(2, "B", 100, TorrentStatus::Downloading),
+        ]);
+        app.marked_ids.insert(1);
+        app.marked_ids.insert(2);
+        app.marked_ids.insert(99); // stale, no torrent with id 99
+        app.deselected_files.insert(2, HashSet::new());
+        app.deselected_files.insert(42, HashSet::new()); // stale
+
+        app.prune_stale_state();
+
+        assert!(app.marked_ids.contains(&1));
+        assert!(app.marked_ids.contains(&2));
+        assert!(!app.marked_ids.contains(&99));
+        assert!(app.deselected_files.contains_key(&2));
+        assert!(!app.deselected_files.contains_key(&42));
+    }
+
+    #[test]
+    fn set_info_concatenates_when_unread() {
+        let mut app = App::new();
+        app.set_info("first".to_string());
+        app.set_info("second".to_string());
+        assert_eq!(app.info_message.as_deref(), Some("first | second"));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "torrenttui"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 description = "A terminal BitTorrent client for magnet link downloads"
 
@@ -26,8 +26,7 @@ toml = "0.8"
 dirs = "5"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
-bytesize = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 fs4 = "0.12"
 notify-rust = "4"
