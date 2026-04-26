@@ -1,47 +1,73 @@
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
-    widgets::{Block, Borders},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use tui_textarea::TextArea;
 
-pub struct InputWidget<'a> {
-    pub textarea: TextArea<'a>,
+const PLACEHOLDER: &str = "magnet:?xt=urn:btih:... or /path/to/file.torrent";
+
+pub struct InputWidget {
+    buffer: String,
 }
 
-impl<'a> InputWidget<'a> {
+impl Default for InputWidget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputWidget {
     pub fn new() -> Self {
-        let mut textarea = TextArea::default();
-        textarea.set_block(
-            Block::default()
-                .title(" Add Torrent (magnet link or .torrent path) ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
-        textarea.set_cursor_line_style(Style::default());
-        textarea.set_placeholder_text("magnet:?xt=urn:btih:... or /path/to/file.torrent");
-        Self { textarea }
+        Self {
+            buffer: String::new(),
+        }
     }
 
     pub fn value(&self) -> String {
-        self.textarea.lines()[0].clone()
+        self.buffer.clone()
     }
 
     pub fn clear(&mut self) {
-        self.textarea.select_all();
-        self.textarea.cut();
+        self.buffer.clear();
+    }
+
+    pub fn push(&mut self, c: char) {
+        self.buffer.push(c);
+    }
+
+    pub fn pop(&mut self) {
+        self.buffer.pop();
     }
 }
 
 pub fn render_input(f: &mut Frame, area: Rect, input: &InputWidget) {
-    f.render_widget(&input.textarea, area);
+    let title = " Add Torrent (magnet link or .torrent path) ";
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let line = if input.buffer.is_empty() {
+        Line::from(vec![
+            Span::styled(PLACEHOLDER, Style::default().fg(Color::DarkGray)),
+            Span::styled("\u{2588}", Style::default().fg(Color::White)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(input.buffer.as_str()),
+            Span::styled("\u{2588}", Style::default().fg(Color::White)),
+        ])
+    };
+
+    let widget = Paragraph::new(line).block(block);
+    f.render_widget(widget, area);
 }
 
 pub fn validate_torrent_source(input: &str) -> Result<(), String> {
     let input = input.trim();
 
-    // Check if it's a .torrent file path
     if input.ends_with(".torrent") {
         let path = std::path::Path::new(input);
         if path.exists() {
@@ -51,7 +77,6 @@ pub fn validate_torrent_source(input: &str) -> Result<(), String> {
         }
     }
 
-    // Otherwise validate as magnet link
     validate_magnet(input)
 }
 
@@ -89,6 +114,31 @@ pub fn validate_magnet(link: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_buffer_starts_empty() {
+        let w = InputWidget::new();
+        assert_eq!(w.value(), "");
+    }
+
+    #[test]
+    fn input_buffer_push_pop() {
+        let mut w = InputWidget::new();
+        w.push('a');
+        w.push('b');
+        w.push('c');
+        assert_eq!(w.value(), "abc");
+        w.pop();
+        assert_eq!(w.value(), "ab");
+    }
+
+    #[test]
+    fn input_buffer_clear() {
+        let mut w = InputWidget::new();
+        w.push('x');
+        w.clear();
+        assert_eq!(w.value(), "");
+    }
 
     #[test]
     fn valid_hex_magnet() {
