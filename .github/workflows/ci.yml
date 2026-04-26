@@ -15,8 +15,10 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  check:
-    name: Check & Lint
+  # Format and lint run only on Linux — they're platform-independent and
+  # running them three times wastes CI minutes.
+  lint:
+    name: Format & Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -34,6 +36,33 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Tests run on every OS we ship release artifacts for, so platform-specific
+  # regressions (path separators, terminal capabilities, notify-rust backend)
+  # are caught at PR time instead of release-build time.
+  test:
+    name: Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
       - name: Run tests
         run: cargo test --all
