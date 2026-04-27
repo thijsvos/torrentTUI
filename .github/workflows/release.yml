@@ -132,13 +132,13 @@ jobs:
       #   gh attestation verify <binary> --repo thijsvos/torrentTUI
       - name: Attest binary provenance (Unix)
         if: runner.os != 'Windows'
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ matrix.artifact }}
 
       - name: Attest binary provenance (Windows)
         if: runner.os == 'Windows'
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ matrix.artifact }}.exe
 
@@ -185,7 +185,7 @@ jobs:
           shasum -a 256 torrenttui-macos-universal.tar.gz > torrenttui-macos-universal.tar.gz.sha256
 
       - name: Attest universal binary provenance
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: torrenttui-macos-universal
 
