@@ -16,7 +16,7 @@ COPY src/ src/
 RUN touch src/main.rs && cargo build --release
 
 # Runtime stage
-FROM alpine:3.21
+FROM alpine:3.23
 
 RUN adduser -D -h /home/torrenttui torrenttui
 
