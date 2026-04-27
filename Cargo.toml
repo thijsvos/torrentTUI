@@ -19,10 +19,10 @@ futures = "0.3"
 # Serialization and config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.0"
 
 # Utilities
-dirs = "5"
+dirs = "6"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
