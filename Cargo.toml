@@ -27,7 +27,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
-fs4 = "0.12"
+fs4 = "1.1"
 notify-rust = "4"
 
 [profile.release]
