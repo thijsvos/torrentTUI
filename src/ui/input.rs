@@ -34,7 +34,21 @@ impl InputWidget {
     }
 
     pub fn push(&mut self, c: char) {
+        // Reject control chars (e.g. \x1b from an OSC sequence, \x07 BEL,
+        // raw newlines from a multi-line paste). Tabs are also dropped here
+        // since the input is a single-line magnet/path.
+        if c.is_control() {
+            return;
+        }
         self.buffer.push(c);
+    }
+
+    /// Push a string (e.g. the payload of a bracketed-paste event), filtering
+    /// control characters character-by-character.
+    pub fn push_str(&mut self, s: &str) {
+        for c in s.chars() {
+            self.push(c);
+        }
     }
 
     pub fn pop(&mut self) {
@@ -138,6 +152,30 @@ mod tests {
         w.push('x');
         w.clear();
         assert_eq!(w.value(), "");
+    }
+
+    #[test]
+    fn input_drops_control_chars() {
+        let mut w = InputWidget::new();
+        w.push('a');
+        w.push('\x1b'); // ESC
+        w.push('\x07'); // BEL
+        w.push('\n');
+        w.push('\t');
+        w.push('b');
+        assert_eq!(w.value(), "ab");
+    }
+
+    #[test]
+    fn input_push_str_filters_controls() {
+        let mut w = InputWidget::new();
+        w.push_str("magnet:?\x1b[31mxt=urn:btih:0123456789abcdef0123456789abcdef01234567\n");
+        // ANSI escape, the literal '[31m' bytes (printable), and the trailing
+        // newline are filtered: \x1b and \n are control chars; '[31m' is
+        // printable so it stays. The hash payload itself is unchanged.
+        assert!(w.value().starts_with("magnet:?[31mxt=urn:btih:"));
+        assert!(!w.value().contains('\n'));
+        assert!(!w.value().contains('\x1b'));
     }
 
     #[test]

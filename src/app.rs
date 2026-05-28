@@ -32,6 +32,17 @@ pub struct App {
     pub deselected_files: HashMap<usize, HashSet<usize>>,
     pub marked_ids: HashSet<usize>,
     pub detail_peer_index: usize,
+    /// Top peer-row index currently visible in the Peers tab. The renderer
+    /// updates this each frame to keep `detail_peer_index` in view; handlers
+    /// only mutate the index.
+    pub detail_peer_scroll_offset: usize,
+    /// Cached order of indices into `self.torrents` after applying the
+    /// current filter and sort. Rebuilt when `sort_dirty` is true. The cache
+    /// exists because `sorted_torrents()` is called multiple times per frame
+    /// (table, detail, key handlers) and the lowercase-for-filter + sort
+    /// work dominated CPU at hundreds of torrents.
+    sort_cache: Vec<usize>,
+    sort_dirty: bool,
     /// Wired from `config.general.confirm_on_quit`; when false, `q` quits
     /// immediately instead of opening the confirmation dialog.
     pub confirm_on_quit: bool,
@@ -70,19 +81,192 @@ impl App {
             deselected_files: HashMap::new(),
             marked_ids: HashSet::new(),
             detail_peer_index: 0,
+            detail_peer_scroll_offset: 0,
+            sort_cache: Vec::new(),
+            sort_dirty: true,
             confirm_on_quit: true,
         }
     }
 
     pub fn confirm_on_quit_required(&self) -> bool {
+        // Trigger on anything that's mid-work: downloading, resolving
+        // metadata, or actively seeding. Quitting on a seed-only session
+        // still cuts peers abruptly, which warrants the prompt.
         self.confirm_on_quit
-            && self
-                .torrents
+            && self.torrents.iter().any(|t| {
+                matches!(
+                    t.status,
+                    TorrentStatus::Downloading
+                        | TorrentStatus::FetchingMetadata
+                        | TorrentStatus::Seeding
+                )
+            })
+    }
+
+    /// Mark the cached sort order as dirty. Call from anywhere that mutates
+    /// `torrents`, `sort_column`, `sort_reversed`, or `filter_text`.
+    pub fn invalidate_sort(&mut self) {
+        self.sort_dirty = true;
+    }
+
+    /// Replace the torrent list and refresh derived state (sort cache,
+    /// selection bookkeeping, pruned marks). One canonical entry point so
+    /// callers can't forget to invalidate.
+    pub fn handle_state_push(&mut self, torrents: Vec<TorrentInfo>) {
+        self.torrents = torrents;
+        self.invalidate_sort();
+        self.prune_stale_state();
+        self.ensure_sort_cache();
+        self.restore_selection();
+    }
+
+    /// Set a new sort column and refresh the cache.
+    pub fn change_sort_column(&mut self, next: SortColumn) {
+        self.sort_column = next;
+        self.invalidate_sort();
+        self.ensure_sort_cache();
+        self.restore_selection();
+    }
+
+    /// Toggle the reversed flag and refresh.
+    pub fn toggle_sort_reversed(&mut self) {
+        self.sort_reversed = !self.sort_reversed;
+        self.invalidate_sort();
+        self.ensure_sort_cache();
+        self.restore_selection();
+    }
+
+    /// Append a character to the filter and refresh.
+    pub fn push_filter_char(&mut self, c: char) {
+        self.filter_text.push(c);
+        self.invalidate_sort();
+        self.ensure_sort_cache();
+        self.restore_selection();
+    }
+
+    /// Drop the trailing filter character and refresh.
+    pub fn pop_filter_char(&mut self) {
+        self.filter_text.pop();
+        self.invalidate_sort();
+        self.ensure_sort_cache();
+        self.restore_selection();
+    }
+
+    /// Empty the filter and refresh.
+    pub fn clear_filter(&mut self) {
+        if !self.filter_text.is_empty() {
+            self.filter_text.clear();
+            self.invalidate_sort();
+            self.ensure_sort_cache();
+        }
+        self.restore_selection();
+    }
+
+    fn rebuild_sort_cache(&mut self) {
+        let filter_lower = self.filter_text.to_lowercase();
+        // Collect indices into `self.torrents` after applying the filter.
+        let mut indices: Vec<usize> = self
+            .torrents
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                if filter_lower.is_empty() {
+                    true
+                } else {
+                    t.name.to_lowercase().contains(&filter_lower)
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if self.sort_column == SortColumn::Name {
+            // Lowercase keys precomputed so each name is lowered once, not
+            // O(N log N) times during sort comparisons.
+            let lc: Vec<String> = indices
                 .iter()
-                .any(|t| matches!(t.status, TorrentStatus::Downloading))
+                .map(|&i| self.torrents[i].name.to_lowercase())
+                .collect();
+            let mut pos: Vec<usize> = (0..indices.len()).collect();
+            pos.sort_by(|&a, &b| {
+                let cmp = lc[a].cmp(&lc[b]);
+                if self.sort_reversed {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
+            });
+            indices = pos.into_iter().map(|i| indices[i]).collect();
+        } else {
+            let sort_column = self.sort_column;
+            let sort_reversed = self.sort_reversed;
+            let torrents = &self.torrents;
+            indices.sort_by(|&a, &b| {
+                let ta = &torrents[a];
+                let tb = &torrents[b];
+                let cmp = match sort_column {
+                    SortColumn::Index => ta.id.cmp(&tb.id),
+                    SortColumn::Name => {
+                        // Handled by the early-return above; degrade gracefully.
+                        debug_assert!(false, "SortColumn::Name should hit the early return");
+                        std::cmp::Ordering::Equal
+                    }
+                    SortColumn::Size => ta.size_bytes.cmp(&tb.size_bytes),
+                    SortColumn::Progress => ta
+                        .progress_percent()
+                        .partial_cmp(&tb.progress_percent())
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                    SortColumn::Speed => ta.download_speed.cmp(&tb.download_speed),
+                    SortColumn::Peers => ta.peers_connected.cmp(&tb.peers_connected),
+                    SortColumn::Eta => match (ta.eta_seconds, tb.eta_seconds) {
+                        (Some(a_eta), Some(b_eta)) => a_eta.cmp(&b_eta),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    },
+                    SortColumn::Status => ta.status.to_string().cmp(&tb.status.to_string()),
+                };
+                if sort_reversed {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
+            });
+        }
+
+        self.sort_cache = indices;
+        self.sort_dirty = false;
     }
 
     pub fn sorted_torrents(&self) -> Vec<&TorrentInfo> {
+        // Read path: never rebuild. Callers that need a fresh cache must
+        // ensure invalidate_sort + ensure_sort_cache ran first; for the
+        // hot path this is wrapped by the convenience methods below.
+        if self.sort_dirty {
+            // Fall back to the live sort when called before the cache has
+            // been (re)built. Avoids needing `&mut self` in render paths.
+            // This branch is also what tests rely on — they construct an
+            // App and immediately call sorted_torrents without a state push.
+            return self.sorted_torrents_live();
+        }
+        self.sort_cache
+            .iter()
+            .filter_map(|&i| self.torrents.get(i))
+            .collect()
+    }
+
+    /// Refresh the sort cache if dirty. Call before render paths that need
+    /// fresh data. The hot path (run_app) keeps this cheap by invalidating
+    /// only when the underlying inputs change.
+    pub fn ensure_sort_cache(&mut self) {
+        if self.sort_dirty {
+            self.rebuild_sort_cache();
+        }
+    }
+
+    /// Live (uncached) sort. Used as a fallback in `sorted_torrents()` when
+    /// the cache is dirty and the caller only has `&self`. Keeps the original
+    /// O(N log N) cost but skips the lowercase keys allocation when not Name.
+    fn sorted_torrents_live(&self) -> Vec<&TorrentInfo> {
         let filter_lower = self.filter_text.to_lowercase();
         let mut torrents: Vec<&TorrentInfo> = self
             .torrents
@@ -96,8 +280,6 @@ impl App {
             })
             .collect();
 
-        // Pre-compute lowercase keys once when sorting by Name (instead of
-        // allocating two Strings per comparison).
         if self.sort_column == SortColumn::Name {
             let lc: Vec<String> = torrents.iter().map(|t| t.name.to_lowercase()).collect();
             let mut indices: Vec<usize> = (0..torrents.len()).collect();
@@ -109,14 +291,16 @@ impl App {
                     cmp
                 }
             });
-            torrents = indices.into_iter().map(|i| torrents[i]).collect();
-            return torrents;
+            return indices.into_iter().map(|i| torrents[i]).collect();
         }
 
         torrents.sort_by(|a, b| {
             let cmp = match self.sort_column {
                 SortColumn::Index => a.id.cmp(&b.id),
-                SortColumn::Name => unreachable!(),
+                SortColumn::Name => {
+                    debug_assert!(false, "SortColumn::Name should hit the early return");
+                    std::cmp::Ordering::Equal
+                }
                 SortColumn::Size => a.size_bytes.cmp(&b.size_bytes),
                 SortColumn::Progress => a
                     .progress_percent()
@@ -196,6 +380,35 @@ impl App {
         self.selected_index = new_index;
         self.selected_torrent_id = new_id;
         self.table_state.select(Some(self.selected_index));
+        self.clamp_detail_indices();
+    }
+
+    /// Clamp detail-view indices against the currently selected torrent's
+    /// file/peer counts. Called after every state push so a torrent that
+    /// briefly drops to FetchingMetadata (files emptied) or that gains/loses
+    /// peers can't leave the cursor pointing past the end of the list.
+    pub fn clamp_detail_indices(&mut self) {
+        // Extract bounds in a scope so the immutable borrow of `self` is
+        // released before we mutate the index fields.
+        let bounds = self
+            .selected_torrent()
+            .map(|t| (t.files.len(), t.peers.len()));
+        match bounds {
+            Some((file_count, peer_count)) => {
+                let file_max = file_count.saturating_sub(1);
+                if self.detail_file_index > file_max {
+                    self.detail_file_index = file_max;
+                }
+                let peer_max = peer_count.saturating_sub(1);
+                if self.detail_peer_index > peer_max {
+                    self.detail_peer_index = peer_max;
+                }
+            }
+            None => {
+                self.detail_file_index = 0;
+                self.detail_peer_index = 0;
+            }
+        }
     }
 
     /// Drop UI-side bookkeeping for torrents that are no longer in the list.

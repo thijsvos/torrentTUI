@@ -11,8 +11,8 @@ use app::App;
 use clap::Parser;
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -51,7 +51,12 @@ async fn main() -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         original_hook(panic_info);
     }));
 
@@ -90,11 +95,15 @@ async fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste is best-effort: terminals that don't support it (e.g.
+    // some Windows consoles) just won't send Event::Paste, and that's fine.
+    let _ = execute!(stdout, EnableBracketedPaste);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_app(&mut terminal, cli, config, config_warning).await;
 
+    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -142,11 +151,14 @@ async fn run_app(
     let (msg_tx, mut msg_rx) = mpsc::channel::<String>(16);
 
     let engine_config = config.clone();
-    tokio::spawn(async move {
+    // Keep the JoinHandle so we can both detect engine death mid-run and
+    // await its persistence flush on shutdown. Wrapped in Option so we can
+    // consume it from either path.
+    let mut engine_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
         if let Err(e) = engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx).await {
             tracing::error!("Engine error: {}", e);
         }
-    });
+    }));
 
     if let Some(ref source) = cli.torrent_source {
         match validate_torrent_source(source) {
@@ -164,10 +176,24 @@ async fn run_app(
     let mut needs_render = true;
 
     loop {
+        // Detect engine death: previously a panic in the spawned task would
+        // silently drop the JoinHandle and the UI would keep rendering stale
+        // state with no indication. is_finished() is a cheap flag read.
+        if engine_handle.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(h) = engine_handle.take() {
+                match h.await {
+                    Ok(()) => tracing::info!("Engine task ended"),
+                    Err(e) => tracing::error!("Engine task panicked: {}", e),
+                }
+            }
+            if !app.should_quit {
+                app.set_error("Engine task ended unexpectedly; quitting".to_string());
+                app.should_quit = true;
+            }
+        }
+
         while let Ok(torrents) = state_rx.try_recv() {
-            app.torrents = torrents;
-            app.prune_stale_state();
-            app.restore_selection();
+            app.handle_state_push(torrents);
             needs_render = true;
         }
         while let Ok(msg) = msg_rx.try_recv() {
@@ -186,7 +212,7 @@ async fn run_app(
 
                 match app.mode {
                     AppMode::Detail => {
-                        ui::detail::render_detail(f, chunks[1], &app);
+                        ui::detail::render_detail(f, chunks[1], &mut app);
                         app.table_area = None;
                     }
                     _ => {
@@ -238,6 +264,11 @@ async fn run_app(
 
         if app.should_quit {
             send_cmd(&cmd_tx, EngineCommand::Shutdown, &mut app).await;
+            // Give the engine task a chance to flush librqbit's persisted
+            // state. The timeout caps how long we wait if it's stuck.
+            if let Some(h) = engine_handle.take() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
+            }
             return Ok(());
         }
 
@@ -250,10 +281,21 @@ async fn run_app(
                         }
                         // Ctrl+C: first opens quit dialog, second force-quits
                         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            let was_detail = app.mode == AppMode::Detail;
                             if app.mode == AppMode::ConfirmQuit {
                                 app.should_quit = true;
                             } else {
                                 app.mode = AppMode::ConfirmQuit;
+                            }
+                            if was_detail {
+                                // Quit dialog overlays Detail — drop the heavy
+                                // per-tick allocations until the user returns.
+                                send_cmd(
+                                    &cmd_tx,
+                                    EngineCommand::SetDetailTorrent(None),
+                                    &mut app,
+                                )
+                                .await;
                             }
                             needs_render = true;
                             continue;
@@ -270,6 +312,22 @@ async fn run_app(
                         }
                         needs_render = true;
                     }
+                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::Input => {
+                        // Bracketed-paste payload (e.g. a magnet link from the
+                        // clipboard). push_str filters control chars per-char
+                        // so escape sequences in the paste never reach the
+                        // buffer or the engine.
+                        input_widget.push_str(&s);
+                        needs_render = true;
+                    }
+                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::Filter => {
+                        for c in s.chars() {
+                            if !c.is_control() {
+                                app.push_filter_char(c);
+                            }
+                        }
+                        needs_render = true;
+                    }
                     Some(Ok(Event::Mouse(mouse)))
                         if app.mode == AppMode::Normal
                             && matches!(
@@ -278,7 +336,10 @@ async fn run_app(
                             ) =>
                     {
                         if let Some(area) = app.table_area {
-                            // Table has 1-cell border top + 1-row header
+                            // Layout: row 0 top-border, row 1 header, rows 2..h-2
+                            // data, row h-1 bottom-border. `< content_bottom`
+                            // (= area.y + h - 1) correctly excludes the bottom
+                            // border row.
                             let content_y = area.y + 2;
                             let content_bottom = area.y + area.height.saturating_sub(1);
                             if mouse.row >= content_y
@@ -304,9 +365,7 @@ async fn run_app(
                 }
             }
             Some(torrents) = state_rx.recv() => {
-                app.torrents = torrents;
-                app.prune_stale_state();
-                app.restore_selection();
+                app.handle_state_push(torrents);
                 needs_render = true;
             }
             Some(msg) = msg_rx.recv() => {
@@ -368,14 +427,15 @@ async fn handle_normal_mode(
                                 || t.throttle_paused)
                     })
                 });
-                for id in &ids {
-                    let cmd = if any_paused {
-                        EngineCommand::Resume(*id)
-                    } else {
-                        EngineCommand::Pause(*id)
-                    };
-                    send_cmd(cmd_tx, cmd, app).await;
-                }
+                // Send the whole batch as one message — the 32-slot channel
+                // would block on send #33 otherwise, and the engine's own
+                // state_tx send (4-slot) could deadlock while the UI waits.
+                let cmd = if any_paused {
+                    EngineCommand::ResumeMany(ids)
+                } else {
+                    EngineCommand::PauseMany(ids)
+                };
+                send_cmd(cmd_tx, cmd, app).await;
                 app.clear_marks();
             } else if let Some(torrent) = app.selected_torrent() {
                 let id = torrent.id;
@@ -421,17 +481,21 @@ async fn handle_normal_mode(
             app.detail_tab = DetailTab::Stats;
             app.detail_file_index = 0;
             app.detail_peer_index = 0;
+            app.detail_peer_scroll_offset = 0;
+            // Tell the engine which torrent we're viewing so the next
+            // snapshot includes files/peers/info for only this one.
+            let detail_id = app.selected_torrent_id;
+            send_cmd(cmd_tx, EngineCommand::SetDetailTorrent(detail_id), app).await;
         }
         KeyCode::Char('?') => {
             app.mode = AppMode::Help;
         }
         KeyCode::Tab => {
-            app.sort_column = app.sort_column.next();
-            app.restore_selection();
+            let next = app.sort_column.next();
+            app.change_sort_column(next);
         }
         KeyCode::Char('r') => {
-            app.sort_reversed = !app.sort_reversed;
-            app.restore_selection();
+            app.toggle_sort_reversed();
         }
         KeyCode::Char('/') => {
             app.mode = AppMode::Filter;
@@ -503,11 +567,15 @@ async fn handle_detail_mode(
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = AppMode::Normal;
+            // Detail mode left — stop the engine from materializing
+            // files/peers for the (now-hidden) torrent.
+            send_cmd(cmd_tx, EngineCommand::SetDetailTorrent(None), app).await;
         }
         KeyCode::Tab => {
             app.detail_tab = app.detail_tab.next();
             app.detail_file_index = 0;
             app.detail_peer_index = 0;
+            app.detail_peer_scroll_offset = 0;
         }
         KeyCode::Char('j') | KeyCode::Down => match app.detail_tab {
             DetailTab::Files => {
@@ -560,16 +628,23 @@ async fn handle_detail_mode(
             if let Some(torrent) = app.selected_torrent() {
                 let torrent_id = torrent.id;
                 let total_files = torrent.files.len();
-                let selected = app.selected_file_indices(torrent_id, total_files);
-                send_cmd(
-                    cmd_tx,
-                    EngineCommand::SetSelectedFiles {
-                        id: torrent_id,
-                        file_indices: selected,
-                    },
-                    app,
-                )
-                .await;
+                // Don't send an empty file selection — librqbit may interpret
+                // it as "deselect everything" and pause the torrent. This
+                // happens when the torrent briefly returns to FetchingMetadata.
+                if total_files == 0 {
+                    app.set_info("No files to apply yet (still fetching metadata)".to_string());
+                } else {
+                    let selected = app.selected_file_indices(torrent_id, total_files);
+                    send_cmd(
+                        cmd_tx,
+                        EngineCommand::SetSelectedFiles {
+                            id: torrent_id,
+                            file_indices: selected,
+                        },
+                        app,
+                    )
+                    .await;
+                }
             }
         }
         _ => {}
@@ -588,21 +663,18 @@ fn handle_help_mode(app: &mut App, key: crossterm::event::KeyEvent) {
 fn handle_filter_mode(app: &mut App, key: crossterm::event::KeyEvent) {
     match key.code {
         KeyCode::Esc => {
-            app.filter_text.clear();
+            app.clear_filter();
             app.mode = AppMode::Normal;
-            app.restore_selection();
         }
         KeyCode::Enter => {
             app.mode = AppMode::Normal;
             app.restore_selection();
         }
         KeyCode::Backspace => {
-            app.filter_text.pop();
-            app.restore_selection();
+            app.pop_filter_char();
         }
         KeyCode::Char(c) => {
-            app.filter_text.push(c);
-            app.restore_selection();
+            app.push_filter_char(c);
         }
         _ => {}
     }
@@ -668,17 +740,15 @@ async fn handle_delete_mode(
         KeyCode::Char('k') => {
             if app.has_marks() {
                 let ids: Vec<usize> = app.marked_ids.iter().copied().collect();
-                for id in ids {
-                    send_cmd(
-                        cmd_tx,
-                        EngineCommand::Delete {
-                            id,
-                            delete_files: false,
-                        },
-                        app,
-                    )
-                    .await;
-                }
+                send_cmd(
+                    cmd_tx,
+                    EngineCommand::DeleteMany {
+                        ids,
+                        delete_files: false,
+                    },
+                    app,
+                )
+                .await;
                 app.clear_marks();
             } else if let Some(torrent) = app.selected_torrent() {
                 let id = torrent.id;
@@ -697,17 +767,15 @@ async fn handle_delete_mode(
         KeyCode::Char('d') => {
             if app.has_marks() {
                 let ids: Vec<usize> = app.marked_ids.iter().copied().collect();
-                for id in ids {
-                    send_cmd(
-                        cmd_tx,
-                        EngineCommand::Delete {
-                            id,
-                            delete_files: true,
-                        },
-                        app,
-                    )
-                    .await;
-                }
+                send_cmd(
+                    cmd_tx,
+                    EngineCommand::DeleteMany {
+                        ids,
+                        delete_files: true,
+                    },
+                    app,
+                )
+                .await;
                 app.clear_marks();
             } else if let Some(torrent) = app.selected_torrent() {
                 let id = torrent.id;

@@ -12,9 +12,9 @@ use crate::ui::layout::{format_eta, format_size, format_speed};
 use crate::ui::progress::render_progress_bar;
 use crate::ui::util::truncate;
 
-pub fn render_detail(f: &mut Frame, area: Rect, app: &App) {
-    let torrent = match app.selected_torrent() {
-        Some(t) => t,
+pub fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
+    let (torrent_name, tab_index) = match app.selected_torrent() {
+        Some(t) => (t.name.clone(), app.detail_tab.index()),
         None => return,
     };
 
@@ -29,7 +29,7 @@ pub fn render_detail(f: &mut Frame, area: Rect, app: &App) {
 
     // Header
     let header = Paragraph::new(Line::from(vec![Span::styled(
-        &torrent.name,
+        torrent_name,
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -45,7 +45,7 @@ pub fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     // Tabs
     let tab_titles = vec!["Stats", "Info", "Files", "Peers"];
     let tabs = Tabs::new(tab_titles)
-        .select(app.detail_tab.index())
+        .select(tab_index)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
             Style::default()
@@ -287,22 +287,28 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(files_widget, area);
 }
 
-fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
-    let torrent = match app.selected_torrent() {
-        Some(t) => t,
+fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
+    // Pull just what we need so the immutable borrow ends before we touch
+    // `app` mutably to update scroll state.
+    let (peers, peers_connected, peers_total) = match app.selected_torrent() {
+        Some(t) => {
+            let mut sorted: Vec<PeerInfo> = t.peers.clone();
+            sorted.sort_by_key(|p| std::cmp::Reverse(p.downloaded_bytes));
+            (sorted, t.peers_connected, t.peers_total)
+        }
         None => return,
     };
 
-    if torrent.peers.is_empty() {
+    if peers.is_empty() {
         let text = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Connected:  ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{}", torrent.peers_connected)),
+                Span::raw(format!("{}", peers_connected)),
             ]),
             Line::from(vec![
                 Span::styled("  Total seen: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{}", torrent.peers_total)),
+                Span::raw(format!("{}", peers_total)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -321,17 +327,34 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Sort lazily here so the engine doesn't sort every torrent's peers on
-    // every state push (only the selected torrent is ever displayed).
-    let mut peers: Vec<&PeerInfo> = torrent.peers.iter().collect();
-    peers.sort_by_key(|p| std::cmp::Reverse(p.downloaded_bytes));
+    let visible_height = area.height.saturating_sub(6) as usize; // borders + header lines
+    let peer_count = peers.len();
+    let peer_index = app.detail_peer_index.min(peer_count.saturating_sub(1));
+    app.detail_peer_index = peer_index;
+
+    // Keep the cursor visible. Track scroll_offset separately on App so
+    // pressing `j` past the bottom of the visible window actually scrolls;
+    // the previous cap-by-min logic froze the cursor at row 0 until the
+    // very end of the list.
+    if peer_index < app.detail_peer_scroll_offset {
+        app.detail_peer_scroll_offset = peer_index;
+    }
+    if visible_height > 0 && peer_index >= app.detail_peer_scroll_offset + visible_height {
+        app.detail_peer_scroll_offset = peer_index + 1 - visible_height;
+    }
+    // Bound to [0, peer_count - visible_height] when the list shrinks.
+    let max_offset = peer_count.saturating_sub(visible_height.max(1));
+    if app.detail_peer_scroll_offset > max_offset {
+        app.detail_peer_scroll_offset = max_offset;
+    }
+    let scroll_offset = app.detail_peer_scroll_offset;
 
     let mut lines = vec![
         Line::from(vec![
             Span::styled("  Connected: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}", torrent.peers_connected)),
+            Span::raw(format!("{}", peers_connected)),
             Span::styled("  /  Total seen: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}", torrent.peers_total)),
+            Span::raw(format!("{}", peers_total)),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -344,16 +367,6 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )]),
     ];
-
-    // Respect scroll offset
-    let visible_height = area.height.saturating_sub(6) as usize; // borders + header lines
-    let peer_count = peers.len();
-    let peer_index = app.detail_peer_index.min(peer_count.saturating_sub(1));
-    let scroll_offset = if peer_count > visible_height {
-        peer_index.min(peer_count.saturating_sub(visible_height))
-    } else {
-        0
-    };
 
     for (i, peer) in peers
         .iter()
