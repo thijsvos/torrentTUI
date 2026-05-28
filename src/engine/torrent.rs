@@ -55,8 +55,18 @@ pub enum EngineCommand {
     AddTorrent(String),
     Pause(usize),
     Resume(usize),
+    /// Bulk pause. Replaces a fan-out of N `Pause(id)` sends from the UI,
+    /// which could deadlock on the 32-slot command channel for >32 marks.
+    PauseMany(Vec<usize>),
+    /// Bulk resume — see `PauseMany`.
+    ResumeMany(Vec<usize>),
     Delete {
         id: usize,
+        delete_files: bool,
+    },
+    /// Bulk delete — see `PauseMany`.
+    DeleteMany {
+        ids: Vec<usize>,
         delete_files: bool,
     },
     PauseAll,
@@ -69,6 +79,11 @@ pub enum EngineCommand {
         id: usize,
         file_indices: Vec<usize>,
     },
+    /// Tell the engine which torrent the UI is showing in Detail mode (or
+    /// `None` when leaving Detail). The engine populates the heavy
+    /// `files` / `peers` fields only for that torrent, dropping per-tick
+    /// allocations from O(N × peers × files) to O(peers + files).
+    SetDetailTorrent(Option<usize>),
     Shutdown,
 }
 
@@ -91,11 +106,14 @@ impl TorrentEngine {
         std::fs::create_dir_all(&download_dir)?;
 
         let port = config.network.listen_port;
+        // Saturate against u16::MAX so a high `listen_port` never panics
+        // (debug) or wraps to an empty range (release).
+        let port_end = port.saturating_add(PORT_RANGE_SIZE);
         let opts = SessionOptions {
             disable_dht: !config.network.enable_dht,
             fastresume: true,
             persistence: Some(SessionPersistenceConfig::Json { folder: None }),
-            listen_port_range: Some(port..port + PORT_RANGE_SIZE),
+            listen_port_range: Some(port..port_end),
             enable_upnp_port_forwarding: config.network.enable_upnp,
             ..Default::default()
         };
@@ -179,7 +197,13 @@ impl TorrentEngine {
         })
     }
 
-    pub fn get_all_torrents(&self) -> Vec<TorrentInfo> {
+    /// Build per-torrent snapshots for the UI. When `detail_id` is `Some`,
+    /// only that torrent gets its `files` and `peers` populated (and the
+    /// `trackers` / `info_hash` / `piece_length` info fields). All other
+    /// torrents get empty placeholders. The full path was hot: ~5000
+    /// FileInfo + PeerInfo allocations per tick at 50 torrents × 100 files
+    /// × 50 peers, of which the UI only ever displayed one torrent's worth.
+    pub fn get_all_torrents(&self, detail_id: Option<usize>) -> Vec<TorrentInfo> {
         self.session.with_torrents(|iter| {
             iter.map(|(id, handle)| {
                 let stats = handle.stats();
@@ -212,51 +236,76 @@ impl TorrentEngine {
                     0
                 };
 
-                let files = handle
-                    .with_metadata(|meta| {
-                        meta.file_infos
-                            .iter()
-                            .enumerate()
-                            .map(|(i, fi)| {
-                                let progress = stats.file_progress.get(i).copied().unwrap_or(0);
-                                FileInfo {
-                                    name: sanitize_display(&fi.relative_filename.to_string_lossy()),
-                                    size_bytes: fi.len,
-                                    progress_bytes: progress,
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let is_detail = detail_id == Some(id);
 
-                let info_hash = handle.info_hash().as_string();
-                let trackers: Vec<String> = handle
-                    .shared()
-                    .trackers
-                    .iter()
-                    .map(|u| u.to_string())
-                    .collect();
-                let piece_length = handle.with_metadata(|m| m.info.piece_length).ok();
+                let files = if is_detail {
+                    handle
+                        .with_metadata(|meta| {
+                            meta.file_infos
+                                .iter()
+                                .enumerate()
+                                .map(|(i, fi)| {
+                                    let progress =
+                                        stats.file_progress.get(i).copied().unwrap_or(0);
+                                    FileInfo {
+                                        name: sanitize_display(
+                                            &fi.relative_filename.to_string_lossy(),
+                                        ),
+                                        size_bytes: fi.len,
+                                        progress_bytes: progress,
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                let info_hash = if is_detail {
+                    handle.info_hash().as_string()
+                } else {
+                    String::new()
+                };
+                let trackers: Vec<String> = if is_detail {
+                    handle
+                        .shared()
+                        .trackers
+                        .iter()
+                        .map(|u| u.to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let piece_length = if is_detail {
+                    handle.with_metadata(|m| m.info.piece_length).ok()
+                } else {
+                    None
+                };
 
                 // Don't sort here: only the selected torrent's peers are ever
                 // displayed, and the detail-view renderer sorts lazily.
-                let peers: Vec<PeerInfo> = handle
-                    .live()
-                    .map(|live| {
-                        let snapshot = live.per_peer_stats_snapshot(Default::default());
-                        snapshot
-                            .peers
-                            .into_iter()
-                            .map(|(addr, ps)| PeerInfo {
-                                address: addr,
-                                state: ps.state.to_string(),
-                                downloaded_bytes: ps.counters.fetched_bytes,
-                                pieces: ps.counters.downloaded_and_checked_pieces,
-                                errors: ps.counters.errors,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let peers: Vec<PeerInfo> = if is_detail {
+                    handle
+                        .live()
+                        .map(|live| {
+                            let snapshot = live.per_peer_stats_snapshot(Default::default());
+                            snapshot
+                                .peers
+                                .into_iter()
+                                .map(|(addr, ps)| PeerInfo {
+                                    address: addr,
+                                    state: ps.state.to_string(),
+                                    downloaded_bytes: ps.counters.fetched_bytes,
+                                    pieces: ps.counters.downloaded_and_checked_pieces,
+                                    errors: ps.counters.errors,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
 
                 TorrentInfo {
                     id,
@@ -354,12 +403,40 @@ pub async fn run_engine(
     let engine = TorrentEngine::new(&config).await?;
 
     // Watch folder for auto-adding torrents. Off by default; only enabled if
-    // the user opts in via config.
+    // the user opts in via config. Failures here must not abort the engine
+    // task — the UI would silently stop receiving state updates and a single
+    // bad config knob would brick the whole app.
     if let Some(ref dir) = config.general.watch_dir {
         let path = PathBuf::from(dir);
-        std::fs::create_dir_all(&path)?;
-        engine.session().watch_folder(&path);
-        tracing::info!("Watching folder: {}", dir);
+        let download_dir = PathBuf::from(&config.general.download_dir);
+        // Compare canonicalized paths when possible (handles trailing slash,
+        // case-insensitive volumes, etc.); fall back to literal path equality.
+        let watch_eq_download = match (path.canonicalize(), download_dir.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => path == download_dir,
+        };
+        if watch_eq_download {
+            let _ = msg_tx
+                .send(
+                    "Watch folder disabled: equal to download_dir would loop"
+                        .to_string(),
+                )
+                .await;
+            tracing::warn!("watch_dir equals download_dir; refusing to watch");
+        } else {
+            match std::fs::create_dir_all(&path) {
+                Ok(()) => {
+                    engine.session().watch_folder(&path);
+                    tracing::info!("Watching folder: {}", dir);
+                }
+                Err(e) => {
+                    let _ = msg_tx
+                        .send(format!("Watch folder disabled: {}", e))
+                        .await;
+                    tracing::warn!("watch_dir {:?} unavailable: {}", dir, e);
+                }
+            }
+        }
     }
 
     let enable_notifications = config.ui.enable_notifications;
@@ -383,6 +460,9 @@ pub async fn run_engine(
     let mut cached_upload_speed: HashMap<usize, u64> = HashMap::new();
     let mut speed_tracker: HashMap<usize, (std::time::Instant, u64, u64)> = HashMap::new();
     let mut per_torrent_last_change: HashMap<usize, std::time::Instant> = HashMap::new();
+    // Tracks which torrent the UI is showing in Detail mode. When None, the
+    // per-tick snapshot skips files/peers/trackers entirely.
+    let mut detail_torrent_id: Option<usize> = None;
 
     #[allow(clippy::too_many_arguments)]
     async fn push_state(
@@ -396,9 +476,10 @@ pub async fn run_engine(
         cached_upload_speed: &mut HashMap<usize, u64>,
         speed_tracker: &mut HashMap<usize, (std::time::Instant, u64, u64)>,
         enable_notifications: bool,
+        detail_id: Option<usize>,
     ) {
         let now = std::time::Instant::now();
-        let mut torrents = engine.get_all_torrents();
+        let mut torrents = engine.get_all_torrents(detail_id);
 
         let current_ids: HashSet<usize> = torrents.iter().map(|t| t.id).collect();
         finished_set.retain(|id| current_ids.contains(id));
@@ -562,6 +643,62 @@ pub async fn run_engine(
                         cached_upload_speed.remove(&id);
                         speed_tracker.remove(&id);
                     }
+                    Some(EngineCommand::PauseMany(ids)) => {
+                        for id in ids {
+                            if let Some(handle) = engine.get_handle(id) {
+                                if let Err(e) = engine.pause(&handle).await {
+                                    tracing::error!("Failed to pause torrent {}: {}", id, e);
+                                }
+                            }
+                            user_paused.insert(id);
+                            throttle_paused.remove(&id);
+                            throttle_managed.remove(&id);
+                            per_torrent_tokens.remove(&id);
+                            per_torrent_prev_bytes.remove(&id);
+                            per_torrent_last_change.remove(&id);
+                            cached_upload_speed.remove(&id);
+                            speed_tracker.remove(&id);
+                        }
+                    }
+                    Some(EngineCommand::ResumeMany(ids)) => {
+                        let throttling = download_limit_bps > 0 || upload_limit_bps > 0;
+                        for id in ids {
+                            if let Some(handle) = engine.get_handle(id) {
+                                if let Err(e) = engine.unpause(&handle).await {
+                                    tracing::error!("Failed to resume torrent {}: {}", id, e);
+                                }
+                            }
+                            user_paused.remove(&id);
+                            throttle_paused.remove(&id);
+                            if throttling {
+                                throttle_managed.insert(id);
+                            } else {
+                                throttle_managed.remove(&id);
+                            }
+                            per_torrent_tokens.insert(id, 0);
+                            per_torrent_prev_bytes.remove(&id);
+                            per_torrent_last_change.remove(&id);
+                            cached_upload_speed.remove(&id);
+                        }
+                        ul_tokens = 0;
+                        last_throttle_tick = std::time::Instant::now();
+                    }
+                    Some(EngineCommand::DeleteMany { ids, delete_files }) => {
+                        for id in ids {
+                            if let Err(e) = engine.delete(id, delete_files).await {
+                                tracing::error!("Failed to delete torrent {}: {}", id, e);
+                            }
+                            finished_set.remove(&id);
+                            user_paused.remove(&id);
+                            throttle_paused.remove(&id);
+                            throttle_managed.remove(&id);
+                            per_torrent_tokens.remove(&id);
+                            per_torrent_prev_bytes.remove(&id);
+                            per_torrent_last_change.remove(&id);
+                            cached_upload_speed.remove(&id);
+                            speed_tracker.remove(&id);
+                        }
+                    }
                     Some(EngineCommand::PauseAll) => {
                         for (id, handle) in engine.handle_snapshot() {
                             let _ = engine.pause(&handle).await;
@@ -621,6 +758,11 @@ pub async fn run_engine(
                             throttle_managed.clear();
                         }
                     }
+                    Some(EngineCommand::SetDetailTorrent(id)) => {
+                        detail_torrent_id = id;
+                        // push_state runs at the bottom of this arm and will
+                        // populate (or strip) files/peers for the new target.
+                    }
                     Some(EngineCommand::SetSelectedFiles { id, file_indices }) => {
                         if let Some(handle) = engine.get_handle(id) {
                             let file_set: HashSet<usize> = file_indices.iter().copied().collect();
@@ -643,13 +785,20 @@ pub async fn run_engine(
                         break;
                     }
                 }
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications).await;
+                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id).await;
             }
             _ = tokio::time::sleep(THROTTLE_TICK) => {
                 let throttling = download_limit_bps > 0 || upload_limit_bps > 0;
                 if throttling {
                     let now = std::time::Instant::now();
-                    let elapsed_secs = now.duration_since(last_throttle_tick).as_secs_f64();
+                    // Clamp at 1s so a system suspend-resume can't credit
+                    // hours of fictitious bytes into the token buckets (the
+                    // upload-bucket math at `ul_delta as i64` would otherwise
+                    // saturate to i64::MAX and corrupt `prev_ul_estimated`).
+                    let elapsed_secs = now
+                        .duration_since(last_throttle_tick)
+                        .as_secs_f64()
+                        .min(1.0);
                     last_throttle_tick = now;
 
                     // Lightweight snapshot avoids the full peer/file allocation
@@ -691,7 +840,16 @@ pub async fn run_engine(
                             let prev = per_torrent_prev_bytes
                                 .entry(t.id)
                                 .or_insert(t.downloaded_bytes);
-                            let delta = t.downloaded_bytes.saturating_sub(*prev) as i64;
+                            // While throttle-paused, librqbit can still settle
+                            // in-flight pieces — debiting that against the
+                            // active bucket would keep tokens below the unpause
+                            // threshold forever. Reset the cursor so the next
+                            // active tick measures only real flow.
+                            let delta = if throttle_paused.contains(&t.id) {
+                                0
+                            } else {
+                                t.downloaded_bytes.saturating_sub(*prev) as i64
+                            };
                             *prev = t.downloaded_bytes;
 
                             let tokens_entry = per_torrent_tokens.entry(t.id).or_insert(0);
@@ -799,7 +957,7 @@ pub async fn run_engine(
                     per_torrent_last_change.retain(|id, _| current_ids.contains(id));
                 }
 
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications).await;
+                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id).await;
             }
         }
     }

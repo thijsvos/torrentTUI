@@ -143,7 +143,17 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&path, content)?;
+        // Atomic write: tmp file + fsync + rename. A power loss or SIGKILL
+        // mid-write would otherwise leave the user with a zero-byte config
+        // and silently restored defaults on next launch.
+        let tmp = path.with_extension("toml.tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 }
