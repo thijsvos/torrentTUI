@@ -154,14 +154,11 @@ async fn run_app(
     // Keep the JoinHandle so we can both detect engine death mid-run and
     // await its persistence flush on shutdown. Wrapped in Option so we can
     // consume it from either path.
-    let mut engine_handle: Option<tokio::task::JoinHandle<()>> =
-        Some(tokio::spawn(async move {
-            if let Err(e) =
-                engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx).await
-            {
-                tracing::error!("Engine error: {}", e);
-            }
-        }));
+    let mut engine_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
+        if let Err(e) = engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx).await {
+            tracing::error!("Engine error: {}", e);
+        }
+    }));
 
     if let Some(ref source) = cli.torrent_source {
         match validate_torrent_source(source) {

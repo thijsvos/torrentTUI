@@ -245,8 +245,7 @@ impl TorrentEngine {
                                 .iter()
                                 .enumerate()
                                 .map(|(i, fi)| {
-                                    let progress =
-                                        stats.file_progress.get(i).copied().unwrap_or(0);
+                                    let progress = stats.file_progress.get(i).copied().unwrap_or(0);
                                     FileInfo {
                                         name: sanitize_display(
                                             &fi.relative_filename.to_string_lossy(),
@@ -417,10 +416,7 @@ pub async fn run_engine(
         };
         if watch_eq_download {
             let _ = msg_tx
-                .send(
-                    "Watch folder disabled: equal to download_dir would loop"
-                        .to_string(),
-                )
+                .send("Watch folder disabled: equal to download_dir would loop".to_string())
                 .await;
             tracing::warn!("watch_dir equals download_dir; refusing to watch");
         } else {
@@ -430,9 +426,7 @@ pub async fn run_engine(
                     tracing::info!("Watching folder: {}", dir);
                 }
                 Err(e) => {
-                    let _ = msg_tx
-                        .send(format!("Watch folder disabled: {}", e))
-                        .await;
+                    let _ = msg_tx.send(format!("Watch folder disabled: {}", e)).await;
                     tracing::warn!("watch_dir {:?} unavailable: {}", dir, e);
                 }
             }
