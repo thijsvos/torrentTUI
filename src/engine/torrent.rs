@@ -1,14 +1,15 @@
 use crate::config::Config;
 use crate::types::{FileInfo, PeerInfo, TorrentInfo, TorrentStatus};
 use crate::ui::util::sanitize_display;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use librqbit::{
-    AddTorrent, AddTorrentResponse, ManagedTorrent, Session, SessionOptions,
-    SessionPersistenceConfig, TorrentStatsState,
+    http_api::HttpApi, AddTorrent, AddTorrentResponse, Api, ManagedTorrent, Session,
+    SessionOptions, SessionPersistenceConfig, TorrentStatsState,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 pub type ManagedTorrentHandle = Arc<ManagedTorrent>;
@@ -49,6 +50,19 @@ const BURST_MULTIPLIER: i64 = 2;
 const STATE_CHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(1000);
 
 // ---------------------------------------------------------------------------
+
+/// One-shot facts the engine pushes to the UI outside the per-tick state
+/// snapshot — currently just the HTTP API base URL, but the channel exists so
+/// future engine→UI metadata (listening port, DHT status, etc.) has a place
+/// to land without bloating the per-tick `Vec<TorrentInfo>`.
+#[derive(Debug, Clone)]
+pub enum EngineInfo {
+    /// The embedded HTTP API is listening on this base URL (e.g.
+    /// `http://127.0.0.1:34567`). Sent once at engine startup when the API
+    /// successfully binds. If the bind fails, no message is sent and the UI
+    /// keeps `http_api_base = None`, which disables stream-related keybinds.
+    HttpApiReady { base_url: String },
+}
 
 #[derive(Debug)]
 pub enum EngineCommand {
@@ -393,13 +407,71 @@ pub(crate) fn step_bucket(prev: i64, rate: i64, elapsed_secs: f64, bytes_delta: 
     next.min(rate.saturating_mul(BURST_MULTIPLIER))
 }
 
+/// Build the HTTP stream URL the UI hands to external media players. Pure so
+/// the path composition is unit-testable without spinning up an HTTP server.
+pub(crate) fn stream_url(base: &str, torrent_id: usize, file_idx: usize) -> String {
+    // librqbit's route is `/torrents/{id_or_infohash}/stream/{file_idx}`; we
+    // pass the numeric ID since it's stable for the engine's lifetime.
+    format!(
+        "{}/torrents/{}/stream/{}",
+        base.trim_end_matches('/'),
+        torrent_id,
+        file_idx
+    )
+}
+
+/// Bind and spawn librqbit's HTTP API server. Returns the chosen base URL so
+/// the engine can publish it to the UI. Spawn failure is the caller's problem
+/// to surface — we never panic here.
+async fn start_http_api(engine: &TorrentEngine, bind: &str) -> Result<String> {
+    let listener = TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind {}", bind))?;
+    let bound = listener.local_addr()?;
+
+    let api = Api::new(engine.session().clone(), None, None);
+    let http_api = HttpApi::new(api, None);
+
+    tokio::spawn(async move {
+        if let Err(e) = http_api.make_http_api_and_run(listener, None).await {
+            tracing::error!("HTTP API server exited with error: {}", e);
+        }
+    });
+
+    // SocketAddr's Display already wraps IPv6 hosts in brackets, so the
+    // resulting URL is correct for both 127.0.0.1:N and [::1]:N.
+    Ok(format!("http://{}", bound))
+}
+
 pub async fn run_engine(
     config: Config,
     cmd_rx: mpsc::Receiver<EngineCommand>,
     state_tx: mpsc::Sender<Vec<TorrentInfo>>,
     msg_tx: mpsc::Sender<String>,
+    info_tx: mpsc::Sender<EngineInfo>,
 ) -> Result<()> {
     let engine = TorrentEngine::new(&config).await?;
+
+    // Bring up the embedded HTTP API for media streaming. A bind failure
+    // (port in use, address invalid) is degraded gracefully: the UI just
+    // won't get an HttpApiReady and the `s` keybind shows an error if
+    // pressed.
+    match start_http_api(&engine, &config.network.http_api_bind).await {
+        Ok(base_url) => {
+            tracing::info!("HTTP streaming API listening on {}", base_url);
+            let _ = info_tx
+                .send(EngineInfo::HttpApiReady {
+                    base_url: base_url.clone(),
+                })
+                .await;
+        }
+        Err(e) => {
+            tracing::warn!("HTTP streaming API failed to start: {}", e);
+            let _ = msg_tx
+                .send(format!("Streaming disabled (API bind failed: {})", e))
+                .await;
+        }
+    }
 
     // Watch folder for auto-adding torrents. Off by default; only enabled if
     // the user opts in via config. Failures here must not abort the engine
@@ -1010,5 +1082,29 @@ mod tests {
         // Smoke test the derive added for tracing/panic dumps.
         let cmd = EngineCommand::Pause(42);
         assert!(format!("{cmd:?}").contains("Pause"));
+    }
+
+    #[test]
+    fn stream_url_basic() {
+        assert_eq!(
+            stream_url("http://127.0.0.1:34567", 3, 0),
+            "http://127.0.0.1:34567/torrents/3/stream/0"
+        );
+    }
+
+    #[test]
+    fn stream_url_strips_trailing_slash() {
+        // Defensive — a caller that hand-builds the base might include "/".
+        assert_eq!(
+            stream_url("http://127.0.0.1:34567/", 1, 7),
+            "http://127.0.0.1:34567/torrents/1/stream/7"
+        );
+    }
+
+    #[test]
+    fn stream_url_ipv6_host_is_unchanged() {
+        // SocketAddr::Display brackets IPv6 hosts; the URL must keep them.
+        let url = stream_url("http://[::1]:9000", 12, 4);
+        assert_eq!(url, "http://[::1]:9000/torrents/12/stream/4");
     }
 }

@@ -10,6 +10,8 @@ pub struct Config {
     pub network: NetworkConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub player: PlayerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +40,25 @@ pub struct NetworkConfig {
     pub max_download_speed_kbps: u64,
     #[serde(default)]
     pub max_upload_speed_kbps: u64,
+    /// Bind address for the embedded HTTP API that serves file-stream URLs to
+    /// external media players. Default `127.0.0.1:0` (auto-assigned port,
+    /// loopback only). Changing the host exposes the API to other machines on
+    /// your network — librqbit's API offers no built-in auth on its public
+    /// routes, so do this only on a trusted network.
+    #[serde(default = "default_http_api_bind")]
+    pub http_api_bind: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlayerConfig {
+    /// External program used to open stream URLs from the Files tab. Empty
+    /// means "use the OS default opener" (`xdg-open` / `open` / `start`).
+    /// Examples: `mpv`, `vlc`, `iina`.
+    #[serde(default)]
+    pub command: String,
+    /// Extra arguments inserted before the URL when invoking `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +93,10 @@ fn default_refresh_rate() -> u64 {
     100
 }
 
+fn default_http_api_bind() -> String {
+    "127.0.0.1:0".to_string()
+}
+
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
@@ -91,6 +116,7 @@ impl Default for NetworkConfig {
             enable_upnp: false,
             max_download_speed_kbps: 0,
             max_upload_speed_kbps: 0,
+            http_api_bind: default_http_api_bind(),
         }
     }
 }
@@ -173,8 +199,13 @@ mod tests {
         assert!(!config.network.enable_upnp);
         assert_eq!(config.network.max_download_speed_kbps, 0);
         assert_eq!(config.network.max_upload_speed_kbps, 0);
+        // Localhost-only by default — never bind the HTTP API to a routable
+        // interface without an explicit user decision.
+        assert_eq!(config.network.http_api_bind, "127.0.0.1:0");
         assert_eq!(config.ui.refresh_rate_ms, 100);
         assert!(config.ui.enable_notifications);
+        assert!(config.player.command.is_empty());
+        assert!(config.player.args.is_empty());
     }
 
     #[test]
@@ -205,10 +236,15 @@ enable_dht = false
 enable_upnp = true
 max_download_speed_kbps = 500
 max_upload_speed_kbps = 100
+http_api_bind = "127.0.0.1:8731"
 
 [ui]
 refresh_rate_ms = 200
 enable_notifications = false
+
+[player]
+command = "mpv"
+args = ["--no-terminal"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.download_dir, "/tmp/downloads");
@@ -223,7 +259,24 @@ enable_notifications = false
         assert!(config.network.enable_upnp);
         assert_eq!(config.network.max_download_speed_kbps, 500);
         assert_eq!(config.network.max_upload_speed_kbps, 100);
+        assert_eq!(config.network.http_api_bind, "127.0.0.1:8731");
         assert_eq!(config.ui.refresh_rate_ms, 200);
         assert!(!config.ui.enable_notifications);
+        assert_eq!(config.player.command, "mpv");
+        assert_eq!(config.player.args, vec!["--no-terminal".to_string()]);
+    }
+
+    #[test]
+    fn test_player_section_omitted_defaults_apply() {
+        // A config file written before the [player] section existed should
+        // still parse cleanly and produce the empty defaults.
+        let toml_str = r#"
+[general]
+download_dir = "/tmp/downloads"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.player.command, "");
+        assert!(config.player.args.is_empty());
+        assert_eq!(config.network.http_api_bind, "127.0.0.1:0");
     }
 }

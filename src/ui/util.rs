@@ -31,6 +31,24 @@ pub fn sanitize_display(s: &str) -> String {
     out
 }
 
+/// True when `name`'s extension matches a common streamable media format
+/// (the kinds a desktop media player will start playing from a partial file
+/// via HTTP range requests). Case-insensitive on the extension only.
+pub fn is_streamable_media(name: &str) -> bool {
+    let ext = match name.rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() => ext,
+        _ => return false,
+    };
+    let lower = ext.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        // Video
+        "mp4" | "mkv" | "webm" | "mov" | "avi" | "mpg" | "mpeg" | "m4v" | "ogv" | "ts"
+        // Audio
+        | "mp3" | "flac" | "ogg" | "opus" | "m4a" | "wav" | "aac"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +111,46 @@ mod tests {
     #[test]
     fn sanitize_keeps_tab() {
         assert_eq!(sanitize_display("a\tb"), "a\tb");
+    }
+
+    #[test]
+    fn streamable_video_extensions() {
+        for ext in ["mp4", "mkv", "webm", "MOV", "Mp4", "AVI", "m4v"] {
+            let name = format!("clip.{ext}");
+            assert!(is_streamable_media(&name), "expected streamable: {ext}");
+        }
+    }
+
+    #[test]
+    fn streamable_audio_extensions() {
+        for ext in ["mp3", "FLAC", "ogg", "opus", "m4a", "wav"] {
+            let name = format!("song.{ext}");
+            assert!(is_streamable_media(&name), "expected streamable: {ext}");
+        }
+    }
+
+    #[test]
+    fn not_streamable_extensions() {
+        for name in [
+            "archive.iso",
+            "readme.txt",
+            "image.png",
+            "doc.pdf",
+            "noext",
+            "trailing.",
+            ".hidden",
+        ] {
+            assert!(
+                !is_streamable_media(name),
+                "expected not streamable: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamable_handles_multiple_dots() {
+        // Only the trailing extension counts.
+        assert!(is_streamable_media("Show.S01E02.1080p.mkv"));
+        assert!(!is_streamable_media("Show.S01E02.1080p.txt"));
     }
 }

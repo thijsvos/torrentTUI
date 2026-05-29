@@ -10,7 +10,7 @@ use crate::app::App;
 use crate::types::{DetailTab, PeerInfo};
 use crate::ui::layout::{format_eta, format_size, format_speed};
 use crate::ui::progress::render_progress_bar;
-use crate::ui::util::truncate;
+use crate::ui::util::{is_streamable_media, truncate};
 
 pub fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let (torrent_name, tab_index) = match app.selected_torrent() {
@@ -262,9 +262,20 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray)
         };
 
+        let is_media = is_streamable_media(&file.name);
+        // ▶ on streamable media so users know `s` will work; two spaces
+        // otherwise to keep the column alignment identical.
+        let media_glyph = if is_media { "\u{25B6} " } else { "  " };
+        let media_glyph_style = if is_media {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+
         lines.push(Line::from(vec![
             Span::styled(if is_highlighted { "> " } else { "  " }, highlight_style),
             Span::styled(format!("{} ", checkbox), checkbox_style),
+            Span::styled(media_glyph, media_glyph_style),
             Span::styled(format!("{:<45}", truncate(&file.name, 45)), file_style),
             Span::styled(format!("{:>10}", format_size(file.size_bytes)), file_style),
             Span::raw("  "),
@@ -278,7 +289,7 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
     let files_widget = Paragraph::new(lines).block(
         Block::default()
             .title(format!(
-                " Files ({}) - Space:toggle  S:apply selection ",
+                " Files ({}) - Space:toggle  S:apply  s:stream \u{25B6} ",
                 torrent.files.len()
             ))
             .borders(Borders::ALL)

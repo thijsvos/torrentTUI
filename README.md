@@ -18,6 +18,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 ## Features
 
 - **Magnet link & .torrent file support** — add torrents via magnet links or local `.torrent` files
+- **Stream while downloading** — press `s` on any media file in the Files tab to open it in your default player; pieces are fetched in playback order
 - **Real-time progress** — progress bars, download/upload speeds, ETA, and peer counts
 - **Sorting & filtering** — sort by any column, search torrents by name
 - **Bandwidth throttling** — per-torrent fair throttling with configurable download/upload limits
@@ -121,7 +122,32 @@ torrenttui -d /path/to/downloads
 | `j` / `k` | Navigate files (Files tab) or peers (Peers tab) |
 | `Space` | Toggle file selection (Files tab) |
 | `S` | Apply current file selection to engine (Files tab) |
+| `s` | Stream selected file in default media player (Files tab) |
 | `Esc` / `q` | Back to list |
+
+### Streaming while downloading
+
+In the Files tab, files with a known media extension are marked with `▶`. Press
+`s` on any file (not just media — anything streamable over HTTP) to open it in
+your system's default player. Librqbit prioritizes the pieces in playback
+order, so videos generally start within seconds of pressing `s` — well before
+the download is complete.
+
+The engine binds a small HTTP API on `127.0.0.1` (auto-assigned port) at
+startup; the player connects to that URL. The API is loopback-only by default;
+see [Configuration](#configuration) and [Privacy](#privacy) before changing the
+bind address.
+
+Pick a specific player by setting:
+
+```toml
+[player]
+command = "mpv"          # or "vlc", "iina", etc.
+args = ["--no-terminal"] # optional extra args inserted before the URL
+```
+
+Leave `command` empty to use the OS default opener (`xdg-open` on Linux,
+`open` on macOS, `start` on Windows).
 
 ## Configuration
 
@@ -145,10 +171,15 @@ enable_dht = true
 enable_upnp = false           # opt in to open an external port via UPnP
 max_download_speed_kbps = 0   # 0 = unlimited
 max_upload_speed_kbps = 0     # 0 = unlimited
+http_api_bind = "127.0.0.1:0" # localhost-only by default (0 = auto-assigned port)
 
 [ui]
 refresh_rate_ms = 100
 enable_notifications = true
+
+[player]
+command = ""                  # empty = OS default (xdg-open / open / start)
+args = []                     # extra args inserted before the URL
 ```
 
 ### Logging
@@ -163,6 +194,7 @@ A few defaults worth knowing:
 - **UPnP is off by default.** Enabling it (`network.enable_upnp = true`) opens an external port via your router and exposes you to peers outside your LAN.
 - **No telemetry.** TorrentTUI makes no outbound connections except to BitTorrent peers, trackers, and (if DHT is enabled) the DHT network.
 - **Notifications.** Torrent names are sanitized before being sent to the OS notification daemon (Pango/HTML escaped on Linux). Disable entirely with `ui.enable_notifications = false`.
+- **HTTP streaming API is loopback-only by default.** The embedded API used for the `s` stream keybinding binds to `127.0.0.1:0`. Changing `network.http_api_bind` to a routable interface exposes the API (which has no built-in auth on its public routes) to other machines on your network — do this only on a trusted LAN.
 
 ## Docker
 
