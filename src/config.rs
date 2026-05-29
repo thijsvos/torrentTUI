@@ -42,9 +42,12 @@ pub struct NetworkConfig {
     pub max_upload_speed_kbps: u64,
     /// Bind address for the embedded HTTP API that serves file-stream URLs to
     /// external media players. Default `127.0.0.1:0` (auto-assigned port,
-    /// loopback only). Changing the host exposes the API to other machines on
-    /// your network — librqbit's API offers no built-in auth on its public
-    /// routes, so do this only on a trusted network.
+    /// loopback only). The API is mounted READ-ONLY (no add/pause/delete routes),
+    /// but it is UNAUTHENTICATED: anyone who can reach it can list your torrents
+    /// and stream/read your downloaded files. Binding to a non-loopback host
+    /// exposes that to every machine on the network, so only do it on a fully
+    /// trusted one; the app logs a warning and shows a status message when it
+    /// binds off-loopback.
     #[serde(default = "default_http_api_bind")]
     pub http_api_bind: String,
 }

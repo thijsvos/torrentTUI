@@ -3,6 +3,11 @@
 /// "...". Slicing strings by byte index (the previous implementation) panics
 /// when the cut lands in the middle of a multi-byte UTF-8 character.
 pub fn truncate(s: &str, max_len: usize) -> String {
+    // Fast path: byte length is an upper bound on char count (every char is
+    // ≥1 byte), so if it already fits we skip the char-counting pass entirely.
+    if s.len() <= max_len {
+        return s.to_string();
+    }
     if s.chars().count() > max_len {
         let prefix: String = s.chars().take(max_len.saturating_sub(3)).collect();
         format!("{prefix}...")

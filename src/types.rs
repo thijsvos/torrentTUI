@@ -23,6 +23,23 @@ impl fmt::Display for TorrentStatus {
     }
 }
 
+impl TorrentStatus {
+    /// Stable, allocation-free key matching the `Display` text ordering used by
+    /// the status-column sort, so comparisons don't `to_string()` each status.
+    /// Returned as `(label, detail)`; `Error(msg)` orders by `msg` without
+    /// building the full `"Error: {msg}"` string.
+    pub fn sort_key(&self) -> (&str, &str) {
+        match self {
+            TorrentStatus::FetchingMetadata => ("Fetching Metadata", ""),
+            TorrentStatus::Downloading => ("Downloading", ""),
+            TorrentStatus::Paused => ("Paused", ""),
+            TorrentStatus::Complete => ("Complete", ""),
+            TorrentStatus::Seeding => ("Seeding", ""),
+            TorrentStatus::Error(e) => ("Error: ", e),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TorrentInfo {
     pub id: usize,
@@ -236,5 +253,29 @@ mod tests {
         assert_eq!(DetailTab::Info.index(), 1);
         assert_eq!(DetailTab::Files.index(), 2);
         assert_eq!(DetailTab::Peers.index(), 3);
+    }
+
+    #[test]
+    fn sort_key_matches_display_ordering() {
+        // sort_key is an allocation-free stand-in for comparing Display strings
+        // in the status-column sort; it must order pairwise identically.
+        let statuses = [
+            TorrentStatus::FetchingMetadata,
+            TorrentStatus::Downloading,
+            TorrentStatus::Paused,
+            TorrentStatus::Complete,
+            TorrentStatus::Seeding,
+            TorrentStatus::Error("alpha".to_string()),
+            TorrentStatus::Error("beta".to_string()),
+        ];
+        for a in &statuses {
+            for b in &statuses {
+                assert_eq!(
+                    a.sort_key().cmp(&b.sort_key()),
+                    a.to_string().cmp(&b.to_string()),
+                    "sort_key disagreed with Display for {a} vs {b}"
+                );
+            }
+        }
     }
 }
