@@ -94,4 +94,12 @@ mod tests {
         assert_eq!(progress_color(99.9), Color::LightGreen);
         assert_eq!(progress_color(100.0), Color::Green);
     }
+
+    #[test]
+    fn spinner_frame_count_matches_app_modulo() {
+        // app.rs::tick_spinner cycles spinner_tick with `% 10`, and table.rs
+        // indexes SPINNER_FRAMES[spinner_tick]. If this length ever drifts from
+        // 10, that index panics — keep them in lockstep.
+        assert_eq!(SPINNER_FRAMES.len(), 10);
+    }
 }

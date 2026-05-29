@@ -234,7 +234,7 @@ impl App {
                         (None, Some(_)) => std::cmp::Ordering::Greater,
                         (None, None) => std::cmp::Ordering::Equal,
                     },
-                    SortColumn::Status => ta.status.to_string().cmp(&tb.status.to_string()),
+                    SortColumn::Status => ta.status.sort_key().cmp(&tb.status.sort_key()),
                 };
                 if sort_reversed {
                     cmp.reverse()
@@ -325,7 +325,7 @@ impl App {
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => std::cmp::Ordering::Equal,
                 },
-                SortColumn::Status => a.status.to_string().cmp(&b.status.to_string()),
+                SortColumn::Status => a.status.sort_key().cmp(&b.status.sort_key()),
             };
             if self.sort_reversed {
                 cmp.reverse()
@@ -362,8 +362,18 @@ impl App {
     }
 
     pub fn selected_torrent(&self) -> Option<&TorrentInfo> {
-        let sorted = self.sorted_torrents();
-        sorted.get(self.selected_index).copied()
+        // Index the sort cache directly instead of materializing the whole
+        // `Vec<&TorrentInfo>` just to read one element — this is called several
+        // times per frame. Falls back to the live sort when the cache is dirty.
+        if self.sort_dirty {
+            return self
+                .sorted_torrents_live()
+                .get(self.selected_index)
+                .copied();
+        }
+        self.sort_cache
+            .get(self.selected_index)
+            .and_then(|&i| self.torrents.get(i))
     }
 
     pub fn restore_selection(&mut self) {
@@ -814,5 +824,131 @@ mod tests {
         app.set_info("first".to_string());
         app.set_info("second".to_string());
         assert_eq!(app.info_message.as_deref(), Some("first | second"));
+    }
+
+    fn file(name: &str) -> crate::types::FileInfo {
+        crate::types::FileInfo {
+            name: name.to_string(),
+            size_bytes: 100,
+            progress_bytes: 0,
+        }
+    }
+
+    fn peer(addr: &str) -> crate::types::PeerInfo {
+        crate::types::PeerInfo {
+            address: addr.to_string(),
+            state: "Live".to_string(),
+            downloaded_bytes: 0,
+            pieces: 0,
+            errors: 0,
+        }
+    }
+
+    #[test]
+    fn tick_spinner_wraps_at_ten() {
+        let mut app = App::new();
+        assert_eq!(app.spinner_tick, 0);
+        app.tick_spinner();
+        assert_eq!(app.spinner_tick, 1);
+        for _ in 0..9 {
+            app.tick_spinner();
+        }
+        // 10 ticks from 0 wraps back to 0.
+        assert_eq!(app.spinner_tick, 0);
+        // The `% 10` in tick_spinner must match SPINNER_FRAMES.len(), or
+        // table.rs panics when it indexes SPINNER_FRAMES[spinner_tick].
+        assert_eq!(crate::ui::progress::SPINNER_FRAMES.len(), 10);
+    }
+
+    #[test]
+    fn clamp_detail_indices_clamps_to_last_when_lists_shrink() {
+        let mut t = make_torrent(0, "A", 100, TorrentStatus::Downloading);
+        t.files = vec![file("a"), file("b")];
+        t.peers = vec![peer("1.1.1.1:1"), peer("2.2.2.2:2"), peer("3.3.3.3:3")];
+        let mut app = app_with_torrents(vec![t]);
+        app.update_selected_id();
+        app.detail_file_index = 9;
+        app.detail_peer_index = 9;
+        app.clamp_detail_indices();
+        assert_eq!(app.detail_file_index, 1); // 2 files -> max index 1
+        assert_eq!(app.detail_peer_index, 2); // 3 peers -> max index 2
+    }
+
+    #[test]
+    fn clamp_detail_indices_resets_when_no_selection() {
+        let mut app = App::new(); // no torrents -> selected_torrent() is None
+        app.detail_file_index = 5;
+        app.detail_peer_index = 7;
+        app.clamp_detail_indices();
+        assert_eq!(app.detail_file_index, 0);
+        assert_eq!(app.detail_peer_index, 0);
+    }
+
+    #[test]
+    fn confirm_on_quit_required_true_when_active() {
+        let mut app =
+            app_with_torrents(vec![make_torrent(0, "A", 100, TorrentStatus::Downloading)]);
+        app.confirm_on_quit = true;
+        assert!(app.confirm_on_quit_required());
+    }
+
+    #[test]
+    fn confirm_on_quit_required_false_when_idle() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "A", 100, TorrentStatus::Complete),
+            make_torrent(1, "B", 100, TorrentStatus::Paused),
+        ]);
+        app.confirm_on_quit = true;
+        assert!(!app.confirm_on_quit_required());
+    }
+
+    #[test]
+    fn confirm_on_quit_required_false_when_disabled() {
+        let mut app =
+            app_with_torrents(vec![make_torrent(0, "A", 100, TorrentStatus::Downloading)]);
+        app.confirm_on_quit = false;
+        assert!(!app.confirm_on_quit_required());
+    }
+
+    #[test]
+    fn file_selection_toggle_and_query() {
+        let mut app = App::new();
+        // All files selected by default.
+        assert!(app.is_file_selected(0, 0));
+        assert_eq!(app.selected_file_indices(0, 3), vec![0, 1, 2]);
+        // Deselect file 1.
+        app.toggle_file_selection(0, 1);
+        assert!(!app.is_file_selected(0, 1));
+        assert_eq!(app.selected_file_indices(0, 3), vec![0, 2]);
+        // Toggle it back.
+        app.toggle_file_selection(0, 1);
+        assert!(app.is_file_selected(0, 1));
+        assert_eq!(app.selected_file_indices(0, 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn messages_expire_after_their_window() {
+        use std::time::{Duration, Instant};
+        let mut app = App::new();
+        app.set_error("boom".to_string());
+        app.set_info("note".to_string());
+        // Fresh messages are not cleared.
+        app.clear_expired_messages();
+        assert_eq!(app.error_message.as_deref(), Some("boom"));
+        assert_eq!(app.info_message.as_deref(), Some("note"));
+        // Age the timers past their windows (3s errors, 5s info).
+        app.error_timer = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(4))
+                .expect("system uptime should exceed a few seconds"),
+        );
+        app.info_timer = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(6))
+                .expect("system uptime should exceed a few seconds"),
+        );
+        app.clear_expired_messages();
+        assert!(app.error_message.is_none());
+        assert!(app.info_message.is_none());
     }
 }

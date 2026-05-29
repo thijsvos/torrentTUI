@@ -178,8 +178,12 @@ async fn run_app(
 
     let download_dir = config.general.download_dir.clone();
     let mut event_stream = EventStream::new();
-    // Target ~30 FPS for smooth UI; the tick just caps the frame rate.
-    let mut frame_interval = tokio::time::interval(std::time::Duration::from_millis(33));
+    // Frame-rate cap for animations and timed-message aging; honors
+    // `config.ui.refresh_rate_ms` (clamped to 16–1000 ms / ~60–1 FPS). Rendering
+    // itself is change-driven via `needs_render`, so this only paces idle repaints.
+    let mut frame_interval = tokio::time::interval(std::time::Duration::from_millis(
+        config.ui.refresh_rate_ms.clamp(16, 1000),
+    ));
     let mut needs_render = true;
 
     loop {
@@ -869,5 +873,99 @@ fn handle_stream_keypress(app: &mut App) {
     match player::spawn_player(&app.player_config, &url) {
         Ok(()) => app.set_info(format!("Streaming {}", file_name)),
         Err(e) => app.set_error(format!("Failed to open player: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn help_mode_esc_returns_to_normal() {
+        let mut app = App::new();
+        app.mode = AppMode::Help;
+        handle_help_mode(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn help_mode_ignores_other_keys() {
+        let mut app = App::new();
+        app.mode = AppMode::Help;
+        handle_help_mode(&mut app, key(KeyCode::Char('x')));
+        assert_eq!(app.mode, AppMode::Help);
+    }
+
+    #[test]
+    fn quit_mode_y_sets_should_quit() {
+        let mut app = App::new();
+        app.mode = AppMode::ConfirmQuit;
+        handle_quit_mode(&mut app, key(KeyCode::Char('y')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn quit_mode_n_cancels_without_quitting() {
+        let mut app = App::new();
+        app.mode = AppMode::ConfirmQuit;
+        handle_quit_mode(&mut app, key(KeyCode::Char('n')));
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn filter_mode_typing_backspace_and_esc() {
+        let mut app = App::new();
+        app.mode = AppMode::Filter;
+        handle_filter_mode(&mut app, key(KeyCode::Char('a')));
+        handle_filter_mode(&mut app, key(KeyCode::Char('b')));
+        assert_eq!(app.filter_text, "ab");
+        handle_filter_mode(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.filter_text, "a");
+        handle_filter_mode(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.filter_text, ""); // Esc clears the filter
+    }
+
+    #[tokio::test]
+    async fn normal_mode_a_opens_input() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('a')), &tx).await;
+        assert_eq!(app.mode, AppMode::Input);
+    }
+
+    #[tokio::test]
+    async fn normal_mode_switch_keys_change_mode() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut iw = InputWidget::new();
+
+        let mut app = App::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('?')), &tx).await;
+        assert_eq!(app.mode, AppMode::Help);
+
+        let mut app = App::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('/')), &tx).await;
+        assert_eq!(app.mode, AppMode::Filter);
+
+        let mut app = App::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('t')), &tx).await;
+        assert_eq!(app.mode, AppMode::ThrottleInput);
+    }
+
+    #[test]
+    fn stream_keypress_without_api_sets_error() {
+        let mut app = App::new();
+        assert!(app.http_api_base.is_none());
+        handle_stream_keypress(&mut app);
+        assert_eq!(
+            app.error_message.as_deref(),
+            Some("Streaming API not ready yet")
+        );
     }
 }

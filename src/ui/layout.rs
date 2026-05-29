@@ -125,7 +125,14 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     }
 
     // Calculate width of speed section for the right column
-    let right_text_width: u16 = right_spans.iter().map(|s| s.content.len() as u16).sum();
+    // Use character count, not byte length: the ↓/↑ arrows are 3 UTF-8 bytes
+    // but occupy a single terminal column, so `.len()` over-reserves the right
+    // column by ~4 columns. All glyphs here are single-width, so chars().count()
+    // is exact (use unicode_width if wide CJK ever appears in this section).
+    let right_text_width: u16 = right_spans
+        .iter()
+        .map(|s| s.content.chars().count() as u16)
+        .sum();
 
     // Build left section: hints, counts, disk, filter
     let mut left_spans = vec![
@@ -167,6 +174,13 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // On a very narrow terminal the bordered inner area collapses to zero
+    // width/height. ratatui renders that safely, but there's nothing to lay
+    // out, so skip the column split and paragraph rendering entirely.
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)

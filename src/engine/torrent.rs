@@ -3,8 +3,9 @@ use crate::types::{FileInfo, PeerInfo, TorrentInfo, TorrentStatus};
 use crate::ui::util::sanitize_display;
 use anyhow::{Context, Result};
 use librqbit::{
-    http_api::HttpApi, AddTorrent, AddTorrentResponse, Api, ManagedTorrent, Session,
-    SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    http_api::{HttpApi, HttpApiOptions},
+    AddTorrent, AddTorrentResponse, Api, ManagedTorrent, Session, SessionOptions,
+    SessionPersistenceConfig, TorrentStatsState,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -423,24 +424,42 @@ pub(crate) fn stream_url(base: &str, torrent_id: usize, file_idx: usize) -> Stri
 /// Bind and spawn librqbit's HTTP API server. Returns the chosen base URL so
 /// the engine can publish it to the UI. Spawn failure is the caller's problem
 /// to surface — we never panic here.
-async fn start_http_api(engine: &TorrentEngine, bind: &str) -> Result<String> {
+async fn start_http_api(
+    engine: &TorrentEngine,
+    bind: &str,
+) -> Result<(String, std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {}", bind))?;
     let bound = listener.local_addr()?;
 
     let api = Api::new(engine.session().clone(), None, None);
-    let http_api = HttpApi::new(api, None);
+    // Mount the API read-only: only GET routes (including the file-stream route
+    // we hand to media players) are exposed. librqbit gates every mutating route
+    // (add / pause / start / forget / delete / limits / update_only_files) behind
+    // `!read_only`. The TUI drives all of those through the Session API directly,
+    // so read-only loses nothing — and an unauthenticated, loopback-reachable API
+    // can no longer be used to control the client (CSRF-to-localhost or another
+    // local process).
+    let http_api = HttpApi::new(
+        api,
+        Some(HttpApiOptions {
+            read_only: true,
+            ..Default::default()
+        }),
+    );
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(e) = http_api.make_http_api_and_run(listener, None).await {
             tracing::error!("HTTP API server exited with error: {}", e);
         }
     });
 
     // SocketAddr's Display already wraps IPv6 hosts in brackets, so the
-    // resulting URL is correct for both 127.0.0.1:N and [::1]:N.
-    Ok(format!("http://{}", bound))
+    // resulting URL is correct for both 127.0.0.1:N and [::1]:N. Return the
+    // bound address (so the caller can warn on a non-loopback bind) and the
+    // task handle (so it can be stopped on shutdown).
+    Ok((format!("http://{}", bound), bound, task))
 }
 
 pub async fn run_engine(
@@ -455,21 +474,43 @@ pub async fn run_engine(
     // Bring up the embedded HTTP API for media streaming. A bind failure
     // (port in use, address invalid) is degraded gracefully: the UI just
     // won't get an HttpApiReady and the `s` keybind shows an error if
-    // pressed.
+    // pressed. The task handle is kept so we can stop it on shutdown.
+    let mut http_task: Option<tokio::task::JoinHandle<()>> = None;
     match start_http_api(&engine, &config.network.http_api_bind).await {
-        Ok(base_url) => {
+        Ok((base_url, bound, task)) => {
+            http_task = Some(task);
             tracing::info!("HTTP streaming API listening on {}", base_url);
-            let _ = info_tx
+            // The API is read-only (no add/pause/delete), but it is still
+            // unauthenticated, so a non-loopback bind lets any host on that
+            // network list your torrents and stream/read your downloaded files.
+            // Warn loudly in both the log and the UI status bar.
+            if !bound.ip().is_loopback() {
+                let warn = format!(
+                    "\u{26a0} Streaming API on {} is unauthenticated — any host on this network can list and stream your downloaded files",
+                    bound
+                );
+                tracing::warn!("{}", warn);
+                if let Err(e) = msg_tx.send(warn).await {
+                    tracing::warn!("non-loopback warning send dropped (UI gone?): {}", e);
+                }
+            }
+            if let Err(e) = info_tx
                 .send(EngineInfo::HttpApiReady {
                     base_url: base_url.clone(),
                 })
-                .await;
+                .await
+            {
+                tracing::warn!("HttpApiReady send dropped (UI gone?): {}", e);
+            }
         }
         Err(e) => {
             tracing::warn!("HTTP streaming API failed to start: {}", e);
-            let _ = msg_tx
+            if let Err(se) = msg_tx
                 .send(format!("Streaming disabled (API bind failed: {})", e))
-                .await;
+                .await
+            {
+                tracing::warn!("streaming-disabled message send dropped (UI gone?): {}", se);
+            }
         }
     }
 
@@ -530,6 +571,11 @@ pub async fn run_engine(
     // per-tick snapshot skips files/peers/trackers entirely.
     let mut detail_torrent_id: Option<usize> = None;
 
+    /// Build the latest per-torrent snapshot and broadcast it to the UI. Also
+    /// fires completion notifications, applies throttle-managed display overrides
+    /// (effective speed + paused flag), and prunes the cache maps (peers /
+    /// upload-speed / speed-tracker) of torrents that no longer exist. Runs at
+    /// the end of every command and every throttle tick.
     #[allow(clippy::too_many_arguments)]
     async fn push_state(
         engine: &TorrentEngine,
@@ -553,7 +599,19 @@ pub async fn run_engine(
         cached_upload_speed.retain(|id, _| current_ids.contains(id));
         speed_tracker.retain(|id, _| current_ids.contains(id));
 
-        let managed_count = throttle_managed.len().max(1) as u64;
+        // Match the throttle loop's `active_count` divisor: count only
+        // throttle-managed torrents that are still downloading. Otherwise a
+        // completed torrent lingering in `throttle_managed` between a command
+        // and the next cleanup tick inflates the divisor, so the displayed
+        // per-torrent cap undershoots what's actually enforced.
+        let managed_count = torrents
+            .iter()
+            .filter(|t| {
+                throttle_managed.contains(&t.id)
+                    && !matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding)
+            })
+            .count()
+            .max(1) as u64;
 
         for t in &mut torrents {
             if matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding)
@@ -1026,6 +1084,14 @@ pub async fn run_engine(
                 push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id).await;
             }
         }
+    }
+
+    // Stop the HTTP API server task spawned in start_http_api. main.rs awaits
+    // this function on shutdown, so aborting here makes teardown deterministic
+    // rather than leaving the task to be reaped when the runtime drops.
+    if let Some(task) = http_task {
+        task.abort();
+        tracing::info!("HTTP API task stopped on shutdown");
     }
 
     Ok(())

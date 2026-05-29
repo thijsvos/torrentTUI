@@ -301,16 +301,12 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
 fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
     // Pull just what we need so the immutable borrow ends before we touch
     // `app` mutably to update scroll state.
-    let (peers, peers_connected, peers_total) = match app.selected_torrent() {
-        Some(t) => {
-            let mut sorted: Vec<PeerInfo> = t.peers.clone();
-            sorted.sort_by_key(|p| std::cmp::Reverse(p.downloaded_bytes));
-            (sorted, t.peers_connected, t.peers_total)
-        }
+    let (peer_count, peers_connected, peers_total) = match app.selected_torrent() {
+        Some(t) => (t.peers.len(), t.peers_connected, t.peers_total),
         None => return,
     };
 
-    if peers.is_empty() {
+    if peer_count == 0 {
         let text = vec![
             Line::from(""),
             Line::from(vec![
@@ -339,7 +335,6 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let visible_height = area.height.saturating_sub(6) as usize; // borders + header lines
-    let peer_count = peers.len();
     let peer_index = app.detail_peer_index.min(peer_count.saturating_sub(1));
     app.detail_peer_index = peer_index;
 
@@ -360,6 +355,15 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
     }
     let scroll_offset = app.detail_peer_scroll_offset;
 
+    // Re-borrow immutably (no more `app` mutations below) and sort peer
+    // *references* — avoids deep-cloning every PeerInfo (two owned Strings each)
+    // on every render of this tab.
+    let Some(t) = app.selected_torrent() else {
+        return;
+    };
+    let mut sorted: Vec<&PeerInfo> = t.peers.iter().collect();
+    sorted.sort_by_key(|p| std::cmp::Reverse(p.downloaded_bytes));
+
     let mut lines = vec![
         Line::from(vec![
             Span::styled("  Connected: ", Style::default().fg(Color::DarkGray)),
@@ -379,7 +383,7 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
         )]),
     ];
 
-    for (i, peer) in peers
+    for (i, peer) in sorted
         .iter()
         .enumerate()
         .skip(scroll_offset)
