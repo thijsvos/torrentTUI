@@ -9,15 +9,21 @@ description = "A terminal BitTorrent client for magnet link downloads"
 ratatui = { version = "0.30", features = ["all-widgets"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 
-# BitTorrent engine
-librqbit = { version = "8", default-features = false, features = ["rust-tls", "watch"] }
+# BitTorrent engine. `http-api` exposes librqbit's built-in axum server, which
+# we bind to localhost only and use as the source of HTTP file-stream URLs that
+# external media players can open. `tracing-subscriber-utils` is required by
+# the http-api crate (its `/stream_logs` handler references a method that only
+# exists with that feature).
+librqbit = { version = "8", default-features = false, features = ["rust-tls", "watch", "http-api", "tracing-subscriber-utils"] }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 futures = "0.3"
 
-# Serialization and config
-serde = { version = "1", features = ["derive"] }
+# Serialization and config. The `rc` feature is required so that librqbit's
+# http-api handlers can derive `Deserialize` on path-extractor structs that
+# contain `Arc<str>` fields (since librqbit 8.1.1).
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "1.0"
 

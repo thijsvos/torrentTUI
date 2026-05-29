@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::config::PlayerConfig;
 use crate::types::{AppMode, DetailTab, SortColumn, TorrentInfo, TorrentStatus};
 use ratatui::widgets::TableState;
 
@@ -46,6 +47,14 @@ pub struct App {
     /// Wired from `config.general.confirm_on_quit`; when false, `q` quits
     /// immediately instead of opening the confirmation dialog.
     pub confirm_on_quit: bool,
+    /// Base URL of the engine's embedded HTTP API (e.g. `http://127.0.0.1:34567`).
+    /// `None` until the engine reports `EngineInfo::HttpApiReady`; if the
+    /// bind failed at startup, stays `None` forever and the `s` stream
+    /// keybinding shows an error.
+    pub http_api_base: Option<String>,
+    /// External player command + args for the `s` stream keybinding. Loaded
+    /// once from `config.player` at startup.
+    pub player_config: PlayerConfig,
 }
 
 impl App {
@@ -85,6 +94,8 @@ impl App {
             sort_cache: Vec::new(),
             sort_dirty: true,
             confirm_on_quit: true,
+            http_api_base: None,
+            player_config: PlayerConfig::default(),
         }
     }
 

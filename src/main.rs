@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod engine;
+mod player;
 mod types;
 mod ui;
 
@@ -17,7 +18,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use engine::torrent::EngineCommand;
+use engine::torrent::{EngineCommand, EngineInfo};
 use futures::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
@@ -141,6 +142,7 @@ async fn run_app(
     app.speed_limit_download_kbps = config.network.max_download_speed_kbps;
     app.speed_limit_upload_kbps = config.network.max_upload_speed_kbps;
     app.confirm_on_quit = config.general.confirm_on_quit;
+    app.player_config = config.player.clone();
 
     if let Some(msg) = config_warning {
         app.set_error(msg);
@@ -149,13 +151,18 @@ async fn run_app(
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(32);
     let (state_tx, mut state_rx) = mpsc::channel::<Vec<types::TorrentInfo>>(4);
     let (msg_tx, mut msg_rx) = mpsc::channel::<String>(16);
+    // Engine-to-UI one-shot facts (HTTP API base URL today; future use:
+    // listening port, DHT state). Small capacity because messages are rare.
+    let (info_tx, mut info_rx) = mpsc::channel::<EngineInfo>(4);
 
     let engine_config = config.clone();
     // Keep the JoinHandle so we can both detect engine death mid-run and
     // await its persistence flush on shutdown. Wrapped in Option so we can
     // consume it from either path.
     let mut engine_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
-        if let Err(e) = engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx).await {
+        if let Err(e) =
+            engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx, info_tx).await
+        {
             tracing::error!("Engine error: {}", e);
         }
     }));
@@ -198,6 +205,10 @@ async fn run_app(
         }
         while let Ok(msg) = msg_rx.try_recv() {
             app.set_info(msg);
+            needs_render = true;
+        }
+        while let Ok(info) = info_rx.try_recv() {
+            apply_engine_info(&mut app, info);
             needs_render = true;
         }
 
@@ -370,6 +381,10 @@ async fn run_app(
             }
             Some(msg) = msg_rx.recv() => {
                 app.set_info(msg);
+                needs_render = true;
+            }
+            Some(info) = info_rx.recv() => {
+                apply_engine_info(&mut app, info);
                 needs_render = true;
             }
             _ = frame_interval.tick() => {
@@ -624,6 +639,9 @@ async fn handle_detail_mode(
                 }
             }
         }
+        KeyCode::Char('s') if app.detail_tab == DetailTab::Files => {
+            handle_stream_keypress(app);
+        }
         KeyCode::Char('S') if app.detail_tab == DetailTab::Files => {
             if let Some(torrent) = app.selected_torrent() {
                 let torrent_id = torrent.id;
@@ -807,5 +825,49 @@ fn handle_quit_mode(app: &mut App, key: crossterm::event::KeyEvent) {
             app.mode = AppMode::Normal;
         }
         _ => {}
+    }
+}
+
+fn apply_engine_info(app: &mut App, info: EngineInfo) {
+    match info {
+        EngineInfo::HttpApiReady { base_url } => {
+            app.http_api_base = Some(base_url);
+        }
+    }
+}
+
+/// Handle the `s` keystroke in the Detail view's Files tab. Composes the
+/// librqbit stream URL and hands it to the configured external player.
+/// All failure modes degrade to a status-bar message instead of a crash.
+fn handle_stream_keypress(app: &mut App) {
+    let base = match app.http_api_base.clone() {
+        Some(b) => b,
+        None => {
+            app.set_error("Streaming API not ready yet".to_string());
+            return;
+        }
+    };
+
+    // Pull the (torrent_id, file_idx, file_name) tuple inside a tight borrow
+    // scope so the immutable borrow ends before we mutate `app` to set
+    // status messages.
+    let resolved = app.selected_torrent().and_then(|t| {
+        t.files
+            .get(app.detail_file_index)
+            .map(|f| (t.id, app.detail_file_index, f.name.clone()))
+    });
+
+    let (torrent_id, file_idx, file_name) = match resolved {
+        Some(v) => v,
+        None => {
+            app.set_error("No file selected (waiting for metadata)".to_string());
+            return;
+        }
+    };
+
+    let url = engine::torrent::stream_url(&base, torrent_id, file_idx);
+    match player::spawn_player(&app.player_config, &url) {
+        Ok(()) => app.set_info(format!("Streaming {}", file_name)),
+        Err(e) => app.set_error(format!("Failed to open player: {}", e)),
     }
 }

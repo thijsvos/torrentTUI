@@ -31,6 +31,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         ("j / k", "Navigate files / peers"),
         ("Space", "Toggle file selection"),
         ("S", "Apply file selection"),
+        ("s", "Stream selected file in default player"),
     ];
 
     let rows: Vec<Row> = keybindings
