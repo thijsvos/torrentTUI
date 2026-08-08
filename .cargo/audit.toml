@@ -1,0 +1,10 @@
+# cargo-audit configuration — also read by CI's rustsec/audit-check job.
+#
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195: DoS-class XML parsing issues in
+# quick-xml < 0.41.0. The sole consumer is librqbit-upnp 1.0.0 (the latest
+# release), which pins quick-xml ^0.37, so no fixed version is reachable
+# from this crate. Exposure is limited: UPnP is opt-in (enable_upnp defaults
+# to false) and the parser only sees XML from the local network's router.
+# Drop these ignores once librqbit-upnp releases with quick-xml >= 0.41.
+[advisories]
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
