@@ -162,7 +162,7 @@ Config file is created automatically at:
 [general]
 download_dir = "~/Downloads/torrents"
 confirm_on_quit = true
-# watch_dir = "/path/to/watch"  # optional; auto-add .torrent files dropped here
+# watch_dir = "~/torrents/watch"  # optional; auto-add .torrent files dropped here
 
 [network]
 listen_port = 6881
@@ -181,6 +181,8 @@ enable_notifications = true
 command = ""                  # empty = OS default (xdg-open / open / start)
 args = []                     # extra args inserted before the URL
 ```
+
+Paths (`download_dir`, `watch_dir`, `player.command`) may start with `~/`, which expands to your home directory.
 
 ### Logging
 
