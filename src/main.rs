@@ -34,7 +34,7 @@ const MAX_SPEED_LIMIT_KBPS: u64 = 10_485_760;
 const MAX_THROTTLE_INPUT_DIGITS: usize = 8;
 
 #[derive(Parser)]
-#[command(name = "torrenttui", about = "Terminal BitTorrent client")]
+#[command(name = "torrenttui", version, about = "Terminal BitTorrent client")]
 struct Cli {
     /// Magnet link or .torrent file path to add on startup
     torrent_source: Option<String>,
@@ -89,8 +89,10 @@ async fn main() -> Result<()> {
             )
         }
     };
+    // A quoted `--download-dir '~/dl'` dodges shell tilde expansion, so
+    // expand here like the config loader does.
     if let Some(ref dir) = cli.download_dir {
-        config.general.download_dir = dir.clone();
+        config.general.download_dir = config::expand_tilde(dir);
     }
 
     enable_raw_mode()?;
@@ -168,9 +170,12 @@ async fn run_app(
     }));
 
     if let Some(ref source) = cli.torrent_source {
-        match validate_torrent_source(source) {
+        // Same tilde story as --download-dir; magnet links never start with
+        // `~` so expansion is a no-op for them.
+        let source = config::expand_tilde(source);
+        match validate_torrent_source(&source) {
             Ok(()) => {
-                send_cmd(&cmd_tx, EngineCommand::AddTorrent(source.clone()), &mut app).await;
+                send_cmd(&cmd_tx, EngineCommand::AddTorrent(source), &mut app).await;
             }
             Err(e) => app.set_error(e),
         }
@@ -556,7 +561,9 @@ async fn handle_input_mode(
             app.mode = AppMode::Normal;
         }
         KeyCode::Enter => {
-            let value = input_widget.value().trim().to_string();
+            // No shell is involved in TUI input, so `~/x.torrent` only works
+            // if we expand it ourselves.
+            let value = config::expand_tilde(input_widget.value().trim());
             match validate_torrent_source(&value) {
                 Ok(()) => {
                     send_cmd(cmd_tx, EngineCommand::AddTorrent(value), app).await;

@@ -100,6 +100,29 @@ fn default_http_api_bind() -> String {
     "127.0.0.1:0".to_string()
 }
 
+/// Expand a leading `~` in a user-supplied path against the home directory.
+/// TOML strings are always quoted and the TUI input dialog never involves a
+/// shell, so nothing else ever performs this expansion — without it a
+/// `"~/downloads"` value is treated as a relative path and materializes as a
+/// literal `./~/downloads` directory under the process working directory
+/// (issue #33). `~user` forms and mid-string tildes are valid path characters
+/// and stay untouched, as does everything when no home directory is known.
+pub fn expand_tilde(path: &str) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return path.to_string();
+    };
+    if path == "~" {
+        return home.to_string_lossy().into_owned();
+    }
+    let rest = path.strip_prefix("~/");
+    #[cfg(windows)]
+    let rest = rest.or_else(|| path.strip_prefix("~\\"));
+    match rest {
+        Some(rest) => home.join(rest).to_string_lossy().into_owned(),
+        None => path.to_string(),
+    }
+}
+
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
@@ -152,7 +175,10 @@ impl Config {
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             match toml::from_str::<Config>(&content) {
-                Ok(config) => Ok((config, None)),
+                Ok(mut config) => {
+                    config.expand_paths();
+                    Ok((config, None))
+                }
                 Err(e) => {
                     let msg = format!("Invalid config file, using defaults: {}", e);
                     tracing::warn!("{msg}");
@@ -164,6 +190,17 @@ impl Config {
             config.save()?;
             Ok((config, None))
         }
+    }
+
+    /// Expand `~` in every user-supplied path the config carries. Called once
+    /// at load time — the single choke point before any of these strings reach
+    /// `PathBuf::from` (session root, watch folder, disk-space probe) or
+    /// `Command::new` (player spawn). Never runs against an existing config
+    /// file's on-disk contents, so users' `~` spellings are preserved there.
+    pub fn expand_paths(&mut self) {
+        self.general.download_dir = expand_tilde(&self.general.download_dir);
+        self.general.watch_dir = self.general.watch_dir.take().map(|d| expand_tilde(&d));
+        self.player.command = expand_tilde(&self.player.command);
     }
 
     pub fn save(&self) -> Result<()> {
@@ -267,6 +304,67 @@ args = ["--no-terminal"]
         assert!(!config.ui.enable_notifications);
         assert_eq!(config.player.command, "mpv");
         assert_eq!(config.player.args, vec!["--no-terminal".to_string()]);
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        let home = dirs::home_dir().expect("home dir required for this test");
+        assert_eq!(expand_tilde("~"), home.to_string_lossy());
+        assert_eq!(
+            expand_tilde("~/rtorrent/download"),
+            home.join("rtorrent/download").to_string_lossy()
+        );
+        // Only a leading `~/` is special — `~user` and mid-string tildes are
+        // ordinary path characters.
+        assert_eq!(expand_tilde("~user/download"), "~user/download");
+        assert_eq!(expand_tilde("/tmp/~backup"), "/tmp/~backup");
+        assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
+        assert_eq!(expand_tilde("relative/path"), "relative/path");
+        assert_eq!(expand_tilde(""), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_expand_tilde_backslash() {
+        let home = dirs::home_dir().expect("home dir required for this test");
+        assert_eq!(expand_tilde(r"~\dl"), home.join("dl").to_string_lossy());
+    }
+
+    #[test]
+    fn test_expand_paths_tilde_config() {
+        let toml_str = r#"
+[general]
+download_dir = "~/rtorrent/download"
+watch_dir = "~/rtorrent/watch"
+
+[player]
+command = "~/bin/mpv"
+"#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        config.expand_paths();
+        let home = dirs::home_dir().expect("home dir required for this test");
+        assert_eq!(
+            config.general.download_dir,
+            home.join("rtorrent/download").to_string_lossy()
+        );
+        assert_eq!(
+            config.general.watch_dir.as_deref().unwrap(),
+            home.join("rtorrent/watch").to_string_lossy()
+        );
+        assert_eq!(
+            config.player.command,
+            home.join("bin/mpv").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn test_expand_paths_leaves_plain_config_untouched() {
+        let mut config = Config::default();
+        let download_dir = config.general.download_dir.clone();
+        config.expand_paths();
+        assert_eq!(config.general.download_dir, download_dir);
+        assert!(config.general.watch_dir.is_none());
+        assert!(config.player.command.is_empty());
     }
 
     #[test]
