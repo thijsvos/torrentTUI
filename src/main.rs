@@ -67,6 +67,12 @@ async fn main() -> Result<()> {
         original_hook(panic_info);
     }));
 
+    // Parse before touching the filesystem. clap exits from inside `parse()`
+    // for --version and --help, so doing this first keeps those from creating
+    // a config directory and writing a startup marker to the log of a machine
+    // that may never have run the app (#44).
+    let cli = Cli::parse();
+
     // Set up logging to file. Default filter is "torrenttui=warn" so librqbit
     // internals (peer IPs, tracker URLs, info hashes) don't get persisted to
     // disk by default. Users who want verbose logs can set RUST_LOG.
@@ -93,8 +99,6 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .with_env_filter(filter)
         .init();
-
-    let cli = Cli::parse();
 
     // Load config. The error here is the I/O error of reading the file; a
     // parse error returns `(default, Some(warning))` so we can surface it.
