@@ -6,6 +6,7 @@ mod types;
 mod ui;
 
 use std::io;
+use std::path::Path;
 
 use anyhow::Result;
 use app::App;
@@ -28,6 +29,11 @@ use ui::input::{validate_torrent_source, InputWidget};
 
 /// Speed-limit input cap in KB/s (10 GB/s). Prevents `kbps * 1024` overflow.
 const MAX_SPEED_LIMIT_KBPS: u64 = 10_485_760;
+
+/// Size at which the log is rotated on startup. The default filter is
+/// `torrenttui=warn`, which writes almost nothing, so this only bites people
+/// running with `RUST_LOG` turned up.
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Maximum digits accepted in the throttle input dialog. Combined with the
 /// numeric cap above, anything past this gets truncated visually.
@@ -66,7 +72,20 @@ async fn main() -> Result<()> {
     // disk by default. Users who want verbose logs can set RUST_LOG.
     let log_dir = config::Config::config_dir();
     std::fs::create_dir_all(&log_dir)?;
-    let log_file = std::fs::File::create(log_dir.join("torrenttui.log"))?;
+    let log_file = open_log_file(&log_dir)?;
+    // The log is cumulative now, so mark where each run begins. Written
+    // straight to the file rather than through tracing: the default filter is
+    // `torrenttui=warn` and a startup notice is not a warning, so it would be
+    // filtered out for exactly the users who need it. Timestamps come from the
+    // tracing lines that follow.
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            &log_file,
+            "=== torrenttui {} ===",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("torrenttui=warn"));
     tracing_subscriber::fmt()
@@ -130,6 +149,27 @@ async fn send_cmd(tx: &mpsc::Sender<EngineCommand>, cmd: EngineCommand, app: &mu
         tracing::error!("engine channel send failed: {e}");
         app.set_error("Engine stopped responding".to_string());
     }
+}
+
+/// Open `torrenttui.log` for appending, rotating it first if it has grown past
+/// [`MAX_LOG_BYTES`].
+///
+/// Appending rather than truncating matters because the failures people most
+/// want logs for — a crash, a hang, a torrent misbehaving — are usually
+/// followed immediately by restarting the app, and truncating on launch
+/// destroyed exactly the evidence they came back for (#42). One previous
+/// generation is kept as `torrenttui.log.1`.
+fn open_log_file(log_dir: &Path) -> io::Result<std::fs::File> {
+    let path = log_dir.join("torrenttui.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+        // A failed rotation is not worth refusing to start over; the append
+        // below just carries on in the oversized file.
+        let _ = std::fs::rename(&path, log_dir.join("torrenttui.log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
 }
 
 async fn run_app(
@@ -892,9 +932,94 @@ fn handle_stream_keypress(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn key(code: KeyCode) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn read_log(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("torrenttui.log")).unwrap()
+    }
+
+    #[test]
+    fn log_is_appended_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut f = open_log_file(dir.path()).unwrap();
+            writeln!(f, "first run").unwrap();
+        }
+        {
+            let mut f = open_log_file(dir.path()).unwrap();
+            writeln!(f, "second run").unwrap();
+        }
+        let contents = read_log(dir.path());
+        // The whole point of #42: the earlier run survives the relaunch.
+        assert!(contents.contains("first run"), "{contents:?}");
+        assert!(contents.contains("second run"), "{contents:?}");
+    }
+
+    #[test]
+    fn log_is_created_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = open_log_file(dir.path()).unwrap();
+        drop(f);
+        assert!(dir.path().join("torrenttui.log").exists());
+        assert!(!dir.path().join("torrenttui.log.1").exists());
+    }
+
+    #[test]
+    fn oversized_log_is_rotated_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("torrenttui.log"),
+            vec![b'x'; (MAX_LOG_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let mut f = open_log_file(dir.path()).unwrap();
+        writeln!(f, "fresh run").unwrap();
+        drop(f);
+
+        let rotated = dir.path().join("torrenttui.log.1");
+        assert!(rotated.exists(), "previous generation should be kept");
+        assert_eq!(
+            std::fs::metadata(&rotated).unwrap().len(),
+            MAX_LOG_BYTES + 1
+        );
+        // The live log restarts from the rotation, not from 5 MB of history.
+        let contents = read_log(dir.path());
+        assert_eq!(contents, "fresh run\n");
+    }
+
+    #[test]
+    fn log_under_the_cap_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("torrenttui.log"), b"keep me\n").unwrap();
+
+        let mut f = open_log_file(dir.path()).unwrap();
+        writeln!(f, "and me").unwrap();
+        drop(f);
+
+        assert!(!dir.path().join("torrenttui.log.1").exists());
+        assert_eq!(read_log(dir.path()), "keep me\nand me\n");
+    }
+
+    #[test]
+    fn rotation_replaces_the_older_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("torrenttui.log.1"), b"ancient\n").unwrap();
+        std::fs::write(
+            dir.path().join("torrenttui.log"),
+            vec![b'y'; (MAX_LOG_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        drop(open_log_file(dir.path()).unwrap());
+
+        // Only one previous generation is kept, so `ancient` is gone.
+        let rotated = std::fs::read(dir.path().join("torrenttui.log.1")).unwrap();
+        assert_eq!(rotated.len(), (MAX_LOG_BYTES + 1) as usize);
     }
 
     #[test]
