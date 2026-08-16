@@ -7,8 +7,8 @@ use librqbit::{
     api::TorrentIdOrHash,
     dht::Id20,
     http_api::{HttpApi, HttpApiOptions},
-    AddTorrent, AddTorrentResponse, Api, ManagedTorrent, Session, SessionOptions,
-    SessionPersistenceConfig, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ManagedTorrent, Session,
+    SessionOptions, SessionPersistenceConfig, TorrentStatsState,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -167,7 +167,26 @@ impl TorrentEngine {
             AddTorrent::from_bytes(bytes)
         };
 
-        let response = self.session.add_torrent(add_torrent, None).await?;
+        // `overwrite` lets librqbit open files that already exist. Without it
+        // adding a torrent whose data is already on disk fails outright with
+        // "error creating a new file (because allow_overwrite = false)" (#41),
+        // which breaks the two flows people actually hit: re-adding a finished
+        // torrent so it seeds, and recovering after the session state is lost
+        // while the downloads survive. librqbit hash-checks before writing, so
+        // intact data is recognised as complete and partial data resumes
+        // rather than being clobbered. Its own watch folder already sets this,
+        // so this is also what makes `a` and the CLI argument behave the same
+        // way as dropping a file into `watch_dir`.
+        let response = self
+            .session
+            .add_torrent(
+                add_torrent,
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
 
         match response {
             AddTorrentResponse::Added(id, handle) => Ok((id, handle, false)),
