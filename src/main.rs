@@ -145,6 +145,7 @@ async fn run_app(
     app.speed_limit_upload_kbps = config.network.max_upload_speed_kbps;
     app.confirm_on_quit = config.general.confirm_on_quit;
     app.player_config = config.player.clone();
+    app.watch_dir_configured = config.general.watch_dir.is_some();
 
     if let Some(msg) = config_warning {
         app.set_error(msg);
@@ -273,7 +274,12 @@ async fn run_app(
                             .unwrap_or_default()
                     };
                     if !label.is_empty() {
-                        ui::dialogs::render_delete_dialog(f, f.area(), &label);
+                        ui::dialogs::render_delete_dialog(
+                            f,
+                            f.area(),
+                            &label,
+                            app.watch_dir_configured,
+                        );
                     }
                 }
                 if app.mode == AppMode::ConfirmQuit {

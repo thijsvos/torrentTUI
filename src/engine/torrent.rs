@@ -1,8 +1,11 @@
 use crate::config::Config;
+use crate::engine::watch;
 use crate::types::{FileInfo, PeerInfo, TorrentInfo, TorrentStatus};
 use crate::ui::util::sanitize_display;
 use anyhow::{Context, Result};
 use librqbit::{
+    api::TorrentIdOrHash,
+    dht::Id20,
     http_api::{HttpApi, HttpApiOptions},
     AddTorrent, AddTorrentResponse, Api, ManagedTorrent, Session, SessionOptions,
     SessionPersistenceConfig, TorrentStatsState,
@@ -29,7 +32,7 @@ const PORT_RANGE_SIZE: u16 = 10;
 /// Maximum size of a `.torrent` file accepted on disk. Anything larger is
 /// rejected before a full read, both as a sanity check and to prevent a
 /// symlink-to-huge-file OOM.
-const MAX_TORRENT_FILE_SIZE: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_TORRENT_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 // Throttle algorithm tuning -------------------------------------------------
 
@@ -100,6 +103,16 @@ pub enum EngineCommand {
     /// allocations from O(N × peers × files) to O(peers + files).
     SetDetailTorrent(Option<usize>),
     Shutdown,
+}
+
+/// Where to look for the `.torrent`/`.magnet` files that fed the watch folder,
+/// and which subtree to leave alone while looking. Present only when the
+/// watcher actually started on a directory it is safe to delete from.
+#[derive(Clone)]
+struct WatchCleanup {
+    root: PathBuf,
+    /// The download directory, when it sits inside `root`.
+    exclude: Option<PathBuf>,
 }
 
 /// Lightweight per-torrent snapshot used by the throttle loop. Avoids the cost
@@ -175,12 +188,55 @@ impl TorrentEngine {
         Ok(())
     }
 
-    pub async fn delete(&self, id: usize, delete_files: bool) -> Result<()> {
-        use librqbit::api::TorrentIdOrHash;
-        self.session
-            .delete(TorrentIdOrHash::Id(id), delete_files)
-            .await?;
+    /// Delete a torrent, addressed by info hash rather than id. librqbit's
+    /// persistence hands out `max(existing ids) + 1`, so removing the highest
+    /// id frees it for immediate reuse by the watch-folder adder running
+    /// concurrently — addressing by hash takes that whole race off the table.
+    pub async fn delete(&self, target: TorrentIdOrHash, delete_files: bool) -> Result<()> {
+        // librqbit's `Session::delete` does `metadata.load_full().expect("TODO")`
+        // *after* it has already removed the torrent from its db, and our
+        // release profile sets `panic = "abort"` — that would take the whole
+        // process down. Unreachable in librqbit 8.1.1 (a magnet is only
+        // inserted into the db once its metadata resolves), so this is
+        // defence in depth against lazy metadata landing upstream.
+        if let Some(handle) = self.session.get(target) {
+            if handle.with_metadata(|_| ()).is_err() {
+                tracing::error!(
+                    "refusing to delete {:?}: metadata unresolved, deleting would abort the process",
+                    target
+                );
+                anyhow::bail!("torrent metadata is still resolving; try again in a moment");
+            }
+        }
+        self.session.delete(target, delete_files).await?;
         Ok(())
+    }
+
+    /// Info hash of a live torrent. Must be read *before* deleting, since
+    /// deletion is what removes the handle from the session.
+    pub fn info_hash(&self, id: usize) -> Option<Id20> {
+        self.get_handle(id).map(|h| h.info_hash())
+    }
+
+    /// Info hashes for a batch of ids, resolved under a single lock so no
+    /// concurrent add can slip in between two lookups. Ids that are no longer
+    /// live are simply absent from the result.
+    pub fn info_hashes(&self, ids: &[usize]) -> HashMap<usize, Id20> {
+        let wanted: HashSet<usize> = ids.iter().copied().collect();
+        self.session.with_torrents(|iter| {
+            iter.filter(|(id, _)| wanted.contains(id))
+                .map(|(id, handle)| (id, handle.info_hash()))
+                .collect()
+        })
+    }
+
+    /// Whether a torrent with this hash is still in the session. Used to
+    /// decide whether watch-folder cleanup should run: `Session::delete` can
+    /// return `Err` *after* removing the torrent from both the db and the
+    /// persistence store ("torrent deleted, but could not delete files"), and
+    /// skipping cleanup in that case would reproduce issue #39 exactly.
+    pub fn is_present(&self, hash: Id20) -> bool {
+        self.session.get(TorrentIdOrHash::Hash(hash)).is_some()
     }
 
     /// Lightweight snapshot of `(id, handle)` pairs. Lets the throttle loop
@@ -462,6 +518,74 @@ async fn start_http_api(
     Ok((format!("http://{}", bound), bound, task))
 }
 
+/// Delete the watch-folder files that fed the torrents identified by `hashes`.
+///
+/// Deliberately runs *after* `Session::delete`: removing the file first would
+/// destroy a `.torrent` for a torrent that might still be live, and it would
+/// close no race — librqbit's watcher ignores every event that isn't
+/// Create/Modify, and an add already in flight is holding the file's bytes in
+/// memory anyway. The trade-off is that this is best-effort: a crash between
+/// the delete and the walk leaves the file behind.
+fn spawn_watch_cleanup(
+    tasks: &mut tokio::task::JoinSet<()>,
+    cleanup: &Option<WatchCleanup>,
+    hashes: HashSet<String>,
+    msg_tx: &mpsc::Sender<String>,
+) {
+    // Reap already-finished cleanups; the set is only drained in full at
+    // shutdown, so without this a long session accumulates dead entries.
+    while tasks.try_join_next().is_some() {}
+
+    let Some(cleanup) = cleanup.clone() else {
+        return;
+    };
+    if hashes.is_empty() {
+        return;
+    }
+    let msg_tx = msg_tx.clone();
+    tasks.spawn(async move {
+        let outcome = match tokio::task::spawn_blocking(move || {
+            watch::remove_sources(&cleanup.root, cleanup.exclude.as_deref(), &hashes)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!("watch folder cleanup task failed: {}", e);
+                return;
+            }
+        };
+
+        // At most two messages, however many files were involved. The message
+        // channel holds 16 and a full one blocks the engine loop; worse, the
+        // UI concatenates unread messages into a single unwrapped line, so a
+        // burst would push everything past the right edge of the terminal.
+        if !outcome.removed.is_empty() {
+            let detail = match outcome.removed.as_slice() {
+                [one] => one
+                    .file_name()
+                    .map(|n| sanitize_display(&n.to_string_lossy()))
+                    .unwrap_or_else(|| "1 file".to_string()),
+                many => format!("{} files", many.len()),
+            };
+            let _ = msg_tx
+                .send(format!("Removed {} from watch folder", detail))
+                .await;
+        }
+        if !outcome.errors.is_empty() {
+            for err in &outcome.errors {
+                tracing::warn!("watch folder cleanup: {}", err);
+            }
+            let _ = msg_tx
+                .send(format!(
+                    "\u{26a0} {} watch file(s) could not be removed",
+                    outcome.errors.len()
+                ))
+                .await;
+        }
+    });
+}
+
 pub async fn run_engine(
     config: Config,
     cmd_rx: mpsc::Receiver<EngineCommand>,
@@ -518,6 +642,12 @@ pub async fn run_engine(
     // the user opts in via config. Failures here must not abort the engine
     // task — the UI would silently stop receiving state updates and a single
     // bad config knob would brick the whole app.
+    //
+    // When the watcher does start, `watch_cleanup` carries what the delete
+    // path needs: the folder to scan, and a subtree to leave alone. `None`
+    // means "no cleanup", so a watcher we refused to start never causes files
+    // to be deleted.
+    let mut watch_cleanup: Option<WatchCleanup> = None;
     if let Some(ref dir) = config.general.watch_dir {
         let path = PathBuf::from(dir);
         let download_dir = PathBuf::from(&config.general.download_dir);
@@ -537,6 +667,23 @@ pub async fn run_engine(
                 Ok(()) => {
                     engine.session().watch_folder(&path);
                     tracing::info!("Watching folder: {}", dir);
+                    // Deleting a torrent removes its source file from here
+                    // (issue #39), so the safety bar is higher than for
+                    // watching alone: refuse roots where a recursive delete
+                    // pass would be unrecoverable.
+                    if watch::is_safe_watch_root(&path) {
+                        let exclude = watch::cleanup_exclude(&path, &download_dir);
+                        watch_cleanup = Some(WatchCleanup {
+                            root: path,
+                            exclude,
+                        });
+                    } else {
+                        tracing::warn!(
+                            "watch_dir {:?} is a home or root directory; \
+                             auto-adding still works but .torrent cleanup on delete is disabled",
+                            dir
+                        );
+                    }
                 }
                 Err(e) => {
                     let _ = msg_tx.send(format!("Watch folder disabled: {}", e)).await;
@@ -545,6 +692,13 @@ pub async fn run_engine(
             }
         }
     }
+    let watch_cleanup = watch_cleanup;
+
+    // Watch-folder cleanup runs off the command loop so a slow walk (deep
+    // tree, network mount) can't hold up the state push that makes the
+    // deleted row disappear. Drained on shutdown so a cleanup in flight
+    // still lands.
+    let mut cleanup_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     let enable_notifications = config.ui.enable_notifications;
     let mut cmd_rx = cmd_rx;
@@ -754,8 +908,35 @@ pub async fn run_engine(
                         last_throttle_tick = std::time::Instant::now();
                     }
                     Some(EngineCommand::Delete { id, delete_files }) => {
-                        if let Err(e) = engine.delete(id, delete_files).await {
-                            tracing::error!("Failed to delete torrent {}: {}", id, e);
+                        // Read the hash before deleting — deletion is what
+                        // removes the handle. `None` means the torrent is
+                        // already gone (a double-tapped `d`, a stale mark);
+                        // stay quiet rather than surfacing librqbit's
+                        // "torrent with id N did not exist".
+                        if let Some(hash) = engine.info_hash(id) {
+                            if let Err(e) = engine
+                                .delete(TorrentIdOrHash::Hash(hash), delete_files)
+                                .await
+                            {
+                                tracing::error!("Failed to delete torrent {}: {}", id, e);
+                                let _ = msg_tx
+                                    .send(format!("\u{26a0} Delete failed: {}", e))
+                                    .await;
+                            }
+                            // Gated on the torrent being gone rather than on
+                            // Ok: librqbit reports "torrent deleted, but could
+                            // not delete files" *after* dropping it from both
+                            // the db and persistence, and skipping cleanup
+                            // there would leave the source file to resurrect
+                            // it on the next launch.
+                            if !engine.is_present(hash) {
+                                spawn_watch_cleanup(
+                                    &mut cleanup_tasks,
+                                    &watch_cleanup,
+                                    HashSet::from([hash.as_string()]),
+                                    &msg_tx,
+                                );
+                            }
                         }
                         finished_set.remove(&id);
                         user_paused.remove(&id);
@@ -808,9 +989,27 @@ pub async fn run_engine(
                         last_throttle_tick = std::time::Instant::now();
                     }
                     Some(EngineCommand::DeleteMany { ids, delete_files }) => {
+                        // One snapshot for the whole batch, before any
+                        // deleting: librqbit hands out `max(ids) + 1`, so
+                        // freeing the highest id makes it immediately
+                        // reusable by the watch-folder adder running
+                        // concurrently. Resolving hashes lazily inside the
+                        // loop could pick up a recycled id's new torrent.
+                        let batch: HashMap<usize, Id20> = engine.info_hashes(&ids);
+                        let mut deleted_hashes: HashSet<String> = HashSet::new();
+                        let mut failures = 0usize;
                         for id in ids {
-                            if let Err(e) = engine.delete(id, delete_files).await {
-                                tracing::error!("Failed to delete torrent {}: {}", id, e);
+                            if let Some(&hash) = batch.get(&id) {
+                                if let Err(e) = engine
+                                    .delete(TorrentIdOrHash::Hash(hash), delete_files)
+                                    .await
+                                {
+                                    tracing::error!("Failed to delete torrent {}: {}", id, e);
+                                    failures += 1;
+                                }
+                                if !engine.is_present(hash) {
+                                    deleted_hashes.insert(hash.as_string());
+                                }
                             }
                             finished_set.remove(&id);
                             user_paused.remove(&id);
@@ -821,6 +1020,20 @@ pub async fn run_engine(
                             per_torrent_last_change.remove(&id);
                             cached_upload_speed.remove(&id);
                             speed_tracker.remove(&id);
+                        }
+                        // One cleanup pass and one failure message for the
+                        // whole batch — see `spawn_watch_cleanup` on why the
+                        // message channel must not be fed per-item.
+                        spawn_watch_cleanup(
+                            &mut cleanup_tasks,
+                            &watch_cleanup,
+                            deleted_hashes,
+                            &msg_tx,
+                        );
+                        if failures > 0 {
+                            let _ = msg_tx
+                                .send(format!("\u{26a0} {} torrent(s) failed to delete", failures))
+                                .await;
                         }
                     }
                     Some(EngineCommand::PauseAll) => {
@@ -1085,6 +1298,11 @@ pub async fn run_engine(
             }
         }
     }
+
+    // Let any watch-folder cleanup in flight finish. Dropping the JoinSet here
+    // would abort it, leaving the source `.torrent` on disk to resurrect a
+    // torrent the user just deleted. main.rs caps the whole shutdown at 5 s.
+    while cleanup_tasks.join_next().await.is_some() {}
 
     // Stop the HTTP API server task spawned in start_http_api. main.rs awaits
     // this function on shutdown, so aborting here makes teardown deterministic

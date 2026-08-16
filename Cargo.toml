@@ -35,6 +35,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 fs4 = "1"
 notify-rust = "4"
+# Watch-folder cleanup walks the same tree librqbit's watcher does; using the
+# same crate keeps the traversal semantics (depth limit, no symlink following,
+# files only) identical to `librqbit::watch`.
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

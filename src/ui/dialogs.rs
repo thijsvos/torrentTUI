@@ -8,16 +8,39 @@ use ratatui::{
 
 use crate::ui::util::truncate;
 
-pub fn render_delete_dialog(f: &mut Frame, area: Rect, torrent_name: &str) {
-    let popup = centered_rect(50, 25, area);
+/// `watch_dir_configured` adds a line making clear that both answers remove
+/// the `.torrent` from the watch folder — otherwise "[K]eep files" reads as a
+/// promise the delete path no longer keeps.
+pub fn render_delete_dialog(
+    f: &mut Frame,
+    area: Rect,
+    torrent_name: &str,
+    watch_dir_configured: bool,
+) {
+    let mut popup = centered_rect(50, 25, area);
+    // The percentage height is only 6 rows on an 80x24 terminal, which is
+    // exactly the borders plus the four base lines. Grow it so the watch-folder
+    // note is not clipped off the bottom.
+    let needed = if watch_dir_configured { 8 } else { 6 };
+    popup.height = popup.height.max(needed).min(area.height);
     f.render_widget(Clear, popup);
 
-    let text = vec![
+    let mut text = vec![
         Line::from(""),
         Line::from(Span::styled(
             format!("  Delete \"{}\"?", truncate(torrent_name, 40)),
             Style::default().fg(Color::White),
         )),
+    ];
+
+    if watch_dir_configured {
+        text.push(Line::from(Span::styled(
+            "  Also removes the .torrent from your watch folder",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    text.extend([
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -40,7 +63,7 @@ pub fn render_delete_dialog(f: &mut Frame, area: Rect, torrent_name: &str) {
             ),
             Span::raw("ancel"),
         ]),
-    ];
+    ]);
 
     let dialog = Paragraph::new(text).block(
         Block::default()
