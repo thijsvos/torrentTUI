@@ -114,6 +114,11 @@ torrenttui -d /path/to/downloads
 | `q` | Quit |
 | `Ctrl+C` | Quit (double press to force) |
 
+Deleting prompts for `[K]eep files` or `[D]elete files` — that choice is about the
+*downloaded data*. Either way, if a watch folder is configured, the matching
+`.torrent`/`.magnet` is removed from it so the torrent does not come back on the next
+launch. See [Watch folder](#watch-folder).
+
 ### Detail view
 
 | Key | Action |
@@ -183,6 +188,22 @@ args = []                     # extra args inserted before the URL
 ```
 
 Paths (`download_dir`, `watch_dir`, `player.command`) may start with `~/`, which expands to your home directory.
+
+### Watch folder
+
+Set `watch_dir` and any `.torrent` (or `.magnet`) file dropped there is added
+automatically, both while TorrentTUI is running and on the next startup.
+
+**Deleting a torrent also deletes its source file from the watch folder.** This applies
+to both `[K]eep files` and `[D]elete files` — the choice there is about the downloaded
+data, not the metadata. Without this the folder is rescanned at every launch and the
+torrent you deleted comes straight back.
+
+Worth knowing if the folder is shared with something else (a Syncthing folder, an \*arr
+blackhole directory): TorrentTUI removes only files whose info hash matches a torrent you
+deleted, but it does remove them for good. Cleanup is skipped entirely when `watch_dir` is
+your home directory or a filesystem root, and never descends into `download_dir` when that
+lives inside the watch folder.
 
 ### Logging
 

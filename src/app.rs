@@ -55,6 +55,10 @@ pub struct App {
     /// External player command + args for the `s` stream keybinding. Loaded
     /// once from `config.player` at startup.
     pub player_config: PlayerConfig,
+    /// Wired from `config.general.watch_dir.is_some()`. Only affects the
+    /// delete dialog, which warns that deleting also removes the `.torrent`
+    /// from the watch folder.
+    pub watch_dir_configured: bool,
 }
 
 impl App {
@@ -96,6 +100,7 @@ impl App {
             confirm_on_quit: true,
             http_api_base: None,
             player_config: PlayerConfig::default(),
+            watch_dir_configured: false,
         }
     }
 
