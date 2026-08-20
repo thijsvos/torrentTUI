@@ -44,7 +44,9 @@ use tracing_subscriber::EnvFilter;
 use types::{AppMode, DetailTab};
 use ui::input::{validate_torrent_source, InputWidget};
 
-/// Speed-limit input cap in KB/s (10 GB/s). Prevents `kbps * 1024` overflow.
+/// Speed-limit cap in KB/s (10 GB/s), applied to both the throttle dialog and
+/// the values read from `config.toml`. Keeps `kbps * 1024` from overflowing in
+/// the status bar, which is the one conversion that is not saturating.
 const MAX_SPEED_LIMIT_KBPS: u64 = 10_485_760;
 
 /// Size at which the log is rotated on startup. The default filter is
@@ -220,8 +222,17 @@ async fn run_app(
     let mut app = App::new();
     let mut input_widget = InputWidget::new();
 
-    app.speed_limit_download_kbps = config.network.max_download_speed_kbps;
-    app.speed_limit_upload_kbps = config.network.max_upload_speed_kbps;
+    // Clamp here, not just in the throttle dialog: these reach an unchecked
+    // `* 1024` in the status bar, which overflows on an absurd config value
+    // (#49).
+    app.speed_limit_download_kbps = config
+        .network
+        .max_download_speed_kbps
+        .min(MAX_SPEED_LIMIT_KBPS);
+    app.speed_limit_upload_kbps = config
+        .network
+        .max_upload_speed_kbps
+        .min(MAX_SPEED_LIMIT_KBPS);
     app.confirm_on_quit = config.general.confirm_on_quit;
     app.player_config = config.player.clone();
     app.watch_dir_configured = config.general.watch_dir.is_some();
@@ -526,14 +537,16 @@ async fn handle_normal_mode(
         KeyCode::Char('p') => {
             if app.has_marks() {
                 let ids: Vec<usize> = app.marked_ids.iter().copied().collect();
-                // "Any paused (or throttle-paused) → resume all" is the
-                // intuitive user model. The previous strict-majority check
-                // gave a wrong answer on ties.
+                // "Any user-paused → resume all" is the intuitive model. A
+                // throttle-paused torrent does not count: it reports Paused
+                // mid duty cycle while the user never asked for it, and
+                // treating it as paused flipped this whole batch to Resume
+                // whenever a speed limit was set (#47).
                 let any_paused = ids.iter().any(|id| {
                     app.torrents.iter().any(|t| {
                         t.id == *id
-                            && (matches!(t.status, types::TorrentStatus::Paused)
-                                || t.throttle_paused)
+                            && matches!(t.status, types::TorrentStatus::Paused)
+                            && !t.throttle_managed
                     })
                 });
                 // Send the whole batch as one message — the 32-slot channel
@@ -548,7 +561,12 @@ async fn handle_normal_mode(
                 app.clear_marks();
             } else if let Some(torrent) = app.selected_torrent() {
                 let id = torrent.id;
-                if torrent.throttle_paused {
+                // Resume only what the user paused. A torrent that is Paused
+                // while throttle-managed is mid duty cycle, and `p` there means
+                // "stop it properly", not "hand it back to the throttle".
+                if matches!(torrent.status, types::TorrentStatus::Paused)
+                    && torrent.throttle_managed
+                {
                     send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
                 } else {
                     match torrent.status {
@@ -987,6 +1005,17 @@ mod tests {
     }
 
     #[test]
+    fn config_speed_limits_are_clamped_before_reaching_the_status_bar() {
+        // The status bar multiplies these by 1024. Values straight from
+        // config.toml used to skip the clamp the throttle dialog applies, so an
+        // absurd limit overflowed there (#49).
+        let raw = u64::MAX;
+        let clamped = raw.min(MAX_SPEED_LIMIT_KBPS);
+        assert_eq!(clamped, MAX_SPEED_LIMIT_KBPS);
+        assert!(clamped.checked_mul(1024).is_some());
+    }
+
+    #[test]
     fn log_is_appended_not_truncated() {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -1111,6 +1140,92 @@ mod tests {
         handle_filter_mode(&mut app, key(KeyCode::Esc));
         assert_eq!(app.mode, AppMode::Normal);
         assert_eq!(app.filter_text, ""); // Esc clears the filter
+    }
+
+    fn torrent(id: usize, status: types::TorrentStatus, managed: bool) -> types::TorrentInfo {
+        types::TorrentInfo {
+            id,
+            name: format!("t{id}"),
+            size_bytes: 100,
+            downloaded_bytes: 10,
+            uploaded_bytes: 0,
+            download_speed: 0,
+            upload_speed: 0,
+            peers_connected: 0,
+            peers_total: 0,
+            status,
+            eta_seconds: None,
+            files: Vec::new(),
+            peers: Vec::new(),
+            info_hash: String::new(),
+            trackers: Vec::new(),
+            piece_length: None,
+            throttle_managed: managed,
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_pause_under_a_speed_limit_pauses_rather_than_resumes() {
+        // #47: throttle-managed torrents used to count as "paused", so `p` on a
+        // set of actively downloading torrents sent ResumeMany and nothing
+        // appeared to happen. Being managed must not imply paused.
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.handle_state_push(vec![
+            torrent(0, types::TorrentStatus::Downloading, true),
+            torrent(1, types::TorrentStatus::Downloading, true),
+        ]);
+        app.marked_ids.insert(0);
+        app.marked_ids.insert(1);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
+        match rx.try_recv().expect("a command should have been sent") {
+            EngineCommand::PauseMany(ids) => assert_eq!(ids.len(), 2),
+            other => panic!("expected PauseMany, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_pause_resumes_when_something_is_genuinely_user_paused() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.handle_state_push(vec![
+            torrent(0, types::TorrentStatus::Downloading, true),
+            // User-paused: a real pause clears throttle management.
+            torrent(1, types::TorrentStatus::Paused, false),
+        ]);
+        app.marked_ids.insert(0);
+        app.marked_ids.insert(1);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
+        match rx.try_recv().expect("a command should have been sent") {
+            EngineCommand::ResumeMany(ids) => assert_eq!(ids.len(), 2),
+            other => panic!("expected ResumeMany, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_pause_resumes_only_a_user_paused_torrent() {
+        // Paused + managed is mid duty cycle: `p` there means "stop it
+        // properly", not "hand it back to the throttle".
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Paused, true)]);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
+        assert!(matches!(
+            rx.try_recv().expect("a command"),
+            EngineCommand::Pause(0)
+        ));
+
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Paused, false)]);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
+        assert!(matches!(
+            rx.try_recv().expect("a command"),
+            EngineCommand::Resume(0)
+        ));
     }
 
     #[tokio::test]

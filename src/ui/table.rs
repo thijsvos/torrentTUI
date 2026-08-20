@@ -82,7 +82,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             };
 
             let (status_text, status_style) =
-                status_cell_style(&torrent.status, torrent.throttle_paused);
+                status_cell_style(&torrent.status, torrent.throttle_managed);
 
             let progress_style = match torrent.status {
                 TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
@@ -150,11 +150,12 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-/// Map a torrent's status (and the throttle-paused override) to the cell text
-/// and style. Throttle takes precedence over the underlying engine state so
-/// the user sees the higher-signal label.
-pub fn status_cell_style(status: &TorrentStatus, throttle_paused: bool) -> (String, Style) {
-    if throttle_paused {
+/// Map a torrent's status (and the throttle-managed override) to the cell text
+/// and style. Being under a speed limit takes precedence over the underlying
+/// engine state, so a torrent mid duty cycle reads as "Throttled" rather than
+/// blinking between Downloading and Paused every tick.
+pub fn status_cell_style(status: &TorrentStatus, throttle_managed: bool) -> (String, Style) {
+    if throttle_managed {
         return ("Throttled".to_string(), Style::default().fg(Color::Cyan));
     }
     let style = match status {
@@ -172,7 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn throttle_paused_overrides_status() {
+    fn throttle_managed_overrides_status() {
         let (text, _) = status_cell_style(&TorrentStatus::Downloading, true);
         assert_eq!(text, "Throttled");
     }
