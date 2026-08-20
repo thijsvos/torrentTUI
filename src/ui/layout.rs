@@ -1,3 +1,11 @@
+//! Frame skeleton, the status/filter/throttle bars, and the human-readable
+//! formatters (`format_size`, `format_speed`, `format_eta`) shared by every
+//! widget.
+//!
+//! The formatters live here rather than in `util` because the bars are their
+//! main consumer and their rounding choices are display decisions rather than
+//! general-purpose utilities.
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},

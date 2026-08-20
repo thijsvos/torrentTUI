@@ -1,3 +1,24 @@
+//! UI-side application state and the operations key handlers perform on it.
+//!
+//! `App` deliberately holds no engine handle: everything it knows about
+//! torrents arrives as a snapshot over the state channel, and everything it
+//! wants done leaves as an `EngineCommand`. That makes it trivially
+//! constructible in tests and keeps any render path from blocking on the
+//! session.
+//!
+//! The recurring pattern here is the sort cache. `sorted_torrents()` is called
+//! several times per frame, and lowercasing names for the filter plus sorting
+//! dominated CPU at hundreds of torrents. Anything that changes the filter, the
+//! sort, or the torrent list must therefore invalidate the cache, rebuild it,
+//! and then restore the selection — which is why `change_sort_column`,
+//! `push_filter_char` and friends exist as wrappers instead of callers poking
+//! the fields directly.
+//!
+//! `torrents` is replaced wholesale on every push, so state keyed by torrent id
+//! (`marked_ids`, `deselected_files`) can outlive the torrent it refers to.
+//! `prune_stale_state` is what stops that accumulating, and `handle_state_push`
+//! is the one entry point that runs it.
+
 use std::collections::{HashMap, HashSet};
 
 use crate::config::PlayerConfig;

@@ -1,3 +1,20 @@
+//! The engine task: the only code in the crate that touches librqbit's
+//! `Session`.
+//!
+//! [`TorrentEngine`] is a thin, stateless wrapper over the session — every
+//! method is a lookup or a passthrough. All the *mutable* engine state lives in
+//! `run_engine`'s locals, deliberately: which torrents the user paused, which
+//! the throttle paused, the per-torrent token buckets, and the caches that stop
+//! the display flickering during a duty cycle. Keeping it on one task's stack
+//! is what makes it safe to mutate without locks.
+//!
+//! Throttling is a token bucket per torrent plus one global upload bucket,
+//! stepped every 100 ms. librqbit exposes no rate limiter, so a torrent that
+//! overdraws its bucket is genuinely paused and unpaused again once it has
+//! reaccumulated `UNPAUSE_HYSTERESIS` of its budget. That is why `Paused` can
+//! appear in the table without the user having asked for it, and why the
+//! hysteresis, the cooldown and the cached peer/speed values exist.
+
 use crate::config::Config;
 use crate::engine::watch;
 use crate::types::{FileInfo, PeerInfo, TorrentInfo, TorrentStatus};

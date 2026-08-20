@@ -1,3 +1,14 @@
+//! The Detail view: four tabs (Stats, Info, Files, Peers) over a single torrent.
+//!
+//! Everything here depends on the engine having been told which torrent is
+//! being viewed. `TorrentInfo::files`, `peers`, `trackers`, `info_hash` and
+//! `piece_length` are populated only for the Detail target; entering and leaving
+//! this view sends `SetDetailTorrent`, and without that every tab but Stats
+//! renders empty.
+//!
+//! All four renderers return early and draw nothing when there is no selection,
+//! which is safe only because the caller has already cleared the frame.
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},

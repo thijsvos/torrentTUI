@@ -1,3 +1,20 @@
+//! Terminal BitTorrent client built on librqbit and ratatui.
+//!
+//! The process runs as two halves that never share memory. `run_app` owns the
+//! terminal, the [`app::App`] state and every key press; `engine::torrent::run_engine`
+//! runs in its own tokio task and owns the librqbit `Session`. They talk over
+//! four mpsc channels: commands down (`EngineCommand`, 32 slots), torrent
+//! snapshots up (`Vec<TorrentInfo>`, 4 slots), status-bar strings up (16 slots),
+//! and one-shot engine facts up (`EngineInfo`, 4 slots). Nothing in `ui` or
+//! `app` may touch the session directly — that separation keeps rendering off
+//! the engine's critical path and lets the UI notice an engine panic instead of
+//! rendering frozen state forever.
+//!
+//! Because the channels are bounded, the UI must never fan out one send per
+//! torrent: the batch variants (`PauseMany`, `DeleteMany`) exist so a bulk
+//! action cannot fill the command queue while the engine is blocked pushing
+//! state the UI has not drained yet.
+
 mod app;
 mod config;
 mod engine;

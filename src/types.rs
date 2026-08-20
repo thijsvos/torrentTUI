@@ -1,3 +1,9 @@
+//! The vocabulary shared between the engine task and the UI.
+//!
+//! Everything here is a plain owned snapshot with no librqbit types in it. That
+//! boundary is what lets the UI render without touching the session, and what
+//! keeps librqbit version churn confined to `engine::torrent`.
+
 use std::fmt;
 
 #[derive(Debug, Clone)]
