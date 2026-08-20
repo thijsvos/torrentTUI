@@ -687,7 +687,7 @@ mod tests {
             info_hash: String::new(),
             trackers: Vec::new(),
             piece_length: None,
-            throttle_paused: false,
+            throttle_managed: false,
         }
     }
 

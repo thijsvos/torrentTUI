@@ -109,7 +109,10 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     )];
     if app.speed_limit_download_kbps > 0 {
         right_spans.push(Span::styled(
-            format!(" [{}]", format_speed(app.speed_limit_download_kbps * 1024)),
+            format!(
+                " [{}]",
+                format_speed(app.speed_limit_download_kbps.saturating_mul(1024))
+            ),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -135,7 +138,10 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     ));
     if app.speed_limit_upload_kbps > 0 {
         right_spans.push(Span::styled(
-            format!("[{}] ", format_speed(app.speed_limit_upload_kbps * 1024)),
+            format!(
+                "[{}] ",
+                format_speed(app.speed_limit_upload_kbps.saturating_mul(1024))
+            ),
             Style::default().fg(Color::DarkGray),
         ));
     }

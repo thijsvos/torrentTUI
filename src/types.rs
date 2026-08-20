@@ -82,8 +82,12 @@ pub struct TorrentInfo {
     pub info_hash: String,
     pub trackers: Vec<String>,
     pub piece_length: Option<u32>,
-    /// True when paused by the throttle system, not by the user
-    pub throttle_paused: bool,
+    /// True when a speed limit governs this torrent — the engine owns its
+    /// pause/unpause duty cycle. Not the same as "currently paused": it stays
+    /// set while the torrent is transferring between cycles. A user pause
+    /// clears it, so `status == Paused && !throttle_managed` is how you tell a
+    /// user pause from a throttle pause (#47).
+    pub throttle_managed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +216,7 @@ mod tests {
             info_hash: String::new(),
             trackers: Vec::new(),
             piece_length: None,
-            throttle_paused: false,
+            throttle_managed: false,
         }
     }
 

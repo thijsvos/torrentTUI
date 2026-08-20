@@ -43,8 +43,16 @@ pub type ManagedTorrentHandle = Arc<ManagedTorrent>;
 // Tunables
 // ---------------------------------------------------------------------------
 
-/// 1 Mbps in bytes/sec (1_000_000 bits/s ÷ 8 = 125_000 B/s).
-const MBPS_TO_BPS: f64 = 125_000.0;
+/// Converts librqbit's `Speed.mbps` to bytes/sec. Despite the field name it is
+/// mebibytes per second, not megabits: `speed_estimator.rs` computes it as
+/// `bytes_per_second / 1024 / 1024` and librqbit renders the same value as
+/// "MiB/s". Treating it as megabits understated every speed by 8.39x and
+/// inflated every ETA by the same factor (#46).
+const MIB_TO_BYTES: f64 = 1_048_576.0;
+
+/// Username half of the embedded HTTP API's per-session basic auth. The
+/// password is random per run; see `start_http_api`.
+const HTTP_API_USER: &str = "torrenttui";
 
 /// How many sequential ports the engine binds. The Dockerfile EXPOSE range is
 /// derived from this, so changes need to be mirrored there.
@@ -321,7 +329,7 @@ impl TorrentEngine {
                 let upload_speed = stats
                     .live
                     .as_ref()
-                    .map(|l| (l.upload_speed.mbps * MBPS_TO_BPS) as u64)
+                    .map(|l| (l.upload_speed.mbps * MIB_TO_BYTES) as u64)
                     .unwrap_or(0);
                 ThrottleSnapshot {
                     id,
@@ -357,8 +365,8 @@ impl TorrentEngine {
 
                 let (download_speed, upload_speed, eta_seconds, peers_connected) =
                     if let Some(ref live) = stats.live {
-                        let dl_bps = (live.download_speed.mbps * MBPS_TO_BPS) as u64;
-                        let ul_bps = (live.upload_speed.mbps * MBPS_TO_BPS) as u64;
+                        let dl_bps = (live.download_speed.mbps * MIB_TO_BYTES) as u64;
+                        let ul_bps = (live.upload_speed.mbps * MIB_TO_BYTES) as u64;
                         let remaining = stats.total_bytes.saturating_sub(stats.progress_bytes);
                         let eta = compute_eta(remaining, dl_bps);
                         let peers = live.snapshot.peer_stats.live as u32;
@@ -460,7 +468,7 @@ impl TorrentEngine {
                     info_hash,
                     trackers,
                     piece_length,
-                    throttle_paused: false, // set by push_state
+                    throttle_managed: false, // set by push_state
                 }
             })
             .collect()
@@ -501,7 +509,7 @@ fn derive_status(stats: &librqbit::TorrentStats) -> TorrentStatus {
                 let ul_speed = stats
                     .live
                     .as_ref()
-                    .map(|l| (l.upload_speed.mbps * MBPS_TO_BPS) as u64)
+                    .map(|l| (l.upload_speed.mbps * MIB_TO_BYTES) as u64)
                     .unwrap_or(0);
                 if ul_speed > 0 {
                     TorrentStatus::Seeding
@@ -566,6 +574,21 @@ async fn start_http_api(
     let bound = listener.local_addr()?;
 
     let api = Api::new(engine.session().clone(), None, None);
+
+    // Random per-session credentials. librqbit applies basic auth as a
+    // `route_layer` over the whole router, so unlike `read_only` it also covers
+    // the two POST routes that survive it: `POST /torrents/resolve_magnet` and
+    // `POST /rust_log`. The latter takes a text/plain body, which makes it a
+    // CORS "simple request" that any web page could send cross-origin to raise
+    // this process's log filter — writing peer IPs, tracker URLs and info
+    // hashes to disk, exactly what the default filter exists to prevent (#48).
+    // A browser cannot attach an Authorization header without a preflight, and
+    // librqbit's CORS layer rejects preflights from unknown origins.
+    //
+    // `generate_peer_id` fills the trailing 12 bytes from the OS RNG; the last
+    // 24 hex characters are those bytes, i.e. 96 bits.
+    let generated = librqbit::generate_peer_id(b"-tt0000-").as_string();
+    let token = generated[generated.len() - 24..].to_string();
     // Mount the API read-only. librqbit gates the torrent-control routes
     // (add / pause / start / forget / delete / limits / update_only_files)
     // behind `!read_only`, and the TUI drives all of those through the Session
@@ -579,7 +602,7 @@ async fn start_http_api(
         api,
         Some(HttpApiOptions {
             read_only: true,
-            ..Default::default()
+            basic_auth: Some((HTTP_API_USER.to_string(), token.clone())),
         }),
     );
 
@@ -593,7 +616,11 @@ async fn start_http_api(
     // resulting URL is correct for both 127.0.0.1:N and [::1]:N. Return the
     // bound address (so the caller can warn on a non-loopback bind) and the
     // task handle (so it can be stopped on shutdown).
-    Ok((format!("http://{}", bound), bound, task))
+    Ok((
+        format!("http://{}:{}@{}", HTTP_API_USER, token, bound),
+        bound,
+        task,
+    ))
 }
 
 /// Spawn a background task that deletes the watch-folder files which fed the
@@ -702,7 +729,8 @@ pub async fn run_engine(
     match start_http_api(&engine, &config.network.http_api_bind).await {
         Ok((base_url, bound, task)) => {
             http_task = Some(task);
-            tracing::info!("HTTP streaming API listening on {}", base_url);
+            // `base_url` carries the session credentials — log the bare address.
+            tracing::info!("HTTP streaming API listening on http://{}", bound);
             // The API is read-only (no add/pause/delete), but it is still
             // unauthenticated, so a non-loopback bind lets any host on that
             // network list your torrents and stream/read your downloaded files.
@@ -908,7 +936,7 @@ pub async fn run_engine(
             if throttle_managed.contains(&t.id)
                 && !matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding)
             {
-                t.throttle_paused = true;
+                t.throttle_managed = true;
                 let tracker = speed_tracker
                     .entry(t.id)
                     .or_insert((now, t.downloaded_bytes, 0));
@@ -1459,6 +1487,27 @@ mod tests {
         // Spent more than credited — expected, drives the pause decision.
         let next = step_bucket(0, 100, 0.1, 1_000);
         assert!(next < 0);
+    }
+
+    #[test]
+    fn mib_to_bytes_matches_librqbits_units() {
+        // librqbit's `Speed.mbps` is `bytes_per_second / 1024 / 1024` and is
+        // rendered as "MiB/s" — mebibytes, despite the field name. If someone
+        // "corrects" this back to a megabit conversion (125_000), every speed
+        // in the table drops by 8.39x and every ETA grows by the same (#46).
+        assert_eq!(MIB_TO_BYTES, 1_048_576.0);
+        assert_eq!((1.0_f64 * MIB_TO_BYTES) as u64, 1024 * 1024);
+        // A half-MiB/s reading is 512 KiB/s, not 62.5 KB/s.
+        assert_eq!((0.5_f64 * MIB_TO_BYTES) as u64, 512 * 1024);
+    }
+
+    #[test]
+    fn eta_uses_the_same_byte_scale_as_the_speed_column() {
+        // 10 MiB left at a reported 1.0 mbps (= 1 MiB/s) is 10 seconds. Under
+        // the old megabit constant this came out as 84.
+        let remaining = 10 * 1024 * 1024;
+        let dl_bps = (1.0_f64 * MIB_TO_BYTES) as u64;
+        assert_eq!(compute_eta(remaining, dl_bps), Some(10));
     }
 
     #[test]
