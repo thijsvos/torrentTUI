@@ -79,6 +79,15 @@ pub fn render_input(f: &mut Frame, area: Rect, input: &InputWidget) {
     f.render_widget(widget, area);
 }
 
+/// Pre-flight check on what the user typed, so an obvious mistake produces a
+/// status-bar message instead of a round trip to the engine. Dispatches on the
+/// literal `.torrent` suffix: anything ending in it is checked for existence
+/// only — not readability, size or content — and everything else is validated
+/// as a magnet link. `Ok` therefore means "worth handing to the engine", not
+/// "will succeed"; the engine re-checks size and parses for real.
+///
+/// Expects an already tilde-expanded path; both callers run `expand_tilde`
+/// first.
 pub fn validate_torrent_source(input: &str) -> Result<(), String> {
     let input = input.trim();
 

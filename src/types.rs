@@ -1,6 +1,19 @@
+//! The vocabulary shared between the engine task and the UI.
+//!
+//! Everything here is a plain owned snapshot with no librqbit types in it. That
+//! boundary is what lets the UI render without touching the session, and what
+//! keeps librqbit version churn confined to `engine::torrent`.
+
 use std::fmt;
 
 #[derive(Debug, Clone)]
+/// What the UI shows in the Status column. Derived fresh from librqbit's stats
+/// on every tick, so it is a snapshot, not a state machine.
+///
+/// `Complete` and `Seeding` are the same underlying condition — a finished
+/// torrent — split purely on whether it is uploading *right now*, so a seeding
+/// torrent with no active peers flips between the two tick to tick. Code that
+/// means "finished" must match both; several places in the engine do.
 pub enum TorrentStatus {
     FetchingMetadata,
     Downloading,
@@ -41,6 +54,17 @@ impl TorrentStatus {
 }
 
 #[derive(Debug, Clone)]
+/// One torrent as the UI sees it — a snapshot rebuilt from scratch by the
+/// engine on every tick and shipped over the state channel. Never mutate one
+/// expecting it to persist; the next push replaces the whole `Vec`.
+///
+/// The heavy fields (`files`, `peers`, `trackers`, `info_hash`, `piece_length`)
+/// are populated only for the torrent the UI is currently showing in Detail
+/// mode — see `EngineCommand::SetDetailTorrent`. For every other torrent they
+/// are empty. That is not "no data", it is "not asked for", and rendering them
+/// outside the Detail view silently shows nothing.
+///
+/// Speeds are bytes per second.
 pub struct TorrentInfo {
     pub id: usize,
     pub name: String,
@@ -79,6 +103,10 @@ pub struct PeerInfo {
 }
 
 impl TorrentInfo {
+    /// Completion as 0.0-100.0. Clamped at both ends because librqbit can
+    /// briefly report more downloaded than total right after a recheck, which
+    /// would otherwise overrun progress bars; a zero-size torrent (metadata
+    /// still resolving) reads as 0 rather than dividing by zero.
     pub fn progress_percent(&self) -> f64 {
         if self.size_bytes == 0 {
             return 0.0;
@@ -113,6 +141,11 @@ pub enum SortColumn {
 }
 
 impl SortColumn {
+    /// Position of this column in the rendered table, taken straight from the
+    /// `#[repr(u8)]` discriminant. It indexes `table.rs`'s header labels and
+    /// the cell order in `render_table`, so all three must be reordered
+    /// together — a mismatch puts the sort arrow above the wrong heading with
+    /// no error.
     pub fn column_index(&self) -> usize {
         *self as u8 as usize
     }
@@ -150,6 +183,8 @@ impl DetailTab {
         }
     }
 
+    /// Position of this tab in the rendered tab bar. Indexes the titles built
+    /// in `detail.rs`, so the two must stay in the same order.
     pub fn index(self) -> usize {
         self as u8 as usize
     }

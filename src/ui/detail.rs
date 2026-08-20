@@ -1,3 +1,14 @@
+//! The Detail view: four tabs (Stats, Info, Files, Peers) over one torrent.
+//!
+//! Everything here depends on the engine having been told which torrent is
+//! being viewed. `TorrentInfo::files`, `peers`, `trackers`, `info_hash` and
+//! `piece_length` are populated only for the Detail target; entering and
+//! leaving this view sends `SetDetailTorrent`, and without that every tab but
+//! Stats renders empty.
+//!
+//! All four renderers return early and draw nothing when there is no selection,
+//! which is safe only because the caller has already cleared the frame.
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -298,6 +309,15 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(files_widget, area);
 }
 
+/// Render the Peers tab. Takes `&mut App` because scrolling is resolved here:
+/// the row list is what defines the visible window, so the scroll offset is
+/// recomputed each frame to keep `detail_peer_index` on screen (the key
+/// handlers only move the index).
+///
+/// Rows are sorted by bytes downloaded, descending — so `detail_peer_index` is
+/// a position in *this* ordering, not in `TorrentInfo::peers`. It stays valid
+/// only because both have the same length; do not use it to index the
+/// underlying vec.
 fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
     // Pull just what we need so the immutable borrow ends before we touch
     // `app` mutably to update scroll state.
@@ -334,7 +354,9 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let visible_height = area.height.saturating_sub(6) as usize; // borders + header lines
+    // 2 border rows + 3 header lines = 5, plus one row of slack so the last
+    // peer never lands flush against the bottom border.
+    let visible_height = area.height.saturating_sub(6) as usize;
     let peer_index = app.detail_peer_index.min(peer_count.saturating_sub(1));
     app.detail_peer_index = peer_index;
 

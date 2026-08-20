@@ -1,12 +1,13 @@
 //! Watch-folder cleanup that librqbit does not do for us.
 //!
-//! `Session::watch_folder` reads `.torrent` files out of the watch directory
+//! `Session::watch_folder` reads `.torrent` files out of the watch folder
 //! and then leaves them there forever — it never moves, renames or deletes
-//! them, and it discards the source path immediately after reading. It also
-//! rescans the whole directory on every startup. Deleting a torrent in the TUI
-//! therefore only removed it until the next launch, when the leftover file was
-//! picked up and re-added (issue #39). This module closes that loop: after a
-//! torrent is deleted we delete the watch-folder file carrying its info hash.
+//! them, and it discards the source path immediately after reading. Its startup
+//! rescan walks the whole directory but only picks up `.torrent` files, so a
+//! leftover `.torrent` re-added the torrent on the next launch (issue #39);
+//! `.magnet` files are only ever read from a live filesystem event. This module
+//! closes that loop: after a torrent is deleted we delete the watch-folder file
+//! carrying its info hash, `.torrent` or `.magnet`.
 //!
 //! Everything here mirrors librqbit's own matching rules, because we are
 //! deleting files the user put there: anything librqbit would not have added,
@@ -23,9 +24,10 @@ use crate::engine::torrent::MAX_TORRENT_FILE_SIZE;
 /// but it only ever reads; we delete, so we keep a lid on the blast radius.
 const MAX_WALK_DEPTH: usize = 8;
 
-/// Hard cap on entries visited in one pass. A `watch_dir` that was mistyped
-/// into something enormous should degrade to "did nothing and logged it",
-/// not "walked the user's entire home directory looking for files to delete".
+/// Hard cap on entries visited in one pass. Bounds the blast radius of a
+/// `watch_dir` mistyped into something enormous: the walk stops and logs after
+/// this many entries. Note it is not a dry run — matching files found among
+/// the first `MAX_WALK_ENTRIES` entries have already been deleted by then.
 const MAX_WALK_ENTRIES: usize = 50_000;
 
 /// A `.magnet` file holds a single URI. 64 KiB is far above any real magnet

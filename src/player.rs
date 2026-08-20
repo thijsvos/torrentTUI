@@ -57,7 +57,10 @@ pub fn spawn_player(config: &PlayerConfig, url: &str) -> Result<()> {
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn '{}'", program))?;
-    // Drop the child handle without waiting — the OS reaps it when it exits.
+    // Drop the child handle without waiting. On Unix the player stays a zombie
+    // in our process table until TorrentTUI exits and init adopts it — harmless
+    // for a handful of manually launched players, and waiting would block for
+    // as long as the player runs.
     drop(child);
     Ok(())
 }

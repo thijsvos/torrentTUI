@@ -3,6 +3,14 @@ use ratatui::style::Color;
 const FILLED: char = '█';
 const EMPTY: char = '░';
 
+/// Render a block-glyph bar `width` cells wide followed by a right-aligned
+/// percentage. The suffix is always 7 columns, so budget `width + 7` when
+/// sizing the containing cell — the table's 24-wide Progress column is a
+/// 15-wide bar plus that suffix, not a 24-wide bar.
+///
+/// `percent` is clamped to 0..=100 before use: librqbit can briefly report
+/// more downloaded than total after a recheck, and an unclamped value would
+/// overrun the cell.
 pub fn render_progress_bar(percent: f64, width: usize) -> String {
     let percent = percent.clamp(0.0, 100.0);
     let filled = (((percent / 100.0) * width as f64).round() as usize).min(width);
@@ -34,6 +42,10 @@ pub fn progress_color(percent: f64) -> Color {
     }
 }
 
+/// Braille spinner frames for the "fetching metadata" cell. The length must
+/// stay at 10: `App::tick_spinner` advances `spinner_tick` with `% 10` and
+/// `table.rs` indexes this slice with it unchecked, so shortening this array
+/// panics the render. A test in this module pins the length.
 pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 #[cfg(test)]

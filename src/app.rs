@@ -1,9 +1,32 @@
+//! UI-side application state and the operations key handlers perform on it.
+//!
+//! `App` deliberately holds no engine handle: everything it knows about
+//! torrents arrives as a snapshot over the state channel, and everything it
+//! wants done leaves as an `EngineCommand`. That makes it trivially
+//! constructible in tests and keeps any render path from blocking on the
+//! session.
+//!
+//! The recurring pattern here is the sort cache. `sorted_torrents()` is called
+//! several times per frame, and lowercasing names for the filter plus sorting
+//! dominated CPU at hundreds of torrents. Anything that changes the filter, the
+//! sort, or the torrent list must therefore invalidate the cache, rebuild it,
+//! and then restore the selection — which is why `change_sort_column`,
+//! `push_filter_char` and friends exist as wrappers instead of callers poking
+//! the fields directly.
+//!
+//! `torrents` is replaced wholesale on every push, so state keyed by torrent id
+//! (`marked_ids`, `deselected_files`) can outlive the torrent it refers to.
+//! `prune_stale_state` is what stops that accumulating, and `handle_state_push`
+//! is the one entry point that runs it.
+
 use std::collections::{HashMap, HashSet};
 
 use crate::config::PlayerConfig;
 use crate::types::{AppMode, DetailTab, SortColumn, TorrentInfo, TorrentStatus};
 use ratatui::widgets::TableState;
 
+/// All UI-side state. Constructed once in `run_app`; every field is either
+/// derived from an engine snapshot or owned by a key handler.
 pub struct App {
     pub torrents: Vec<TorrentInfo>,
     pub table_state: TableState,
@@ -28,14 +51,22 @@ pub struct App {
     pub throttle_upload_value: u64,
     pub speed_limit_download_kbps: u64,
     pub speed_limit_upload_kbps: u64,
+    /// Where the torrent table was drawn last frame, so mouse clicks can be
+    /// mapped back to rows. Set by the renderer and cleared to `None` in
+    /// Detail mode, which is what makes clicks inert there.
     pub table_area: Option<ratatui::layout::Rect>,
     pub detail_file_index: usize,
+    /// Per torrent id, the file indices the user has *deselected*. Stored
+    /// negatively so a torrent whose metadata has not arrived yet — and which
+    /// therefore has no known file count — still defaults to "download
+    /// everything". Pruned by `prune_stale_state`.
     pub deselected_files: HashMap<usize, HashSet<usize>>,
     pub marked_ids: HashSet<usize>,
     pub detail_peer_index: usize,
     /// Top peer-row index currently visible in the Peers tab. The renderer
-    /// updates this each frame to keep `detail_peer_index` in view; handlers
-    /// only mutate the index.
+    /// recomputes it each frame to keep `detail_peer_index` in view and to
+    /// clamp it when the peer list shrinks; the key handlers reset it to 0
+    /// whenever the Peers list is re-entered (opening Detail, switching tab).
     pub detail_peer_scroll_offset: usize,
     /// Cached order of indices into `self.torrents` after applying the
     /// current filter and sort. Rebuilt when `sort_dirty` is true. The cache
@@ -47,7 +78,8 @@ pub struct App {
     /// Wired from `config.general.confirm_on_quit`; when false, `q` quits
     /// immediately instead of opening the confirmation dialog.
     pub confirm_on_quit: bool,
-    /// Base URL of the engine's embedded HTTP API (e.g. `http://127.0.0.1:34567`).
+    /// Base URL of the engine's embedded HTTP API (e.g.
+    /// `http://127.0.0.1:34567`).
     /// `None` until the engine reports `EngineInfo::HttpApiReady`; if the
     /// bind failed at startup, stays `None` forever and the `s` stream
     /// keybinding shows an error.
@@ -62,6 +94,12 @@ pub struct App {
 }
 
 impl App {
+    /// A blank app with row 0 selected and the sort cache marked dirty.
+    ///
+    /// The config-derived fields (speed limits, `confirm_on_quit`,
+    /// `player_config`, `watch_dir_configured`) get placeholder values here and
+    /// are overwritten by `run_app` immediately afterwards — do not read the
+    /// real defaults off this function.
     pub fn new() -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
@@ -104,10 +142,11 @@ impl App {
         }
     }
 
+    /// Whether `q` should open the confirmation dialog instead of quitting
+    /// outright. True for anything mid-work: downloading, resolving metadata,
+    /// or actively seeding. Seeding counts because quitting still cuts peers
+    /// abruptly, even though nothing is being downloaded.
     pub fn confirm_on_quit_required(&self) -> bool {
-        // Trigger on anything that's mid-work: downloading, resolving
-        // metadata, or actively seeding. Quitting on a seed-only session
-        // still cuts peers abruptly, which warrants the prompt.
         self.confirm_on_quit
             && self.torrents.iter().any(|t| {
                 matches!(
@@ -136,7 +175,11 @@ impl App {
         self.restore_selection();
     }
 
-    /// Set a new sort column and refresh the cache.
+    /// Set a new sort column and refresh the cache. Prefer these five wrappers
+    /// over assigning `sort_column` / `sort_reversed` / `filter_text` directly:
+    /// each has to pair `invalidate_sort` with `ensure_sort_cache` *and*
+    /// `restore_selection`, and skipping the last one leaves the user's cursor
+    /// on whatever torrent happens to land at the old index.
     pub fn change_sort_column(&mut self, next: SortColumn) {
         self.sort_column = next;
         self.invalidate_sort();
@@ -144,7 +187,7 @@ impl App {
         self.restore_selection();
     }
 
-    /// Toggle the reversed flag and refresh.
+    /// Toggle the sort direction and refresh — see `change_sort_column`.
     pub fn toggle_sort_reversed(&mut self) {
         self.sort_reversed = !self.sort_reversed;
         self.invalidate_sort();
@@ -152,7 +195,7 @@ impl App {
         self.restore_selection();
     }
 
-    /// Append a character to the filter and refresh.
+    /// Append a character to the filter and refresh — see `change_sort_column`.
     pub fn push_filter_char(&mut self, c: char) {
         self.filter_text.push(c);
         self.invalidate_sort();
@@ -160,7 +203,8 @@ impl App {
         self.restore_selection();
     }
 
-    /// Drop the trailing filter character and refresh.
+    /// Drop the trailing filter character and refresh — see
+    /// `change_sort_column`.
     pub fn pop_filter_char(&mut self) {
         self.filter_text.pop();
         self.invalidate_sort();
@@ -168,7 +212,7 @@ impl App {
         self.restore_selection();
     }
 
-    /// Empty the filter and refresh.
+    /// Empty the filter and refresh — see `change_sort_column`.
     pub fn clear_filter(&mut self) {
         if !self.filter_text.is_empty() {
             self.filter_text.clear();
@@ -253,6 +297,16 @@ impl App {
         self.sort_dirty = false;
     }
 
+    /// The current filtered and sorted view, borrowed from the cache. Takes
+    /// `&self` so render paths can call it, which means it will never rebuild a
+    /// cache it finds stale: if `sort_dirty` is set it falls back to a full
+    /// live sort, correct but O(N log N) on every call, and this runs several
+    /// times per frame.
+    ///
+    /// If the cache is *not* dirty but `torrents` was mutated behind its back,
+    /// indices that no longer resolve are dropped and you get a quietly
+    /// shortened list with no error. Mutate through `handle_state_push` (or
+    /// pair `invalidate_sort` with `ensure_sort_cache`) and neither happens.
     pub fn sorted_torrents(&self) -> Vec<&TorrentInfo> {
         // Read path: never rebuild. Callers that need a fresh cache must
         // ensure invalidate_sort + ensure_sort_cache ran first; for the
@@ -381,6 +435,14 @@ impl App {
             .and_then(|&i| self.torrents.get(i))
     }
 
+    /// Re-anchor the selection after the visible list changed. Follows the
+    /// selected torrent by id where it still exists, so re-sorting or filtering
+    /// keeps the cursor on the same *torrent* rather than the same row number;
+    /// when it is gone, the old index is clamped into the new bounds.
+    ///
+    /// Reads the sort cache, so run `ensure_sort_cache()` first or you anchor
+    /// against the previous ordering. Also refreshes `selected_torrent_id`,
+    /// syncs `table_state`, and clamps the detail-view cursors.
     pub fn restore_selection(&mut self) {
         let (new_index, new_id) = {
             let sorted = self.sorted_torrents();
@@ -476,11 +538,19 @@ impl App {
             .any(|t| matches!(t.status, TorrentStatus::FetchingMetadata))
     }
 
+    /// Show an error in the status bar for 3 seconds. Replaces any error
+    /// already showing — unlike `set_info`, which concatenates — because the
+    /// newest failure is the one the user needs.
     pub fn set_error(&mut self, msg: String) {
         self.error_message = Some(msg);
         self.error_timer = Some(std::time::Instant::now());
     }
 
+    /// Show an informational message for 5 seconds. If one is still on screen
+    /// the new text is appended after a `|` rather than replacing it, so a
+    /// burst does not silently swallow all but the last. The combined line is
+    /// rendered unwrapped, which is why the engine batches its own bursts into
+    /// at most two messages.
     pub fn set_info(&mut self, msg: String) {
         // If a previous info message is still on screen, append the new one so
         // burst notifications (e.g. multiple completions in one tick) don't
@@ -493,6 +563,10 @@ impl App {
         self.info_timer = Some(std::time::Instant::now());
     }
 
+    /// Age out status-bar messages: errors after 3 seconds, info after 5.
+    /// There is no timer task behind this — the main loop calls it every pass,
+    /// so a message set outside that loop stays on screen until the next
+    /// iteration, and one set during shutdown never clears at all.
     pub fn clear_expired_messages(&mut self) {
         if let Some(timer) = self.error_timer {
             if timer.elapsed() > std::time::Duration::from_secs(3) {
@@ -512,6 +586,11 @@ impl App {
         self.spinner_tick = (self.spinner_tick + 1) % 10;
     }
 
+    /// Whether a file is included in the download. Returns `true` for torrents
+    /// and indices this has never seen, because selection is tracked as the set
+    /// of *exclusions* — so an out-of-range `file_index` also reports selected.
+    /// Bound the index against the torrent's real file count before trusting
+    /// it.
     pub fn is_file_selected(&self, torrent_id: usize, file_index: usize) -> bool {
         !self
             .deselected_files
@@ -534,6 +613,12 @@ impl App {
             .collect()
     }
 
+    /// Refresh the free-space figure in the status bar, at most once every 5
+    /// seconds. Safe and intended to call every frame — the rate limit lives
+    /// here rather than at the call site. A failed probe (directory removed,
+    /// network share unmounted) clears the cached value rather than keeping a
+    /// stale reading, so the indicator disappears. Performs a blocking
+    /// filesystem call on the UI thread.
     pub fn update_disk_space(&mut self, download_dir: &str) {
         let should_update = match self.disk_space_timer {
             None => true,
@@ -560,6 +645,11 @@ impl App {
         self.marked_ids.clear();
     }
 
+    /// Mark every torrent currently *visible* — the active filter applies —
+    /// and add to the existing marks rather than replacing them, so narrowing
+    /// the filter and pressing `v` repeatedly accumulates a selection across
+    /// searches. Marks for torrents hidden by the filter survive untouched,
+    /// including through a subsequent bulk delete.
     pub fn mark_all(&mut self) {
         let ids: Vec<usize> = self.sorted_torrents().iter().map(|t| t.id).collect();
         self.marked_ids.extend(ids);
