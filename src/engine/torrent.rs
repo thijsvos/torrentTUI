@@ -64,7 +64,8 @@ pub enum EngineInfo {
     /// The embedded HTTP API is listening on this base URL (e.g.
     /// `http://127.0.0.1:34567`). Sent once at engine startup when the API
     /// successfully binds. If the bind fails, no message is sent and the UI
-    /// keeps `http_api_base = None`, which disables stream-related keybinds.
+    /// keeps `http_api_base = None`, so `s` reports "Streaming API not ready
+    /// yet" instead of opening a player.
     HttpApiReady { base_url: String },
 }
 
@@ -105,9 +106,9 @@ pub enum EngineCommand {
     Shutdown,
 }
 
-/// Where to look for the `.torrent`/`.magnet` files that fed the watch folder,
-/// and which subtree to leave alone while looking. Present only when the
-/// watcher actually started on a directory it is safe to delete from.
+/// Where to look for the `.torrent`/`.magnet` files the watch folder fed to the
+/// engine, and which subtree to leave alone while looking. Present only when
+/// the watcher actually started on a directory it is safe to delete from.
 #[derive(Clone)]
 struct WatchCleanup {
     root: PathBuf,
@@ -496,9 +497,11 @@ pub(crate) fn stream_url(base: &str, torrent_id: usize, file_idx: usize) -> Stri
     )
 }
 
-/// Bind and spawn librqbit's HTTP API server. Returns the chosen base URL so
-/// the engine can publish it to the UI. Spawn failure is the caller's problem
-/// to surface — we never panic here.
+/// Bind and spawn librqbit's HTTP API server. Returns the base URL to publish
+/// to the UI, the bound address so the caller can warn on a non-loopback bind,
+/// and the server task's handle so it can be stopped on shutdown. `Err` means
+/// the bind failed (port in use, address unparseable); the spawned server's own
+/// errors are logged, not returned. We never panic here.
 async fn start_http_api(
     engine: &TorrentEngine,
     bind: &str,
@@ -509,13 +512,15 @@ async fn start_http_api(
     let bound = listener.local_addr()?;
 
     let api = Api::new(engine.session().clone(), None, None);
-    // Mount the API read-only: only GET routes (including the file-stream route
-    // we hand to media players) are exposed. librqbit gates every mutating route
-    // (add / pause / start / forget / delete / limits / update_only_files) behind
-    // `!read_only`. The TUI drives all of those through the Session API directly,
-    // so read-only loses nothing — and an unauthenticated, loopback-reachable API
-    // can no longer be used to control the client (CSRF-to-localhost or another
-    // local process).
+    // Mount the API read-only. librqbit gates the torrent-control routes
+    // (add / pause / start / forget / delete / limits / update_only_files)
+    // behind `!read_only`, and the TUI drives all of those through the Session
+    // API directly, so read-only loses nothing there. It is not a GET-only
+    // mount though: librqbit 8.1.1 registers `POST /torrents/resolve_magnet`
+    // and `POST /rust_log` unconditionally. The latter takes a plain-text body,
+    // so a browser page can reach it cross-origin without a preflight and raise
+    // this process's log filter — which is what keeps peer IPs, tracker URLs
+    // and info hashes out of the on-disk log by default.
     let http_api = HttpApi::new(
         api,
         Some(HttpApiOptions {
@@ -537,7 +542,11 @@ async fn start_http_api(
     Ok((format!("http://{}", bound), bound, task))
 }
 
-/// Delete the watch-folder files that fed the torrents identified by `hashes`.
+/// Spawn a background task that deletes the watch-folder files which fed the
+/// torrents identified by `hashes`, and reap any previously finished ones off
+/// `tasks`. Returns immediately — the deletion has not happened yet. A silent
+/// no-op when `cleanup` is `None` (no watcher, or a watch root cleanup
+/// refused) or when `hashes` is empty — in both cases nothing was matched.
 ///
 /// Deliberately runs *after* `Session::delete`: removing the file first would
 /// destroy a `.torrent` for a torrent that might still be live, and it would
@@ -745,10 +754,11 @@ pub async fn run_engine(
     let mut detail_torrent_id: Option<usize> = None;
 
     /// Build the latest per-torrent snapshot and broadcast it to the UI. Also
-    /// fires completion notifications, applies throttle-managed display overrides
-    /// (effective speed + paused flag), and prunes the cache maps (peers /
-    /// upload-speed / speed-tracker) of torrents that no longer exist. Runs at
-    /// the end of every command and every throttle tick.
+    /// fires completion notifications, applies throttle-managed display
+    /// overrides (effective speed + paused flag), and prunes the bookkeeping
+    /// (finished-set / peers / upload-speed / speed-tracker) of torrents that
+    /// no longer exist. Runs at the end of every command except `Shutdown`,
+    /// which breaks out of the loop first, and on every timer tick.
     #[allow(clippy::too_many_arguments)]
     async fn push_state(
         engine: &TorrentEngine,
@@ -931,7 +941,7 @@ pub async fn run_engine(
                         // removes the handle. `None` means the torrent is
                         // already gone (a double-tapped `d`, a stale mark);
                         // stay quiet rather than surfacing librqbit's
-                        // "torrent with id N did not exist".
+                        // "no such torrent in db".
                         if let Some(hash) = engine.info_hash(id) {
                             if let Err(e) = engine
                                 .delete(TorrentIdOrHash::Hash(hash), delete_files)

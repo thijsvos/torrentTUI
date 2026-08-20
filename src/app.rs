@@ -34,8 +34,9 @@ pub struct App {
     pub marked_ids: HashSet<usize>,
     pub detail_peer_index: usize,
     /// Top peer-row index currently visible in the Peers tab. The renderer
-    /// updates this each frame to keep `detail_peer_index` in view; handlers
-    /// only mutate the index.
+    /// recomputes it each frame to keep `detail_peer_index` in view and to
+    /// clamp it when the peer list shrinks; the key handlers reset it to 0
+    /// whenever the Peers list is re-entered (opening Detail, switching tab).
     pub detail_peer_scroll_offset: usize,
     /// Cached order of indices into `self.torrents` after applying the
     /// current filter and sort. Rebuilt when `sort_dirty` is true. The cache
@@ -47,7 +48,8 @@ pub struct App {
     /// Wired from `config.general.confirm_on_quit`; when false, `q` quits
     /// immediately instead of opening the confirmation dialog.
     pub confirm_on_quit: bool,
-    /// Base URL of the engine's embedded HTTP API (e.g. `http://127.0.0.1:34567`).
+    /// Base URL of the engine's embedded HTTP API (e.g.
+    /// `http://127.0.0.1:34567`).
     /// `None` until the engine reports `EngineInfo::HttpApiReady`; if the
     /// bind failed at startup, stays `None` forever and the `s` stream
     /// keybinding shows an error.
@@ -104,10 +106,11 @@ impl App {
         }
     }
 
+    /// Whether `q` should open the confirmation dialog instead of quitting
+    /// outright. True for anything mid-work: downloading, resolving metadata,
+    /// or actively seeding. Seeding counts because quitting still cuts peers
+    /// abruptly, even though nothing is being downloaded.
     pub fn confirm_on_quit_required(&self) -> bool {
-        // Trigger on anything that's mid-work: downloading, resolving
-        // metadata, or actively seeding. Quitting on a seed-only session
-        // still cuts peers abruptly, which warrants the prompt.
         self.confirm_on_quit
             && self.torrents.iter().any(|t| {
                 matches!(
@@ -136,7 +139,11 @@ impl App {
         self.restore_selection();
     }
 
-    /// Set a new sort column and refresh the cache.
+    /// Set a new sort column and refresh the cache. Prefer these five wrappers
+    /// over assigning `sort_column` / `sort_reversed` / `filter_text` directly:
+    /// each has to pair `invalidate_sort` with `ensure_sort_cache` *and*
+    /// `restore_selection`, and skipping the last one leaves the user's cursor
+    /// on whatever torrent happens to land at the old index.
     pub fn change_sort_column(&mut self, next: SortColumn) {
         self.sort_column = next;
         self.invalidate_sort();
@@ -144,7 +151,7 @@ impl App {
         self.restore_selection();
     }
 
-    /// Toggle the reversed flag and refresh.
+    /// Toggle the sort direction and refresh — see `change_sort_column`.
     pub fn toggle_sort_reversed(&mut self) {
         self.sort_reversed = !self.sort_reversed;
         self.invalidate_sort();
@@ -152,7 +159,7 @@ impl App {
         self.restore_selection();
     }
 
-    /// Append a character to the filter and refresh.
+    /// Append a character to the filter and refresh — see `change_sort_column`.
     pub fn push_filter_char(&mut self, c: char) {
         self.filter_text.push(c);
         self.invalidate_sort();
@@ -160,7 +167,8 @@ impl App {
         self.restore_selection();
     }
 
-    /// Drop the trailing filter character and refresh.
+    /// Drop the trailing filter character and refresh — see
+    /// `change_sort_column`.
     pub fn pop_filter_char(&mut self) {
         self.filter_text.pop();
         self.invalidate_sort();
@@ -168,7 +176,7 @@ impl App {
         self.restore_selection();
     }
 
-    /// Empty the filter and refresh.
+    /// Empty the filter and refresh — see `change_sort_column`.
     pub fn clear_filter(&mut self) {
         if !self.filter_text.is_empty() {
             self.filter_text.clear();

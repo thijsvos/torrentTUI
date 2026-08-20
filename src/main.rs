@@ -100,8 +100,10 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .init();
 
-    // Load config. The error here is the I/O error of reading the file; a
-    // parse error returns `(default, Some(warning))` so we can surface it.
+    // Load config. A parse error returns `(default, Some(warning))` so we can
+    // surface it; an Err is an I/O failure either reading an existing config or
+    // — on first run, when `load` writes the defaults out — creating the config
+    // directory, serializing, fsyncing or renaming the new file.
     let (mut config, config_warning) = match config::Config::load() {
         Ok(pair) => pair,
         Err(e) => {
@@ -502,7 +504,7 @@ async fn handle_normal_mode(
                     })
                 });
                 // Send the whole batch as one message — the 32-slot channel
-                // would block on send #33 otherwise, and the engine's own
+                // would block on the 33rd send otherwise, and the engine's own
                 // state_tx send (4-slot) could deadlock while the UI waits.
                 let cmd = if any_paused {
                     EngineCommand::ResumeMany(ids)
@@ -897,7 +899,7 @@ fn apply_engine_info(app: &mut App, info: EngineInfo) {
     }
 }
 
-/// Handle the `s` keystroke in the Detail view's Files tab. Composes the
+/// Handle the `s` keystroke in Detail mode's Files tab. Composes the
 /// librqbit stream URL and hands it to the configured external player.
 /// All failure modes degrade to a status-bar message instead of a crash.
 fn handle_stream_keypress(app: &mut App) {

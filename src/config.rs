@@ -42,12 +42,12 @@ pub struct NetworkConfig {
     pub max_upload_speed_kbps: u64,
     /// Bind address for the embedded HTTP API that serves file-stream URLs to
     /// external media players. Default `127.0.0.1:0` (auto-assigned port,
-    /// loopback only). The API is mounted READ-ONLY (no add/pause/delete routes),
-    /// but it is UNAUTHENTICATED: anyone who can reach it can list your torrents
-    /// and stream/read your downloaded files. Binding to a non-loopback host
-    /// exposes that to every machine on the network, so only do it on a fully
-    /// trusted one; the app logs a warning and shows a status message when it
-    /// binds off-loopback.
+    /// loopback only). The API is mounted READ-ONLY (no add/pause/delete
+    /// routes), but it is UNAUTHENTICATED: anyone who can reach it can list
+    /// your torrents and stream/read your downloaded files. Binding to a
+    /// non-loopback host exposes that to every machine on the network, so only
+    /// do it on a fully trusted one; the app logs a warning and shows a status
+    /// message when it binds off-loopback.
     #[serde(default = "default_http_api_bind")]
     pub http_api_bind: String,
 }
@@ -170,6 +170,14 @@ impl Config {
     /// Load config from disk. Returns `(config, optional_warning)`. The warning
     /// is set when the config file existed but couldn't be parsed; callers
     /// should surface it to the user (the file is still treated as defaults).
+    ///
+    /// Not a pure read: when no config file exists this writes one containing
+    /// the defaults, so a first launch materializes `config.toml` and its
+    /// parent directory — and `Err` covers that write as well as the read. A
+    /// file that exists but is unparseable is deliberately left alone for the
+    /// user to fix.
+    /// Tilde expansion runs only on the parsed-file path; the default and
+    /// parse-failure paths return values that never contain `~`.
     pub fn load() -> Result<(Self, Option<String>)> {
         let path = Self::config_path();
         if path.exists() {

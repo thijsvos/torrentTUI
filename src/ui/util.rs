@@ -2,6 +2,9 @@
 /// most `max_len`; otherwise returns the first `max_len - 3` chars followed by
 /// "...". Slicing strings by byte index (the previous implementation) panics
 /// when the cut lands in the middle of a multi-byte UTF-8 character.
+///
+/// For `max_len` under 4 the result is just "...", which is *longer* than
+/// `max_len` — callers laying out fixed-width columns must not go that narrow.
 pub fn truncate(s: &str, max_len: usize) -> String {
     // Fast path: byte length is an upper bound on char count (every char is
     // ≥1 byte), so if it already fits we skip the char-counting pass entirely.

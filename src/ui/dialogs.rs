@@ -8,9 +8,14 @@ use ratatui::{
 
 use crate::ui::util::truncate;
 
-/// `watch_dir_configured` adds a line making clear that both answers remove
-/// the `.torrent` from the watch folder — otherwise "[K]eep files" reads as a
-/// promise the delete path no longer keeps.
+/// Render the delete-confirmation popup. `watch_dir_configured` adds a line
+/// making clear that both answers remove the `.torrent` from the watch folder —
+/// otherwise `[K]eep files` reads as a promise the delete path no longer keeps.
+///
+/// That flag is wired from `config.general.watch_dir.is_some()` alone, so the
+/// note also shows in the cases where the engine disables cleanup at startup
+/// (watch folder equal to the download dir, unavailable, or a home/root path).
+/// Erring toward the warning is deliberate; it is not a guarantee.
 pub fn render_delete_dialog(
     f: &mut Frame,
     area: Rect,

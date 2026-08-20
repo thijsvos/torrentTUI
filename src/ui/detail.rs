@@ -334,7 +334,9 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let visible_height = area.height.saturating_sub(6) as usize; // borders + header lines
+    // 2 border rows + 3 header lines = 5, plus one row of slack so the last
+    // peer never lands flush against the bottom border.
+    let visible_height = area.height.saturating_sub(6) as usize;
     let peer_index = app.detail_peer_index.min(peer_count.saturating_sub(1));
     app.detail_peer_index = peer_index;
 
