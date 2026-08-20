@@ -33,6 +33,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+/// A reference to a torrent inside the session. Cloning is a refcount bump, so
+/// snapshotting handles for a tick is cheap — but holding one does not keep the
+/// torrent *registered*: after a delete the session no longer knows about it
+/// while your handle stays alive. Check `is_present` when liveness matters.
 pub type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
 // ---------------------------------------------------------------------------
@@ -87,6 +91,13 @@ pub enum EngineInfo {
 }
 
 #[derive(Debug)]
+/// Everything the UI can ask the engine to do. The only channel for mutating
+/// torrent state — nothing outside `engine::torrent` holds a session handle.
+///
+/// The channel carrying these is 32 deep and the engine's own state channel is
+/// 4 deep, so a UI that fans out one command per marked torrent can fill the
+/// queue and deadlock against an engine blocked pushing state. That is what the
+/// `*Many` variants are for; prefer them over loops.
 pub enum EngineCommand {
     AddTorrent(String),
     Pause(usize),
@@ -115,8 +126,8 @@ pub enum EngineCommand {
         id: usize,
         file_indices: Vec<usize>,
     },
-    /// Tell the engine which torrent the UI is showing in Detail mode (or
-    /// `None` when leaving Detail). The engine populates the heavy
+    /// Which torrent the UI is showing in Detail mode, or `None` when leaving
+    /// Detail. The engine populates the heavy
     /// `files` / `peers` fields only for that torrent, dropping per-tick
     /// allocations from O(N × peers × files) to O(peers + files).
     SetDetailTorrent(Option<usize>),
@@ -142,6 +153,11 @@ struct ThrottleSnapshot {
     upload_speed: u64,
 }
 
+/// Thin wrapper over librqbit's `Session` — lookups, passthroughs and snapshot
+/// building, with no state of its own. Everything mutable (user-paused set,
+/// throttle buckets, display caches) lives in `run_engine`'s locals, so a
+/// second `TorrentEngine` would be a session view with no throttling attached
+/// rather than a second engine.
 pub struct TorrentEngine {
     session: Arc<Session>,
 }
@@ -168,6 +184,14 @@ impl TorrentEngine {
         Ok(Self { session })
     }
 
+    /// Add a magnet URI or a `.torrent` file path. The trailing `bool` is
+    /// "already managed": the session recognised this info hash and returned
+    /// the existing torrent instead of adding one, which is what lets the
+    /// caller say "already downloaded" rather than reporting a fresh add.
+    ///
+    /// Anything not starting with `magnet:?` is treated as a filesystem path
+    /// and size-capped before reading, so a symlink pointing at something
+    /// enormous cannot be read into memory.
     pub async fn add_torrent(&self, source: &str) -> Result<(usize, ManagedTorrentHandle, bool)> {
         let source = source.trim();
         let add_torrent = if source.starts_with("magnet:?") {
@@ -215,6 +239,11 @@ impl TorrentEngine {
         }
     }
 
+    /// Pause a torrent in the session and nothing else. The caller owns the
+    /// bookkeeping: `run_engine` distinguishes a user pause (`user_paused`,
+    /// which the throttle loop must never undo) from a throttle pause
+    /// (`throttle_paused`, which it unpauses once tokens recover). Calling this
+    /// without updating the right set means the throttle loop fights the user.
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> Result<()> {
         self.session.pause(handle).await?;
         Ok(())
@@ -438,6 +467,11 @@ impl TorrentEngine {
         })
     }
 
+    /// Look up a live torrent by id. Linear scan under the session lock, which
+    /// is why the throttle loop uses `handle_snapshot()` once per tick instead
+    /// of calling this per torrent. `None` means the torrent is no longer in
+    /// the session — a double-tapped delete, or a stale mark — and callers
+    /// generally stay quiet about it rather than surfacing an error.
     pub fn get_handle(&self, id: usize) -> Option<ManagedTorrentHandle> {
         self.session.with_torrents(|iter| {
             for (tid, handle) in iter {
@@ -449,6 +483,9 @@ impl TorrentEngine {
         })
     }
 
+    /// Escape hatch to the raw session, for the few operations this wrapper
+    /// deliberately does not mirror: `update_only_files`, `watch_folder`, and
+    /// handing the session to librqbit's `Api` for the read-only HTTP server.
     pub fn session(&self) -> &Arc<Session> {
         &self.session
     }
@@ -631,6 +668,23 @@ fn spawn_watch_cleanup(
     });
 }
 
+/// The engine task. Owns the librqbit session, all throttle bookkeeping, and
+/// the watch folder, and runs until it receives `Shutdown` or the command
+/// channel closes — both are normal exits that return `Ok`.
+///
+/// Two arms drive everything: an incoming command, or the throttle tick. Both
+/// end by calling `push_state`, so the UI gets a fresh snapshot after every
+/// action without each command handler having to remember to send one.
+///
+/// Startup failures are degraded, never fatal: a failed HTTP API bind just
+/// means the UI never receives `HttpApiReady` and streaming stays disabled, and
+/// an unusable `watch_dir` disables the watcher with a status message. Only
+/// session construction can abort the task, and main.rs treats that as "engine
+/// died, quit".
+///
+/// Shutdown drains in-flight watch-folder cleanups before returning, because
+/// dropping the `JoinSet` would abort them and leave a `.torrent` on disk to
+/// resurrect a torrent the user just deleted.
 pub async fn run_engine(
     config: Config,
     cmd_rx: mpsc::Receiver<EngineCommand>,

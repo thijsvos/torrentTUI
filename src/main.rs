@@ -1,10 +1,10 @@
 //! Terminal BitTorrent client built on librqbit and ratatui.
 //!
 //! The process runs as two halves that never share memory. `run_app` owns the
-//! terminal, the [`app::App`] state and every key press; `engine::torrent::run_engine`
-//! runs in its own tokio task and owns the librqbit `Session`. They talk over
-//! four mpsc channels: commands down (`EngineCommand`, 32 slots), torrent
-//! snapshots up (`Vec<TorrentInfo>`, 4 slots), status-bar strings up (16 slots),
+//! terminal, the [`app::App`] state and every key press; `run_engine` runs in
+//! its own tokio task and owns the librqbit `Session`. They talk over four mpsc
+//! channels: commands down (`EngineCommand`, 32 slots), torrent snapshots up
+//! (`Vec<TorrentInfo>`, 4 slots), status-bar strings up (16 slots),
 //! and one-shot engine facts up (`EngineInfo`, 4 slots). Nothing in `ui` or
 //! `app` may touch the session directly — that separation keeps rendering off
 //! the engine's critical path and lets the UI notice an engine panic instead of
@@ -195,6 +195,22 @@ fn open_log_file(log_dir: &Path) -> io::Result<std::fs::File> {
         .open(&path)
 }
 
+/// The UI loop. Spawns the engine task, then alternates between draining the
+/// engine's channels, rendering, and awaiting the next event.
+///
+/// Rendering is change-driven: `needs_render` is set by anything that alters
+/// what is on screen, and the frame interval exists only to age out timed
+/// messages and advance the metadata spinner. An idle session with no torrents
+/// therefore draws nothing at all.
+///
+/// Each pass drains the state/message/info channels with `try_recv` *before*
+/// the `select!`, so a burst of engine pushes collapses into a single repaint
+/// instead of one per message. The engine's `JoinHandle` is retained rather
+/// than detached purely so a panicked engine is noticed here instead of leaving
+/// the UI rendering frozen state forever.
+///
+/// On quit it sends `Shutdown` and waits up to 5 s for the engine to flush
+/// librqbit's persisted state and finish any watch-folder cleanup.
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: Cli,
@@ -829,6 +845,11 @@ async fn handle_throttle_mode(
     }
 }
 
+/// Keys for the delete confirmation: `k` keeps the downloaded files, `d`
+/// deletes them, `c` or Esc cancels. Both `k` and `d` remove the torrent from
+/// the session — the choice is only about the data on disk. Operates on the
+/// marked set when there is one, otherwise on the selected row, and marks are
+/// cleared afterwards either way, including marks hidden by the active filter.
 async fn handle_delete_mode(
     app: &mut App,
     key: crossterm::event::KeyEvent,

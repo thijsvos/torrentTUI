@@ -17,6 +17,14 @@ use ratatui::{
 use crate::app::App;
 use crate::types::AppMode;
 
+/// Split the frame into the three regions every mode shares: a 3-row header, a
+/// flexible main area (table or detail view), and a 3-row bottom bar (status,
+/// filter, throttle prompt or add-torrent input, depending on mode).
+///
+/// Always three elements, in that order — main.rs indexes them positionally, so
+/// returning a different count panics rather than misrendering. The main area
+/// is `Min(5)`, so on a very short terminal ratatui shrinks the fixed bars
+/// instead and downstream renderers must tolerate a zero-height inner area.
 pub fn get_layout(area: Rect) -> Vec<Rect> {
     Layout::default()
         .direction(Direction::Vertical)
@@ -239,6 +247,10 @@ pub fn render_throttle_bar(f: &mut Frame, area: Rect, step: u8, input_buf: &str)
     f.render_widget(bar, area);
 }
 
+/// Format a byte-per-second rate for display. Divides by 1024 at each step but
+/// labels the result KB/MB/GB, matching what other torrent clients show rather
+/// than being strictly correct about KiB. Callers holding a KB/s value from the
+/// throttle config must multiply by 1024 first.
 pub fn format_speed(bytes_per_sec: u64) -> String {
     if bytes_per_sec == 0 {
         return "0 B/s".to_string();
@@ -255,6 +267,10 @@ pub fn format_speed(bytes_per_sec: u64) -> String {
     format!("{:.2} GB/s", gb)
 }
 
+/// Format a byte count for display, with the same 1024-per-step, KB-labelled
+/// convention as `format_speed`. Anything under 1 MB is rendered as whole KB,
+/// so sub-kilobyte files show as `0 KB` rather than in bytes — fine for torrent
+/// payloads, wrong if this is ever reused for small values.
 pub fn format_size(bytes: u64) -> String {
     if bytes == 0 {
         return "0 B".to_string();

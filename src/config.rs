@@ -20,12 +20,20 @@ pub struct GeneralConfig {
     pub download_dir: String,
     #[serde(default = "default_true")]
     pub confirm_on_quit: bool,
+    /// Directory watched for `.torrent`/`.magnet` files to add automatically.
+    /// Disabled if it resolves to the same directory as `download_dir`, which
+    /// would loop. Deleting a torrent also deletes the file that added it from
+    /// here — unless the directory is the user's home or a filesystem root, in
+    /// which case adding still works but that cleanup is switched off.
     #[serde(default)]
     pub watch_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
+    /// First port of the range the engine binds; it reserves ten consecutive
+    /// ports from here. The Dockerfile's EXPOSE range is derived from the same
+    /// span, so widening it means editing both.
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
     #[serde(default = "default_max_peers")]
@@ -36,8 +44,15 @@ pub struct NetworkConfig {
     /// IGD/UPnP service, which exposes you to peers outside your LAN.
     #[serde(default)]
     pub enable_upnp: bool,
+    /// Download cap in KB/s, where `0` means unlimited. Enforced by pausing
+    /// and unpausing torrents on a duty cycle rather than by rate limiting,
+    /// since librqbit offers no limiter — expect capped torrents to show as
+    /// "Throttled" in the table.
     #[serde(default)]
     pub max_download_speed_kbps: u64,
+    /// Upload cap in KB/s, `0` for unlimited. Same duty-cycle mechanism as the
+    /// download cap, but with one global budget instead of a bucket per
+    /// torrent.
     #[serde(default)]
     pub max_upload_speed_kbps: u64,
     /// Bind address for the embedded HTTP API that serves file-stream URLs to
@@ -66,6 +81,10 @@ pub struct PlayerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
+    /// Idle repaint interval. Clamped to 16-1000 ms at startup, so values
+    /// outside that are accepted by the parser and then quietly ignored.
+    /// Rendering is change-driven, so this only paces animations and the ageing
+    /// out of status messages — it is not a frame rate floor.
     #[serde(default = "default_refresh_rate")]
     pub refresh_rate_ms: u64,
     #[serde(default = "default_true")]
@@ -157,6 +176,11 @@ impl Default for UiConfig {
 }
 
 impl Config {
+    /// The app's per-user directory. Holds `config.toml` and the rotating
+    /// `torrenttui.log`, so main.rs calls this before any config is loaded.
+    /// Falls back to the process working directory when the platform reports
+    /// no config dir, which keeps the app runnable in a container with no HOME
+    /// rather than failing at startup.
     pub fn config_dir() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -211,6 +235,9 @@ impl Config {
         self.player.command = expand_tilde(&self.player.command);
     }
 
+    /// Write the config out, creating the directory if needed. Serializes the
+    /// in-memory values, so any `~` the user wrote has already been expanded by
+    /// `load` and gets persisted in expanded form.
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path();
         if let Some(parent) = path.parent() {

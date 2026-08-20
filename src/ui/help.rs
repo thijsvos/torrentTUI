@@ -5,6 +5,10 @@ use ratatui::{
     Frame,
 };
 
+/// Draw the keybinding overlay. The table is hand-maintained and has no link
+/// to the handlers in main.rs or the hint strings in `render_status_bar`, so a
+/// new keybinding needs editing in all three places — nothing here fails if
+/// they drift.
 pub fn render_help(f: &mut Frame, area: Rect) {
     let popup = centered_rect(60, 80, area);
     f.render_widget(Clear, popup);
