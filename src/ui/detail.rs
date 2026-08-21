@@ -287,7 +287,7 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(if is_highlighted { "> " } else { "  " }, highlight_style),
             Span::styled(format!("{} ", checkbox), checkbox_style),
             Span::styled(media_glyph, media_glyph_style),
-            Span::styled(format!("{:<45}", truncate(&file.name, 45)), file_style),
+            Span::styled(crate::ui::util::pad_to_width(&file.name, 45), file_style),
             Span::styled(format!("{:>10}", format_size(file.size_bytes)), file_style),
             Span::raw("  "),
             Span::styled(

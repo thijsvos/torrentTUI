@@ -18,10 +18,16 @@ The minimum supported toolchain is whatever `rustc 1.95+` installs through `rust
 The project mirrors GitHub Actions' lint settings; running these locally avoids a CI round trip:
 
 ```bash
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
+cargo fmt --all -- --check
+RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features
+RUSTFLAGS="-D warnings" cargo test --all
+cargo audit
 ```
+
+`RUSTFLAGS` matters: CI sets it globally, including for the test job, so a
+warning in test code passes locally without it and fails in CI. `cargo audit`
+is a third CI job (it reads `.cargo/audit.toml`) that a dependency bump will
+trip.
 
 If you touch the engine, smoke-test against a public-domain torrent (e.g. one of [archive.org's](https://archive.org/) `.torrent` files) before submitting.
 

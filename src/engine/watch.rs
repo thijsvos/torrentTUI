@@ -47,18 +47,31 @@ pub struct RemoveOutcome {
     pub errors: Vec<String>,
 }
 
-/// False for filesystem roots and the user's home directory. Both are
-/// plausible typos for a watch folder and catastrophic targets for a
-/// recursive delete pass, so cleanup is disabled entirely for them.
+/// False for filesystem roots and the well-known user directories. All of them
+/// are plausible choices for a watch folder and poor targets for a recursive
+/// delete pass — `~/Downloads` especially, since that is where browsers put
+/// `.torrent` files and where a curated archive of them is most likely to live.
+/// Cleanup is disabled entirely for these; auto-adding still works.
 pub fn is_safe_watch_root(dir: &Path) -> bool {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     // Filesystem root, or a bare drive prefix like `C:\` on Windows.
     if dir.parent().is_none() {
         return false;
     }
-    if let Some(home) = dirs::home_dir() {
-        let home = home.canonicalize().unwrap_or(home);
-        if dir == home {
+    let well_known = [
+        dirs::home_dir(),
+        dirs::download_dir(),
+        dirs::document_dir(),
+        dirs::desktop_dir(),
+        dirs::picture_dir(),
+        dirs::video_dir(),
+        dirs::audio_dir(),
+        dirs::config_dir(),
+        dirs::data_dir(),
+    ];
+    for candidate in well_known.into_iter().flatten() {
+        let candidate = candidate.canonicalize().unwrap_or(candidate);
+        if dir == candidate {
             return false;
         }
     }
@@ -417,6 +430,24 @@ mod tests {
         assert_eq!(cleanup_exclude(&inner, &sibling), None);
         // Identical paths are the engine's separate "would loop" case.
         assert_eq!(cleanup_exclude(&watch, &watch), None);
+    }
+
+    #[test]
+    fn rejects_well_known_user_directories() {
+        // ~/Downloads is the most plausible bad choice: it is where browsers
+        // put .torrent files and where an archive of them tends to live.
+        for d in [
+            dirs::download_dir(),
+            dirs::document_dir(),
+            dirs::desktop_dir(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if d.exists() {
+                assert!(!is_safe_watch_root(&d), "{d:?} should be refused");
+            }
+        }
     }
 
     #[cfg(unix)]

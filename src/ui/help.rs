@@ -1,3 +1,4 @@
+use crate::ui::util::centered_rect;
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
@@ -62,12 +63,4 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         .style(Style::default().fg(Color::White));
 
     f.render_widget(table, popup);
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_width = r.width * percent_x / 100;
-    let popup_height = r.height * percent_y / 100;
-    let x = r.x + (r.width.saturating_sub(popup_width)) / 2;
-    let y = r.y + (r.height.saturating_sub(popup_height)) / 2;
-    Rect::new(x, y, popup_width, popup_height)
 }

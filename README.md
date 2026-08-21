@@ -26,7 +26,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 - **Detail view** — inspect torrent info, individual file progress, and peer details
 - **Session persistence** — torrents survive restarts via librqbit's built-in fastresume
 - **Disk space monitoring** — free space indicator with low-space warnings
-- **Completion notifications** — terminal bell + status bar notification when downloads finish
+- **Completion notifications** — status bar message, plus a desktop notification on Linux/Windows or a system sound on macOS
 - **Mouse support** — click to select torrents in the list
 - **Configurable** — TOML config file for download directory, network settings, and more
 
@@ -171,7 +171,6 @@ confirm_on_quit = true
 
 [network]
 listen_port = 6881
-max_peers_per_torrent = 50
 enable_dht = true
 enable_upnp = false           # opt in to open an external port via UPnP
 max_download_speed_kbps = 0   # 0 = unlimited
@@ -191,8 +190,10 @@ Paths (`download_dir`, `watch_dir`, `player.command`) may start with `~/`, which
 
 ### Watch folder
 
-Set `watch_dir` and any `.torrent` (or `.magnet`) file dropped there is added
-automatically, both while TorrentTUI is running and on the next startup.
+Set `watch_dir` and any `.torrent` file dropped there is added automatically,
+both while TorrentTUI is running and on the next startup. `.magnet` files are
+picked up too, but only while the app is running — librqbit's startup rescan
+reads `.torrent` only, so a `.magnet` dropped while it is closed is ignored.
 
 **Deleting a torrent also deletes its source file from the watch folder.** This applies
 to both `[K]eep files` and `[D]elete files` — the choice there is about the downloaded
@@ -216,8 +217,8 @@ A few defaults worth knowing:
 - **Logging is filtered.** Only TorrentTUI's own warnings are written to disk; librqbit's INFO-level output (peer IPs, tracker URLs, info hashes) is silenced. Bumping `RUST_LOG` re-enables it — redact before sharing logs.
 - **UPnP is off by default.** Enabling it (`network.enable_upnp = true`) opens an external port via your router and exposes you to peers outside your LAN.
 - **No telemetry.** TorrentTUI makes no outbound connections except to BitTorrent peers, trackers, and (if DHT is enabled) the DHT network.
-- **Notifications.** Torrent names are sanitized before being sent to the OS notification daemon (Pango/HTML escaped on Linux). Disable entirely with `ui.enable_notifications = false`.
-- **HTTP streaming API is loopback-only by default.** The embedded API used for the `s` stream keybinding binds to `127.0.0.1:0`. Changing `network.http_api_bind` to a routable interface exposes the API (which has no built-in auth on its public routes) to other machines on your network — do this only on a trusted LAN.
+- **Notifications.** Control characters are stripped from torrent names at the engine boundary, and names are additionally Pango-escaped before reaching the Linux notification daemon. macOS plays a sound instead of sending a notification, so no name leaves the process there. Disable entirely with `ui.enable_notifications = false`.
+- **HTTP streaming API is loopback-only and authenticated.** The embedded API used for the `s` stream keybinding binds to `127.0.0.1:0`, is mounted read-only, and requires HTTP basic auth with a random password generated per run. The credentials ride in the stream URL handed to your media player, which means they are visible in that process's argv while it runs. Changing `network.http_api_bind` to a routable interface sends those credentials over plaintext HTTP — do this only on a trusted LAN.
 
 ## Docker
 

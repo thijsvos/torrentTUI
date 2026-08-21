@@ -2,6 +2,9 @@
 name = "torrenttui"
 version = "0.6.1"
 edition = "2021"
+# Stated in the README and CONTRIBUTING; declared here so cargo enforces it
+# with a clear message instead of failing deep inside a dependency.
+rust-version = "1.95"
 description = "A terminal BitTorrent client for magnet link downloads"
 
 [dependencies]
@@ -39,6 +42,10 @@ notify-rust = "4"
 # same crate keeps the traversal semantics (depth limit, no symlink following,
 # files only) identical to `librqbit::watch`.
 walkdir = "2"
+# Terminal column accounting. Torrent names are attacker-controlled, and a
+# CJK/emoji name counted by `char` occupies twice its width, shoving the
+# adjacent columns off screen.
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
