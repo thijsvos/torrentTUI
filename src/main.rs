@@ -44,10 +44,18 @@ use tracing_subscriber::EnvFilter;
 use types::{AppMode, DetailTab};
 use ui::input::{validate_torrent_source, InputWidget};
 
-/// Speed-limit cap in KB/s (10 GB/s), applied to both the throttle dialog and
-/// the values read from `config.toml`. Keeps `kbps * 1024` from overflowing in
-/// the status bar, which is the one conversion that is not saturating.
+/// Speed-limit cap in KB/s (10 GB/s). Applied by [`clamped_speed_limit`] to
+/// every entry point: the throttle dialog, the values read from `config.toml`,
+/// and the limits the engine enforces.
 const MAX_SPEED_LIMIT_KBPS: u64 = 10_485_760;
+
+/// Clamp a user-supplied speed limit. The single choke point for the cap —
+/// the status bar multiplies by 1024 without saturating, and the engine casts
+/// to `i64`, so a value that skips this can overflow the display or invert the
+/// upload bucket and pause every torrent forever.
+pub(crate) fn clamped_speed_limit(kbps: u64) -> u64 {
+    kbps.min(MAX_SPEED_LIMIT_KBPS)
+}
 
 /// Size at which the log is rotated on startup. The default filter is
 /// `torrenttui=warn`, which writes almost nothing, so this only bites people
@@ -225,14 +233,8 @@ async fn run_app(
     // Clamp here, not just in the throttle dialog: these reach an unchecked
     // `* 1024` in the status bar, which overflows on an absurd config value
     // (#49).
-    app.speed_limit_download_kbps = config
-        .network
-        .max_download_speed_kbps
-        .min(MAX_SPEED_LIMIT_KBPS);
-    app.speed_limit_upload_kbps = config
-        .network
-        .max_upload_speed_kbps
-        .min(MAX_SPEED_LIMIT_KBPS);
+    app.speed_limit_download_kbps = clamped_speed_limit(config.network.max_download_speed_kbps);
+    app.speed_limit_upload_kbps = clamped_speed_limit(config.network.max_upload_speed_kbps);
     app.confirm_on_quit = config.general.confirm_on_quit;
     app.player_config = config.player.clone();
     app.watch_dir_configured = config.general.watch_dir.is_some();
@@ -247,6 +249,9 @@ async fn run_app(
     // Engine-to-UI one-shot facts (HTTP API base URL today; future use:
     // listening port, DHT state). Small capacity because messages are rare.
     let (info_tx, mut info_rx) = mpsc::channel::<EngineInfo>(4);
+    // Free-space probe results. Depth 1: only the newest reading matters, and
+    // a full channel just means a probe is still in flight.
+    let (disk_tx, mut disk_rx) = mpsc::channel::<Option<u64>>(1);
 
     let engine_config = config.clone();
     // Keep the JoinHandle so we can both detect engine death mid-run and
@@ -281,6 +286,7 @@ async fn run_app(
         config.ui.refresh_rate_ms.clamp(16, 1000),
     ));
     let mut needs_render = true;
+    let mut engine_died = false;
 
     loop {
         // Detect engine death: previously a panic in the spawned task would
@@ -296,12 +302,17 @@ async fn run_app(
             if !app.should_quit {
                 app.set_error("Engine task ended unexpectedly; quitting".to_string());
                 app.should_quit = true;
+                // Without this the loop can quit without ever drawing the
+                // message, so the TUI just vanishes. The Err below is what
+                // puts it on stderr once the terminal is restored.
+                needs_render = true;
+                engine_died = true;
             }
         }
 
         while let Ok(torrents) = state_rx.try_recv() {
-            app.handle_state_push(torrents);
-            needs_render = true;
+            // Only repaint when something on screen actually moved.
+            needs_render |= app.handle_state_push(torrents);
         }
         while let Ok(msg) = msg_rx.try_recv() {
             app.set_info(msg);
@@ -310,6 +321,12 @@ async fn run_app(
         while let Ok(info) = info_rx.try_recv() {
             apply_engine_info(&mut app, info);
             needs_render = true;
+        }
+        while let Ok(free) = disk_rx.try_recv() {
+            if app.free_disk_space != free {
+                app.set_disk_space(free);
+                needs_render = true;
+            }
         }
 
         app.clear_expired_messages();
@@ -385,7 +402,11 @@ async fn run_app(
             if let Some(h) = engine_handle.take() {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
             }
-            return Ok(());
+            return if engine_died {
+                Err(anyhow::anyhow!("engine task ended unexpectedly"))
+            } else {
+                Ok(())
+            };
         }
 
         tokio::select! {
@@ -481,8 +502,7 @@ async fn run_app(
                 }
             }
             Some(torrents) = state_rx.recv() => {
-                app.handle_state_push(torrents);
-                needs_render = true;
+                needs_render |= app.handle_state_push(torrents);
             }
             Some(msg) = msg_rx.recv() => {
                 app.set_info(msg);
@@ -496,7 +516,16 @@ async fn run_app(
                 // Only burn a render frame when something actually animates.
                 // Disk-space refresh is internally throttled to ~5s.
                 let prev_disk = app.free_disk_space;
-                app.update_disk_space(&download_dir);
+                // Off the reactor: `available_space` is a blocking statvfs, and
+                // on a hung NFS/SMB mount it blocks for the mount timeout —
+                // which would freeze the whole TUI, not just this readout.
+                if app.disk_space_due() {
+                    let dir = download_dir.clone();
+                    let tx = disk_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.try_send(fs4::available_space(&dir).ok());
+                    });
+                }
                 let disk_changed = prev_disk != app.free_disk_space;
 
                 if app.has_fetching_metadata() {
@@ -570,11 +599,20 @@ async fn handle_normal_mode(
                     send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
                 } else {
                     match torrent.status {
-                        types::TorrentStatus::Downloading => {
+                        // Seeding and Complete are pausable too — librqbit
+                        // handles a finished torrent fine, and the marked and
+                        // `P` paths already pause them, so leaving them out
+                        // here made `p` a dropped keypress on a seeding row.
+                        types::TorrentStatus::Downloading
+                        | types::TorrentStatus::Complete
+                        | types::TorrentStatus::Seeding => {
                             send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
                         }
                         types::TorrentStatus::Paused => {
                             send_cmd(cmd_tx, EngineCommand::Resume(id), app).await;
+                        }
+                        types::TorrentStatus::FetchingMetadata => {
+                            app.set_info("Can't pause while fetching metadata".to_string());
                         }
                         _ => {}
                     }
@@ -582,16 +620,29 @@ async fn handle_normal_mode(
             }
         }
         KeyCode::Char('P') => {
-            let all_paused = app
+            // Same test as the `p` handler: only a *user* pause counts as
+            // paused. A throttle-managed torrent reports Paused mid duty
+            // cycle, and treating that as paused made `P` send ResumeAll when
+            // the user asked to pause everything. `.all()` on an empty
+            // iterator is also true, so an idle session needs the emptiness
+            // guard or `P` resumes nothing at all.
+            let pausable: Vec<&types::TorrentInfo> = app
                 .torrents
                 .iter()
                 .filter(|t| {
                     matches!(
                         t.status,
-                        types::TorrentStatus::Downloading | types::TorrentStatus::Paused
+                        types::TorrentStatus::Downloading
+                            | types::TorrentStatus::Paused
+                            | types::TorrentStatus::Complete
+                            | types::TorrentStatus::Seeding
                     )
                 })
-                .all(|t| matches!(t.status, types::TorrentStatus::Paused));
+                .collect();
+            let all_paused = !pausable.is_empty()
+                && pausable.iter().all(|t| {
+                    matches!(t.status, types::TorrentStatus::Paused) && !t.throttle_managed
+                });
 
             let cmd = if all_paused {
                 EngineCommand::ResumeAll
@@ -600,7 +651,10 @@ async fn handle_normal_mode(
             };
             send_cmd(cmd_tx, cmd, app).await;
         }
-        KeyCode::Char('d') if !app.torrents.is_empty() => {
+        // Guard on the *visible* list, like Enter does: with a filter that
+        // matches nothing the dialog label is empty and the popup is never
+        // drawn, leaving the user in a modal with nothing on screen.
+        KeyCode::Char('d') if !app.sorted_torrents().is_empty() || app.has_marks() => {
             app.mode = AppMode::ConfirmDelete;
         }
         KeyCode::Enter if !app.sorted_torrents().is_empty() => {
@@ -1005,14 +1059,88 @@ mod tests {
     }
 
     #[test]
-    fn config_speed_limits_are_clamped_before_reaching_the_status_bar() {
-        // The status bar multiplies these by 1024. Values straight from
-        // config.toml used to skip the clamp the throttle dialog applies, so an
-        // absurd limit overflowed there (#49).
-        let raw = u64::MAX;
-        let clamped = raw.min(MAX_SPEED_LIMIT_KBPS);
-        assert_eq!(clamped, MAX_SPEED_LIMIT_KBPS);
-        assert!(clamped.checked_mul(1024).is_some());
+    fn clamped_speed_limit_bounds_every_entry_point() {
+        // Calls the production function rather than re-implementing `.min()`,
+        // so deleting the clamp fails here. The old version of this test
+        // asserted `u64::MAX.min(CAP) == CAP` and could not detect #49 at all.
+        assert_eq!(clamped_speed_limit(u64::MAX), MAX_SPEED_LIMIT_KBPS);
+        assert_eq!(clamped_speed_limit(0), 0);
+        assert_eq!(clamped_speed_limit(1024), 1024);
+        // The two conversions that used to overflow: the status bar's `* 1024`
+        // and the engine's cast to i64 for the token bucket.
+        let capped = clamped_speed_limit(u64::MAX);
+        assert!(capped.checked_mul(1024).is_some());
+        assert!(i64::try_from(capped.saturating_mul(1024)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn pause_all_pauses_when_a_throttled_torrent_looks_paused() {
+        // A throttle-managed torrent reports Paused mid duty cycle. Counting
+        // that as "paused" made `P` send ResumeAll when the user asked to
+        // pause everything.
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.handle_state_push(vec![
+            torrent(0, types::TorrentStatus::Downloading, true),
+            torrent(1, types::TorrentStatus::Paused, true),
+        ]);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('P')), &tx).await;
+        assert!(matches!(
+            rx.try_recv().expect("a command"),
+            EngineCommand::PauseAll
+        ));
+    }
+
+    #[tokio::test]
+    async fn pause_all_resumes_only_when_everything_is_user_paused() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.handle_state_push(vec![
+            torrent(0, types::TorrentStatus::Paused, false),
+            torrent(1, types::TorrentStatus::Paused, false),
+        ]);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('P')), &tx).await;
+        assert!(matches!(
+            rx.try_recv().expect("a command"),
+            EngineCommand::ResumeAll
+        ));
+    }
+
+    #[tokio::test]
+    async fn pause_all_on_an_idle_session_does_not_resume() {
+        // `.all()` on an empty iterator is true, which used to make `P` send
+        // ResumeAll with nothing to resume.
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('P')), &tx).await;
+        assert!(matches!(
+            rx.try_recv().expect("a command"),
+            EngineCommand::PauseAll
+        ));
+    }
+
+    #[tokio::test]
+    async fn p_pauses_a_seeding_torrent() {
+        // Was a silent no-op: the match fell through to `_ => {}`, so a single
+        // seeding torrent could not be stopped even though mark+p and P both
+        // paused it.
+        for status in [
+            types::TorrentStatus::Seeding,
+            types::TorrentStatus::Complete,
+        ] {
+            let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+            let mut app = App::new();
+            let mut iw = InputWidget::new();
+            app.handle_state_push(vec![torrent(0, status.clone(), false)]);
+            handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
+            assert!(
+                matches!(rx.try_recv().expect("a command"), EngineCommand::Pause(0)),
+                "{status:?} should pause"
+            );
+        }
     }
 
     #[test]

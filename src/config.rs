@@ -36,8 +36,6 @@ pub struct NetworkConfig {
     /// span, so widening it means editing both.
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
-    #[serde(default = "default_max_peers")]
-    pub max_peers_per_torrent: u32,
     #[serde(default = "default_true")]
     pub enable_dht: bool,
     /// UPnP is opt-in. Enabling this opens an external port via your router's
@@ -57,12 +55,16 @@ pub struct NetworkConfig {
     pub max_upload_speed_kbps: u64,
     /// Bind address for the embedded HTTP API that serves file-stream URLs to
     /// external media players. Default `127.0.0.1:0` (auto-assigned port,
-    /// loopback only). The API is mounted READ-ONLY (no add/pause/delete
-    /// routes), but it is UNAUTHENTICATED: anyone who can reach it can list
-    /// your torrents and stream/read your downloaded files. Binding to a
-    /// non-loopback host exposes that to every machine on the network, so only
-    /// do it on a fully trusted one; the app logs a warning and shows a status
-    /// message when it binds off-loopback.
+    /// loopback only). The API is mounted read-only (no add/pause/delete
+    /// routes) *and* behind HTTP basic auth with a random per-session password
+    /// — read-only alone is not enough, because librqbit registers two POST
+    /// routes outside that gate. The credentials ride in the stream URL handed
+    /// to the media player.
+    ///
+    /// Binding to a non-loopback host still deserves care: basic auth over
+    /// plaintext HTTP is readable by anyone on the path, and the URL (with its
+    /// credentials) is visible in the player's argv. The app logs a warning and
+    /// shows a status message when it binds off-loopback.
     #[serde(default = "default_http_api_bind")]
     pub http_api_bind: String,
 }
@@ -105,10 +107,6 @@ fn default_true() -> bool {
 
 fn default_listen_port() -> u16 {
     6881
-}
-
-fn default_max_peers() -> u32 {
-    50
 }
 
 fn default_refresh_rate() -> u64 {
@@ -156,7 +154,6 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             listen_port: default_listen_port(),
-            max_peers_per_torrent: default_max_peers(),
             enable_dht: true,
             enable_upnp: false,
             max_download_speed_kbps: 0,
@@ -269,7 +266,6 @@ mod tests {
         assert!(config.general.confirm_on_quit);
         assert!(config.general.watch_dir.is_none());
         assert_eq!(config.network.listen_port, 6881);
-        assert_eq!(config.network.max_peers_per_torrent, 50);
         assert!(config.network.enable_dht);
         assert!(!config.network.enable_upnp);
         assert_eq!(config.network.max_download_speed_kbps, 0);
@@ -306,7 +302,6 @@ watch_dir = "/var/torrents/watch"
 
 [network]
 listen_port = 7000
-max_peers_per_torrent = 100
 enable_dht = false
 enable_upnp = true
 max_download_speed_kbps = 500
@@ -329,7 +324,6 @@ args = ["--no-terminal"]
             Some("/var/torrents/watch")
         );
         assert_eq!(config.network.listen_port, 7000);
-        assert_eq!(config.network.max_peers_per_torrent, 100);
         assert!(!config.network.enable_dht);
         assert!(config.network.enable_upnp);
         assert_eq!(config.network.max_download_speed_kbps, 500);

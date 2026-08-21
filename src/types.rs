@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// What the UI shows in the Status column. Derived fresh from librqbit's stats
 /// on every tick, so it is a snapshot, not a state machine.
 ///

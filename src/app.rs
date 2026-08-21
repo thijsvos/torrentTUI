@@ -87,6 +87,10 @@ pub struct App {
     /// External player command + args for the `s` stream keybinding. Loaded
     /// once from `config.player` at startup.
     pub player_config: PlayerConfig,
+    /// Name last seen behind each torrent id, so `prune_stale_state` can tell
+    /// "same torrent" from "recycled id". librqbit hands out `max(ids) + 1`, so
+    /// a freed id can be reused by a concurrent add.
+    torrent_identities: HashMap<usize, String>,
     /// Wired from `config.general.watch_dir.is_some()`. Only affects the
     /// delete dialog, which warns that deleting also removes the `.torrent`
     /// from the watch folder.
@@ -138,6 +142,7 @@ impl App {
             confirm_on_quit: true,
             http_api_base: None,
             player_config: PlayerConfig::default(),
+            torrent_identities: HashMap::new(),
             watch_dir_configured: false,
         }
     }
@@ -167,12 +172,48 @@ impl App {
     /// Replace the torrent list and refresh derived state (sort cache,
     /// selection bookkeeping, pruned marks). One canonical entry point so
     /// callers can't forget to invalidate.
-    pub fn handle_state_push(&mut self, torrents: Vec<TorrentInfo>) {
+    /// Returns whether anything the UI draws actually changed. The engine
+    /// pushes a snapshot every 100 ms whether or not it differs, so repainting
+    /// unconditionally meant a session of idle torrents redrew the terminal ten
+    /// times a second forever — and rebuilt the sort cache each time.
+    pub fn handle_state_push(&mut self, torrents: Vec<TorrentInfo>) -> bool {
+        let changed = Self::render_state_differs(&self.torrents, &torrents);
         self.torrents = torrents;
+        if !changed {
+            // Same rows, same values: the cached order is still correct and
+            // nothing on screen would move.
+            return false;
+        }
         self.invalidate_sort();
         self.prune_stale_state();
         self.ensure_sort_cache();
         self.restore_selection();
+        true
+    }
+
+    /// Compare only the fields that reach the screen. Deliberately ignores
+    /// `files`/`peers`/`trackers`, which are populated for the Detail torrent
+    /// only and are compared by the Detail view's own redraw trigger.
+    fn render_state_differs(old: &[TorrentInfo], new: &[TorrentInfo]) -> bool {
+        if old.len() != new.len() {
+            return true;
+        }
+        old.iter().zip(new.iter()).any(|(a, b)| {
+            a.id != b.id
+                || a.name != b.name
+                || a.status != b.status
+                || a.size_bytes != b.size_bytes
+                || a.downloaded_bytes != b.downloaded_bytes
+                || a.uploaded_bytes != b.uploaded_bytes
+                || a.download_speed != b.download_speed
+                || a.upload_speed != b.upload_speed
+                || a.peers_connected != b.peers_connected
+                || a.peers_total != b.peers_total
+                || a.eta_seconds != b.eta_seconds
+                || a.throttle_managed != b.throttle_managed
+                || a.files.len() != b.files.len()
+                || a.peers.len() != b.peers.len()
+        })
     }
 
     /// Set a new sort column and refresh the cache. Prefer these five wrappers
@@ -503,10 +544,31 @@ impl App {
     /// The engine prunes its own maps; this mirrors the same pattern on the UI
     /// side (called from the state-update arm of the main loop).
     pub fn prune_stale_state(&mut self) {
-        let current_ids: HashSet<usize> = self.torrents.iter().map(|t| t.id).collect();
-        self.marked_ids.retain(|id| current_ids.contains(id));
-        self.deselected_files
-            .retain(|id, _| current_ids.contains(id));
+        let current: HashMap<usize, &str> = self
+            .torrents
+            .iter()
+            .map(|t| (t.id, t.name.as_str()))
+            .collect();
+        // Drop state for ids that are gone, and — because librqbit recycles
+        // ids as `max + 1` — also for ids whose torrent has been replaced by a
+        // different one. Without the identity check, deleting the highest-id
+        // torrent and letting the watch folder add a new one into the freed id
+        // silently carried the old file deselections onto the new torrent.
+        let identities = &self.torrent_identities;
+        self.marked_ids.retain(|id| {
+            current
+                .get(id)
+                .is_some_and(|name| identities.get(id).is_none_or(|prev| prev == name))
+        });
+        self.deselected_files.retain(|id, _| {
+            current
+                .get(id)
+                .is_some_and(|name| identities.get(id).is_none_or(|prev| prev == name))
+        });
+        self.torrent_identities = current
+            .into_iter()
+            .map(|(id, name)| (id, name.to_string()))
+            .collect();
     }
 
     pub fn total_download_speed(&self) -> u64 {
@@ -613,21 +675,26 @@ impl App {
             .collect()
     }
 
-    /// Refresh the free-space figure in the status bar, at most once every 5
-    /// seconds. Safe and intended to call every frame — the rate limit lives
-    /// here rather than at the call site. A failed probe (directory removed,
-    /// network share unmounted) clears the cached value rather than keeping a
-    /// stale reading, so the indicator disappears. Performs a blocking
-    /// filesystem call on the UI thread.
-    pub fn update_disk_space(&mut self, download_dir: &str) {
-        let should_update = match self.disk_space_timer {
+    /// Whether the free-space figure is due for a refresh (at most once every
+    /// 5 seconds). Safe and intended to call every frame — the rate limit lives
+    /// here rather than at the call site. Marks the attempt immediately, so a
+    /// slow probe can't queue up behind itself.
+    pub fn disk_space_due(&mut self) -> bool {
+        let due = match self.disk_space_timer {
             None => true,
             Some(t) => t.elapsed() > std::time::Duration::from_secs(5),
         };
-        if should_update {
-            self.free_disk_space = fs4::available_space(download_dir).ok();
+        if due {
             self.disk_space_timer = Some(std::time::Instant::now());
         }
+        due
+    }
+
+    /// Record a probe result. `None` (directory removed, network share
+    /// unmounted) clears the cached value rather than keeping a stale reading,
+    /// so the indicator disappears instead of lying.
+    pub fn set_disk_space(&mut self, free: Option<u64>) {
+        self.free_disk_space = free;
     }
 
     pub fn toggle_mark(&mut self) {
@@ -691,7 +758,18 @@ mod tests {
         }
     }
 
+    /// Build an App the way the running app does — through `handle_state_push`,
+    /// so the sort cache is built and every test below exercises
+    /// `rebuild_sort_cache` rather than the dirty-cache fallback.
     fn app_with_torrents(torrents: Vec<TorrentInfo>) -> App {
+        let mut app = App::new();
+        app.handle_state_push(torrents);
+        app
+    }
+
+    /// The fallback path: torrents assigned directly, cache left dirty. Only
+    /// for the two tests that deliberately cover `sorted_torrents_live`.
+    fn app_with_dirty_cache(torrents: Vec<TorrentInfo>) -> App {
         let mut app = App::new();
         app.torrents = torrents;
         app
@@ -712,7 +790,9 @@ mod tests {
             make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
             make_torrent(1, "Beta", 200, TorrentStatus::Paused),
         ]);
-        app.filter_text = "alpha".to_string();
+        for c in "alpha".chars() {
+            app.push_filter_char(c);
+        }
         let sorted = app.sorted_torrents();
         assert_eq!(sorted.len(), 1);
         assert_eq!(sorted[0].name, "Alpha");
@@ -726,8 +806,142 @@ mod tests {
             100,
             TorrentStatus::Downloading,
         )]);
-        app.filter_text = "zzz".to_string();
+        for c in "zzz".chars() {
+            app.push_filter_char(c);
+        }
         assert!(app.sorted_torrents().is_empty());
+    }
+
+    #[test]
+    fn recycled_torrent_id_drops_stale_marks_and_deselections() {
+        // librqbit reuses `max(ids) + 1`, so deleting the highest-id torrent
+        // frees its id for a concurrent watch-folder add. Without the identity
+        // check the old deselections silently attached to the new torrent.
+        let mut app = App::new();
+        app.handle_state_push(vec![make_torrent(
+            7,
+            "Old",
+            100,
+            TorrentStatus::Downloading,
+        )]);
+        app.marked_ids.insert(7);
+        app.deselected_files.insert(7, HashSet::from([2, 5]));
+
+        // Same id, different torrent.
+        app.handle_state_push(vec![make_torrent(
+            7,
+            "New",
+            100,
+            TorrentStatus::Downloading,
+        )]);
+        assert!(!app.marked_ids.contains(&7), "mark must not survive");
+        assert!(
+            !app.deselected_files.contains_key(&7),
+            "deselection must not survive"
+        );
+        assert!(
+            app.is_file_selected(7, 2),
+            "new torrent downloads everything"
+        );
+    }
+
+    #[test]
+    fn same_torrent_keeps_its_marks_across_pushes() {
+        let mut app = App::new();
+        let rows = vec![make_torrent(7, "Same", 100, TorrentStatus::Downloading)];
+        app.handle_state_push(rows.clone());
+        app.marked_ids.insert(7);
+        app.deselected_files.insert(7, HashSet::from([1]));
+
+        let mut moved = rows.clone();
+        moved[0].downloaded_bytes += 10;
+        app.handle_state_push(moved);
+        assert!(app.marked_ids.contains(&7));
+        assert!(!app.is_file_selected(7, 1));
+    }
+
+    #[test]
+    fn identical_state_push_reports_no_change() {
+        // The engine pushes every 100 ms regardless. Repainting on each one
+        // meant idle torrents redrew the terminal ten times a second.
+        let rows = vec![
+            make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
+            make_torrent(1, "Beta", 200, TorrentStatus::Paused),
+        ];
+        let mut app = App::new();
+        assert!(
+            app.handle_state_push(rows.clone()),
+            "first push is a change"
+        );
+        assert!(
+            !app.handle_state_push(rows.clone()),
+            "identical push is not"
+        );
+
+        // ...but anything the table draws must still trigger a repaint.
+        let mut moved = rows.clone();
+        moved[0].downloaded_bytes += 1;
+        assert!(app.handle_state_push(moved), "progress moved");
+
+        let mut renamed = rows.clone();
+        renamed[1].status = TorrentStatus::Seeding;
+        assert!(app.handle_state_push(renamed), "status changed");
+
+        assert!(
+            app.handle_state_push(vec![rows[0].clone()]),
+            "a torrent disappearing is a change"
+        );
+    }
+
+    #[test]
+    fn sorted_torrents_falls_back_to_a_live_sort_when_the_cache_is_dirty() {
+        // The `&self` read path can't rebuild, so it sorts live instead of
+        // returning a stale order. Mutating the fields directly (rather than
+        // through `change_sort_column`) is what leaves the cache dirty.
+        let mut app = app_with_dirty_cache(vec![
+            make_torrent(0, "Zeta", 100, TorrentStatus::Downloading),
+            make_torrent(1, "Alpha", 200, TorrentStatus::Downloading),
+        ]);
+        app.sort_column = SortColumn::Name;
+        let sorted = app.sorted_torrents();
+        assert_eq!(sorted[0].name, "Alpha");
+        assert_eq!(sorted[1].name, "Zeta");
+    }
+
+    #[test]
+    fn cached_and_live_comparators_agree() {
+        // `rebuild_sort_cache` and `sorted_torrents_live` carry separate copies
+        // of the comparator. Pin them against each other so adding a sort
+        // column to one and not the other fails here.
+        for column in [
+            SortColumn::Index,
+            SortColumn::Name,
+            SortColumn::Size,
+            SortColumn::Progress,
+            SortColumn::Status,
+            SortColumn::Speed,
+            SortColumn::Eta,
+        ] {
+            for reversed in [false, true] {
+                let torrents = vec![
+                    make_torrent(0, "Zeta", 100, TorrentStatus::Downloading),
+                    make_torrent(1, "Alpha", 300, TorrentStatus::Paused),
+                    make_torrent(2, "Mid", 200, TorrentStatus::Seeding),
+                ];
+                let mut cached = app_with_torrents(torrents.clone());
+                cached.change_sort_column(column);
+                if reversed {
+                    cached.toggle_sort_reversed();
+                }
+                let mut live = app_with_dirty_cache(torrents);
+                live.sort_column = column;
+                live.sort_reversed = reversed;
+
+                let a: Vec<usize> = cached.sorted_torrents().iter().map(|t| t.id).collect();
+                let b: Vec<usize> = live.sorted_torrents().iter().map(|t| t.id).collect();
+                assert_eq!(a, b, "column {column:?} reversed={reversed}");
+            }
+        }
     }
 
     #[test]
@@ -736,7 +950,7 @@ mod tests {
             make_torrent(0, "Zeta", 100, TorrentStatus::Downloading),
             make_torrent(1, "Alpha", 200, TorrentStatus::Downloading),
         ]);
-        app.sort_column = SortColumn::Name;
+        app.change_sort_column(SortColumn::Name);
         let sorted = app.sorted_torrents();
         assert_eq!(sorted[0].name, "Alpha");
         assert_eq!(sorted[1].name, "Zeta");
@@ -748,8 +962,8 @@ mod tests {
             make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
             make_torrent(1, "Zeta", 200, TorrentStatus::Downloading),
         ]);
-        app.sort_column = SortColumn::Name;
-        app.sort_reversed = true;
+        app.change_sort_column(SortColumn::Name);
+        app.toggle_sort_reversed();
         let sorted = app.sorted_torrents();
         assert_eq!(sorted[0].name, "Zeta");
     }
@@ -760,7 +974,7 @@ mod tests {
             make_torrent(0, "Big", 1000, TorrentStatus::Downloading),
             make_torrent(1, "Small", 100, TorrentStatus::Downloading),
         ]);
-        app.sort_column = SortColumn::Size;
+        app.change_sort_column(SortColumn::Size);
         let sorted = app.sorted_torrents();
         assert_eq!(sorted[0].name, "Small");
         assert_eq!(sorted[1].name, "Big");

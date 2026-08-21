@@ -6,6 +6,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::ui::util::centered_rect;
 use crate::ui::util::truncate;
 
 /// Render the delete-confirmation popup. `watch_dir_configured` adds a line
@@ -117,12 +118,4 @@ pub fn render_quit_dialog(f: &mut Frame, area: Rect) {
             .border_style(Style::default().fg(Color::Yellow)),
     );
     f.render_widget(dialog, popup);
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_width = r.width * percent_x / 100;
-    let popup_height = r.height * percent_y / 100;
-    let x = r.x + (r.width.saturating_sub(popup_width)) / 2;
-    let y = r.y + (r.height.saturating_sub(popup_height)) / 2;
-    Rect::new(x, y, popup_width, popup_height)
 }
