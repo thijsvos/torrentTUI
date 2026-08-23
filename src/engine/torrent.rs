@@ -24,13 +24,14 @@ use librqbit::{
     api::TorrentIdOrHash,
     dht::Id20,
     http_api::{HttpApi, HttpApiOptions},
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ManagedTorrent, Session,
-    SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListenerOptions,
+    ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
 };
+use librqbit_dualstack_sockets::{BindOpts, TcpListener};
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 /// A reference to a torrent inside the session. Cloning is a refcount bump, so
@@ -57,6 +58,23 @@ const HTTP_API_USER: &str = "torrenttui";
 /// How many sequential ports the engine binds. The Dockerfile EXPOSE range is
 /// derived from this, so changes need to be mirrored there.
 const PORT_RANGE_SIZE: u16 = 10;
+
+/// First bindable port in `[start, start + PORT_RANGE_SIZE)`. librqbit 8 took
+/// a port *range* and walked it until a bind succeeded; librqbit 9 takes
+/// exactly one listen address, so the walk lives here as a best-effort probe.
+/// Falls back to `start` when no probe succeeds, so the session bind surfaces
+/// the real error. The probe is inherently racy (the port can be taken
+/// between probe and bind) and only sees the IPv6 side on platforms where a
+/// plain `[::]` bind is not dualstack; either way the worst case is the same
+/// bind error the session would have reported anyway.
+fn pick_listen_port(start: u16) -> u16 {
+    // Saturate against u16::MAX so a high `listen_port` never panics (debug)
+    // or wraps to an empty range (release).
+    let end = start.saturating_add(PORT_RANGE_SIZE);
+    (start..end)
+        .find(|&port| std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok())
+        .unwrap_or(start)
+}
 
 /// Maximum size of a `.torrent` file accepted on disk. Anything larger is
 /// rejected before a full read, both as a sanity check and to prevent a
@@ -175,16 +193,16 @@ impl TorrentEngine {
         let download_dir = PathBuf::from(&config.general.download_dir);
         std::fs::create_dir_all(&download_dir)?;
 
-        let port = config.network.listen_port;
-        // Saturate against u16::MAX so a high `listen_port` never panics
-        // (debug) or wraps to an empty range (release).
-        let port_end = port.saturating_add(PORT_RANGE_SIZE);
+        let port = pick_listen_port(config.network.listen_port);
         let opts = SessionOptions {
-            disable_dht: !config.network.enable_dht,
+            dht: config.network.enable_dht.then(DhtSessionConfig::default),
             fastresume: true,
             persistence: Some(SessionPersistenceConfig::Json { folder: None }),
-            listen_port_range: Some(port..port_end),
-            enable_upnp_port_forwarding: config.network.enable_upnp,
+            listen: Some(ListenerOptions {
+                listen_addr: (Ipv6Addr::UNSPECIFIED, port).into(),
+                enable_upnp_port_forwarding: config.network.enable_upnp,
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -369,7 +387,7 @@ impl TorrentEngine {
                         let ul_bps = (live.upload_speed.mbps * MIB_TO_BYTES) as u64;
                         let remaining = stats.total_bytes.saturating_sub(stats.progress_bytes);
                         let eta = compute_eta(remaining, dl_bps);
-                        let peers = live.snapshot.peer_stats.live as u32;
+                        let peers = live.snapshot.peer_stats.live;
                         (dl_bps, ul_bps, eta, peers)
                     } else {
                         (0, 0, None, 0)
@@ -380,7 +398,7 @@ impl TorrentEngine {
                 // in it. Adding `live` on top double-counted the connected
                 // ones (20 of 50 rendered as 20/70).
                 let peers_total = if let Some(ref live) = stats.live {
-                    live.snapshot.peer_stats.seen as u32
+                    live.snapshot.peer_stats.seen
                 } else {
                     0
                 };
@@ -426,7 +444,7 @@ impl TorrentEngine {
                     Vec::new()
                 };
                 let piece_length = if is_detail {
-                    handle.with_metadata(|m| m.info.piece_length).ok()
+                    handle.with_metadata(|m| m.info.info().piece_length).ok()
                 } else {
                     None
                 };
@@ -507,7 +525,11 @@ impl TorrentEngine {
 /// the branching can be unit-tested.
 fn derive_status(stats: &librqbit::TorrentStats) -> TorrentStatus {
     match stats.state {
-        TorrentStatsState::Initializing => TorrentStatus::FetchingMetadata,
+        // librqbit 9 can hold a torrent paused while it is still checking
+        // files; surface that as Paused, matching what the engine will do
+        // with it (nothing) rather than what it is doing right now.
+        TorrentStatsState::Initializing { paused: true } => TorrentStatus::Paused,
+        TorrentStatsState::Initializing { paused: false } => TorrentStatus::FetchingMetadata,
         TorrentStatsState::Live => {
             if stats.finished {
                 let ul_speed = stats
@@ -572,10 +594,17 @@ async fn start_http_api(
     engine: &TorrentEngine,
     bind: &str,
 ) -> Result<(String, std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
-    let listener = TcpListener::bind(bind)
+    // Resolve the string ourselves: librqbit 9's listener takes a bare
+    // `SocketAddr` where tokio's bind accepted anything `ToSocketAddrs`, and
+    // the config value may be a hostname like `localhost:0`.
+    let addr = tokio::net::lookup_host(bind)
         .await
+        .with_context(|| format!("resolve {}", bind))?
+        .next()
+        .with_context(|| format!("no addresses for {}", bind))?;
+    let listener = TcpListener::bind_tcp(addr, BindOpts::default())
         .with_context(|| format!("bind {}", bind))?;
-    let bound = listener.local_addr()?;
+    let bound = listener.bind_addr();
 
     let api = Api::new(engine.session().clone(), None, None);
 
@@ -607,6 +636,9 @@ async fn start_http_api(
         Some(HttpApiOptions {
             read_only: true,
             basic_auth: Some((HTTP_API_USER.to_string(), token.clone())),
+            // `allow_create: false` and no upload body cap — both moot behind
+            // `read_only`, which drops the state-modifying routes entirely.
+            ..Default::default()
         }),
     );
 
@@ -1525,6 +1557,29 @@ pub async fn run_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_listen_port_skips_taken_port() {
+        // Occupy an ephemeral port the same way the probe binds, then ask for
+        // it: the probe must move past it but stay inside the range.
+        let taken = std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        if port > u16::MAX - PORT_RANGE_SIZE {
+            // The range would saturate empty and the fallback kicks in; the
+            // empty-range test below covers that path.
+            return;
+        }
+        let picked = pick_listen_port(port);
+        assert_ne!(picked, port);
+        assert!((port..port.saturating_add(PORT_RANGE_SIZE)).contains(&picked));
+    }
+
+    #[test]
+    fn pick_listen_port_empty_range_falls_back_to_start() {
+        // start == u16::MAX saturates into an empty range; the fallback keeps
+        // the configured port so the session reports the real bind error.
+        assert_eq!(pick_listen_port(u16::MAX), u16::MAX);
+    }
 
     #[test]
     fn eta_stalled_returns_none() {

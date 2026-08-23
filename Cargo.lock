@@ -4454,6 +4454,7 @@ dependencies = [
  "fs4",
  "futures",
  "librqbit",
+ "librqbit-dualstack-sockets",
  "notify-rust",
  "ratatui",
  "serde",
