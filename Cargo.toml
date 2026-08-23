@@ -17,7 +17,11 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 # external media players can open. `tracing-subscriber-utils` is required by
 # the http-api crate (its `/stream_logs` handler references a method that only
 # exists with that feature).
-librqbit = { version = "8", default-features = false, features = ["rust-tls", "watch", "http-api", "tracing-subscriber-utils"] }
+librqbit = { version = "9", default-features = false, features = ["rust-tls", "watch", "http-api", "tracing-subscriber-utils"] }
+# librqbit 9's `make_http_api_and_run` takes this crate's listener type instead
+# of tokio's, and librqbit does not re-export it. Keep the version in lockstep
+# with what librqbit itself depends on.
+librqbit-dualstack-sockets = "0.7"
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

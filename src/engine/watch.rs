@@ -115,7 +115,7 @@ fn torrent_file_hash(path: &Path) -> Option<String> {
         return None;
     }
     let buf = std::fs::read(path).ok()?;
-    let meta = librqbit::torrent_from_bytes::<librqbit::ByteBuf>(&buf).ok()?;
+    let meta = librqbit::torrent_from_bytes(&buf).ok()?;
     Some(meta.info_hash.as_string())
 }
 
@@ -235,7 +235,7 @@ mod tests {
     /// digest is taken over the raw `info` slice, so it has to come from the
     /// same parser the production code uses.
     fn hash_of(bytes: &[u8]) -> String {
-        librqbit::torrent_from_bytes::<librqbit::ByteBuf>(bytes)
+        librqbit::torrent_from_bytes(bytes)
             .expect("test torrent should parse")
             .info_hash
             .as_string()
