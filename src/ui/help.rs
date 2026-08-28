@@ -20,6 +20,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         ("p", "(Un)pause selected torrent"),
         ("P", "(Un)pause all torrents"),
         ("d", "Delete selected torrent"),
+        ("o", "Open torrent folder in file manager"),
         ("Enter", "Open detail view"),
         ("j / \u{2193}", "Move selection down"),
         ("k / \u{2191}", "Move selection up"),

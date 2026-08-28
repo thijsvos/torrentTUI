@@ -405,6 +405,25 @@ impl TorrentEngine {
 
                 let is_detail = detail_id == Some(id);
 
+                // The on-disk root for the `o` reveal keybinding. librqbit's
+                // per-torrent output folder already has the multi-file
+                // subfolder joined in at add time; a torrent whose files sit
+                // directly in the shared download dir (fewer than two files
+                // gets no subfolder) points at its single file instead so the
+                // file manager can select it. Computed from librqbit's own
+                // paths, never from the display name — the name is sanitized
+                // for rendering and can differ from what is on disk.
+                let content_path = handle
+                    .with_metadata(|meta| {
+                        let out = handle.output_folder();
+                        match meta.file_infos.as_slice() {
+                            [only] => out.join(&only.relative_filename),
+                            _ => out.to_path_buf(),
+                        }
+                    })
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+
                 let files = if is_detail {
                     handle
                         .with_metadata(|meta| {
@@ -490,6 +509,7 @@ impl TorrentEngine {
                     info_hash,
                     trackers,
                     piece_length,
+                    content_path,
                     throttle_managed: false, // set by push_state
                 }
             })

@@ -82,6 +82,13 @@ pub struct TorrentInfo {
     pub info_hash: String,
     pub trackers: Vec<String>,
     pub piece_length: Option<u32>,
+    /// Absolute path of the torrent's on-disk root, straight from librqbit's
+    /// resolved per-torrent output folder — the multi-file subfolder, or the
+    /// file itself for a torrent living directly in the download dir. `None`
+    /// until metadata resolves. The `o` reveal keybinding uses this instead of
+    /// re-deriving a path from the (display-sanitized) name, which can differ
+    /// from what is actually on disk.
+    pub content_path: Option<String>,
     /// True when a speed limit governs this torrent — the engine owns its
     /// pause/unpause duty cycle. Not the same as "currently paused": it stays
     /// set while the torrent is transferring between cycles. A user pause
@@ -222,6 +229,7 @@ mod tests {
             info_hash: String::new(),
             trackers: Vec::new(),
             piece_length: None,
+            content_path: None,
             throttle_managed: false,
         }
     }

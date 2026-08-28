@@ -24,6 +24,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 - **Sorting & filtering** — sort by any column, search torrents by name
 - **Bandwidth throttling** — per-torrent fair throttling with configurable download/upload limits
 - **Selective file download** — choose which files to download from multi-file torrents
+- **Reveal in file manager** — press `o` to open the selected torrent's data in Finder, Explorer, or your Linux file manager
 - **Detail view** — inspect torrent info, individual file progress, and peer details
 - **Session persistence** — torrents survive restarts via librqbit's built-in fastresume
 - **Disk space monitoring** — free space indicator with low-space warnings
@@ -102,6 +103,7 @@ torrenttui -d /path/to/downloads
 | `p` | Pause/unpause selected (or all marked) torrents |
 | `P` | Pause/unpause all torrents |
 | `d` | Delete selected (or all marked) torrents |
+| `o` | Reveal the selected torrent in your file manager (Finder/Explorer/xdg-open); falls back to the download folder while data is still arriving |
 | `Enter` | Open detail view |
 | `j` / `k` (or `↓` / `↑`) | Move selection down/up |
 | `Tab` | Cycle sort column / detail tab |
@@ -162,6 +164,7 @@ from the same API, and there is no warehouse of magnet links anywhere.
 | `Space` | Toggle file selection (Files tab) |
 | `S` | Apply current file selection to engine (Files tab) |
 | `s` | Stream selected file in default media player (Files tab) |
+| `o` | Reveal this torrent in your file manager |
 | `Esc` / `q` | Back to list |
 
 ### Streaming while downloading

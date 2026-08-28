@@ -155,6 +155,9 @@ pub struct App {
     pub search: SearchState,
     /// Copied once from `config.search` at startup, like `player_config`.
     pub search_config: SearchConfig,
+    /// Copied once from `config.general.download_dir` at startup; the `o`
+    /// keybinding resolves the selected torrent's on-disk location against it.
+    pub download_dir: String,
 }
 
 impl App {
@@ -206,6 +209,7 @@ impl App {
             watch_dir_configured: false,
             search: SearchState::new(),
             search_config: SearchConfig::default(),
+            download_dir: String::new(),
         }
     }
 
@@ -923,6 +927,7 @@ mod tests {
             info_hash: String::new(),
             trackers: Vec::new(),
             piece_length: None,
+            content_path: None,
             throttle_managed: false,
         }
     }

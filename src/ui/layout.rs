@@ -90,11 +90,13 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
             if app.torrents.is_empty() {
                 "a:add  s:search  /:filter  ?:help  q:quit"
             } else {
-                "a:add  s:search  Space:mark  p:(un)pause  d:delete  Enter:detail  /:filter  t:throttle  ?:help  q:quit"
+                "a:add  s:search  Space:mark  p:(un)pause  d:delete  o:folder  Enter:detail  /:filter  t:throttle  ?:help  q:quit"
             }
         }
         AppMode::Input => "Enter:submit  Esc:cancel",
-        AppMode::Detail => "Tab:switch tab  j/k:navigate  Space:toggle  S:apply  Esc:back",
+        AppMode::Detail => {
+            "Tab:switch tab  j/k:navigate  Space:toggle  S:apply  o:folder  Esc:back"
+        }
         AppMode::Help => "Esc/?:close",
         AppMode::ConfirmDelete => "k:keep files  d:delete files  c:cancel",
         AppMode::ConfirmQuit => "y:quit  n:cancel",
