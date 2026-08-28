@@ -88,9 +88,9 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let hints = match app.mode {
         AppMode::Normal => {
             if app.torrents.is_empty() {
-                "a:add  /:filter  ?:help  q:quit"
+                "a:add  s:search  /:filter  ?:help  q:quit"
             } else {
-                "a:add  Space:mark  p:(un)pause  d:delete  Enter:detail  /:filter  t:throttle  ?:help  q:quit"
+                "a:add  s:search  Space:mark  p:(un)pause  d:delete  Enter:detail  /:filter  t:throttle  ?:help  q:quit"
             }
         }
         AppMode::Input => "Enter:submit  Esc:cancel",
@@ -100,6 +100,8 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         AppMode::ConfirmQuit => "y:quit  n:cancel",
         AppMode::Filter => "Enter:apply  Esc:clear & close",
         AppMode::ThrottleInput => "Enter:confirm  Esc:cancel",
+        AppMode::Search => "Enter:search  Esc:back",
+        AppMode::SearchResults => "Enter:download  j/k:navigate  s:edit query  r:retry  Esc:back",
     };
 
     // Build right-aligned speed section
@@ -221,6 +223,21 @@ pub fn render_filter_bar(f: &mut Frame, area: Rect, filter_text: &str) {
     let line = Line::from(vec![
         Span::styled(" Filter: ", Style::default().fg(Color::Cyan)),
         Span::raw(filter_text),
+        Span::styled("\u{2588}", Style::default().fg(Color::White)), // cursor
+    ]);
+
+    let bar = Paragraph::new(line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(bar, area);
+}
+
+pub fn render_search_bar(f: &mut Frame, area: Rect, query: &str) {
+    let line = Line::from(vec![
+        Span::styled(" Search torrents: ", Style::default().fg(Color::Cyan)),
+        Span::raw(query),
         Span::styled("\u{2588}", Style::default().fg(Color::White)), // cursor
     ]);
 

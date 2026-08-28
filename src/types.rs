@@ -129,6 +129,12 @@ pub enum AppMode {
     ConfirmQuit,
     Filter,
     ThrottleInput,
+    /// Typing an indexer-search query in the bottom bar. The main area keeps
+    /// showing whatever was there (torrent table, or previous results).
+    Search,
+    /// Browsing indexer-search results (or the loading spinner) in the main
+    /// area.
+    SearchResults,
 }
 
 #[repr(u8)]

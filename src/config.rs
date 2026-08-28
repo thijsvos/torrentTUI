@@ -12,6 +12,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub player: PlayerConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +84,26 @@ pub struct PlayerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Query The Pirate Bay's public JSON API (apibay.org). No account or API
+    /// key involved; only the search text is sent, and only when the user
+    /// submits a search.
+    #[serde(default = "default_true")]
+    pub enable_apibay: bool,
+    /// Query the torrents-csv.com public API. Same privacy posture as apibay.
+    #[serde(default = "default_true")]
+    pub enable_torrents_csv: bool,
+    /// Per-provider HTTP timeout. Clamped to 1-30 s at use, like
+    /// `refresh_rate_ms`, so out-of-range values parse and are quietly bounded.
+    #[serde(default = "default_search_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Cap on merged results shown in the search table. Clamped to 1-500 at
+    /// use.
+    #[serde(default = "default_search_max_results")]
+    pub max_results: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
     /// Idle repaint interval. Clamped to 16-1000 ms at startup, so values
     /// outside that are accepted by the parser and then quietly ignored.
@@ -115,6 +137,14 @@ fn default_refresh_rate() -> u64 {
 
 fn default_http_api_bind() -> String {
     "127.0.0.1:0".to_string()
+}
+
+fn default_search_timeout_secs() -> u64 {
+    8
+}
+
+fn default_search_max_results() -> usize {
+    50
 }
 
 /// Expand a leading `~` in a user-supplied path against the home directory.
@@ -168,6 +198,17 @@ impl Default for UiConfig {
         Self {
             refresh_rate_ms: default_refresh_rate(),
             enable_notifications: true,
+        }
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enable_apibay: true,
+            enable_torrents_csv: true,
+            timeout_secs: default_search_timeout_secs(),
+            max_results: default_search_max_results(),
         }
     }
 }
@@ -277,6 +318,10 @@ mod tests {
         assert!(config.ui.enable_notifications);
         assert!(config.player.command.is_empty());
         assert!(config.player.args.is_empty());
+        assert!(config.search.enable_apibay);
+        assert!(config.search.enable_torrents_csv);
+        assert_eq!(config.search.timeout_secs, 8);
+        assert_eq!(config.search.max_results, 50);
     }
 
     #[test]
@@ -290,6 +335,8 @@ confirm_on_quit = false
         assert_eq!(config.network.listen_port, 6881);
         assert_eq!(config.ui.refresh_rate_ms, 100);
         assert!(config.ui.enable_notifications);
+        assert!(config.search.enable_apibay);
+        assert!(config.search.enable_torrents_csv);
     }
 
     #[test]
@@ -315,6 +362,12 @@ enable_notifications = false
 [player]
 command = "mpv"
 args = ["--no-terminal"]
+
+[search]
+enable_apibay = false
+enable_torrents_csv = true
+timeout_secs = 3
+max_results = 10
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.download_dir, "/tmp/downloads");
@@ -333,6 +386,10 @@ args = ["--no-terminal"]
         assert!(!config.ui.enable_notifications);
         assert_eq!(config.player.command, "mpv");
         assert_eq!(config.player.args, vec!["--no-terminal".to_string()]);
+        assert!(!config.search.enable_apibay);
+        assert!(config.search.enable_torrents_csv);
+        assert_eq!(config.search.timeout_secs, 3);
+        assert_eq!(config.search.max_results, 10);
     }
 
     #[test]
@@ -408,5 +465,32 @@ download_dir = "/tmp/downloads"
         assert_eq!(config.player.command, "");
         assert!(config.player.args.is_empty());
         assert_eq!(config.network.http_api_bind, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn test_search_section_omitted_defaults_apply() {
+        // A config file written before the [search] section existed should
+        // still parse cleanly and produce the enabled defaults.
+        let toml_str = r#"
+[general]
+download_dir = "/tmp/downloads"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.search.enable_apibay);
+        assert!(config.search.enable_torrents_csv);
+        assert_eq!(config.search.timeout_secs, 8);
+        assert_eq!(config.search.max_results, 50);
+    }
+
+    #[test]
+    fn test_search_both_providers_disabled_parses() {
+        let toml_str = r#"
+[search]
+enable_apibay = false
+enable_torrents_csv = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.search.enable_apibay);
+        assert!(!config.search.enable_torrents_csv);
     }
 }
