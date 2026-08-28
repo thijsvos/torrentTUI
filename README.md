@@ -9,7 +9,10 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![@thijsvos](https://img.shields.io/badge/@thijsvos-000000?logo=x)](https://x.com/thijsvos)
 
-![demo](assets/demo.gif)
+<p align="center">
+  <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: pressing s to search torrent indexers for an Arch Linux ISO, downloading the selected result with Enter, and revealing the data in the file manager with o">
+</p>
+<p align="center"><em>Built-in search → pick a result → downloading → reveal in your file manager. No external services.</em></p>
 
 ## Contents
 
