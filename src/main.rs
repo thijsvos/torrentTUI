@@ -24,6 +24,7 @@
 mod app;
 mod config;
 mod engine;
+mod opener;
 mod player;
 mod search;
 mod types;
@@ -246,6 +247,7 @@ async fn run_app(
     app.player_config = config.player.clone();
     app.watch_dir_configured = config.general.watch_dir.is_some();
     app.search_config = config.search.clone();
+    app.download_dir = config.general.download_dir.clone();
 
     if let Some(msg) = config_warning {
         app.set_error(msg);
@@ -624,6 +626,9 @@ async fn handle_normal_mode(
             // The search buffer is deliberately not cleared: coming back to
             // search shows the previous query ready to refine.
             app.mode = AppMode::Search;
+        }
+        KeyCode::Char('o') => {
+            handle_open_folder(app);
         }
         KeyCode::Char('p') => {
             if app.has_marks() {
@@ -1026,6 +1031,9 @@ async fn handle_detail_mode(
         KeyCode::Char('s') if app.detail_tab == DetailTab::Files => {
             handle_stream_keypress(app);
         }
+        KeyCode::Char('o') => {
+            handle_open_folder(app);
+        }
         KeyCode::Char('S') if app.detail_tab == DetailTab::Files => {
             if let Some(torrent) = app.selected_torrent() {
                 let torrent_id = torrent.id;
@@ -1222,6 +1230,33 @@ fn apply_engine_info(app: &mut App, info: EngineInfo) {
         EngineInfo::HttpApiReady { base_url } => {
             app.http_api_base = Some(base_url);
         }
+    }
+}
+
+/// Handle the `o` keystroke (Normal and Detail): reveal the selected
+/// torrent's data in the system file manager, degrading to opening the
+/// download directory when the data isn't on disk yet. No-op with nothing
+/// selected, matching the other selection-scoped keys.
+fn handle_open_folder(app: &mut App) {
+    let Some((name, content_path)) = app
+        .selected_torrent()
+        .map(|t| (t.name.clone(), t.content_path.clone()))
+    else {
+        return;
+    };
+    let target = opener::resolve_reveal_target(
+        Path::new(&app.download_dir),
+        content_path.as_deref().map(Path::new),
+    );
+    match opener::reveal(&target) {
+        Ok(()) => match target {
+            opener::RevealTarget::Item(_) => app.set_info(format!("Opening folder for {}", name)),
+            // Neutral wording: the fallback covers both "metadata still
+            // resolving" and "data moved/deleted outside the app", and
+            // guessing the cause here misled in exactly the second case.
+            opener::RevealTarget::Dir(_) => app.set_info("Opening the download folder".to_string()),
+        },
+        Err(e) => app.set_error(format!("Failed to open file manager: {}", e)),
     }
 }
 
@@ -1504,6 +1539,7 @@ mod tests {
             info_hash: String::new(),
             trackers: Vec::new(),
             piece_length: None,
+            content_path: None,
             throttle_managed: managed,
         }
     }
@@ -1597,6 +1633,16 @@ mod tests {
         let mut app = App::new();
         handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('t')), &tx).await;
         assert_eq!(app.mode, AppMode::ThrottleInput);
+    }
+
+    #[test]
+    fn open_folder_with_nothing_selected_is_a_no_op() {
+        // Must return before touching the filesystem or spawning anything —
+        // the selection guard is the only thing between `o` and a spawn.
+        let mut app = App::new();
+        handle_open_folder(&mut app);
+        assert!(app.info_message.is_none());
+        assert!(app.error_message.is_none());
     }
 
     #[test]
