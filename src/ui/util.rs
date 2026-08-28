@@ -45,9 +45,15 @@ pub fn pad_to_width(s: &str, width: usize) -> String {
     out
 }
 
-/// Strip control characters (except tab) so the string is safe to render in
-/// the TUI. Torrent names come from attacker-controlled metadata, so this runs
-/// at the engine boundary.
+/// Strip control characters (except tab) and Unicode bidi controls so the
+/// string is safe to render in the TUI. Torrent names come from
+/// attacker-controlled metadata — and indexer search results are the same
+/// threat class — so this runs at those boundaries.
+///
+/// Bidi controls need stripping separately because `char::is_control` covers
+/// only the Cc category: U+202E (right-to-left override) and friends are Cf
+/// and sail through it, letting a name like `gpj.exe\u{202E}iva.` render
+/// visually reversed as an extension-spoofing trick.
 ///
 /// Deliberately does *not* escape markup. It used to, for the benefit of one
 /// consumer — the Linux libnotify body — and every other consumer paid for it:
@@ -56,8 +62,20 @@ pub fn pad_to_width(s: &str, width: usize) -> String {
 /// only at the notification site.
 pub fn sanitize_display(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control() || *c == '\t')
+        .filter(|c| (!c.is_control() || *c == '\t') && !is_bidi_control(*c))
         .collect()
+}
+
+/// Unicode bidirectional/format characters that visually reorder text:
+/// embeddings/overrides (U+202A-202E), isolates (U+2066-2069) and the LTR/RTL
+/// marks (U+200E/200F). Crate-visible so input paths that render their buffer
+/// raw (the search query bar and titles) can reject these at entry instead of
+/// sanitizing at every render site.
+pub(crate) fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+    )
 }
 
 /// Escape the three characters Pango treats as markup. Call this on top of
@@ -229,6 +247,18 @@ mod tests {
     #[test]
     fn sanitize_keeps_tab() {
         assert_eq!(sanitize_display("a\tb"), "a\tb");
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_controls() {
+        // U+202E reverses everything after it visually; is_control() does not
+        // catch it (category Cf, not Cc).
+        assert_eq!(sanitize_display("gpj.exe\u{202E}iva."), "gpj.exeiva.");
+        assert_eq!(sanitize_display("a\u{202A}b\u{202B}c"), "abc");
+        assert_eq!(sanitize_display("a\u{2066}b\u{2069}c"), "abc");
+        assert_eq!(sanitize_display("a\u{200E}b\u{200F}c"), "abc");
+        // Ordinary RTL text is untouched — only the invisible controls go.
+        assert_eq!(sanitize_display("مرحبا"), "مرحبا");
     }
 
     #[test]

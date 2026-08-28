@@ -21,9 +21,65 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::config::PlayerConfig;
+use crate::config::{PlayerConfig, SearchConfig};
+use crate::search::{SearchOutcome, SearchResult};
 use crate::types::{AppMode, DetailTab, SortColumn, TorrentInfo, TorrentStatus};
 use ratatui::widgets::TableState;
+
+/// State for the indexer-search feature, grouped because it lives and dies
+/// together: it persists for the whole session (leaving the search views and
+/// coming back shows the last query and results untouched) and only firing a
+/// new search replaces it.
+pub struct SearchState {
+    /// Live edit buffer for the query bar. A plain `String` like
+    /// `filter_text`, deliberately not the shared `InputWidget` — the add
+    /// dialog clears that widget on entry, which would eat the remembered
+    /// query, and a plain field keeps the handlers testable.
+    pub input: String,
+    /// The last *fired* query, for the results title and the `r` retry.
+    pub query: String,
+    /// Monotonic query id, bumped only when a search fires. Outcomes carrying
+    /// any other value are stale and get dropped, which is the entire
+    /// staleness story — in-flight tasks are never aborted, their results
+    /// just die at this check.
+    pub generation: u64,
+    /// True from fire until the matching-generation outcome lands.
+    pub in_flight: bool,
+    /// Distinguishes "never searched" from "searched and found nothing".
+    pub searched_once: bool,
+    pub results: Vec<SearchResult>,
+    /// Short per-provider failure notes from the last outcome; partial
+    /// results still render, these annotate the title line.
+    pub provider_errors: Vec<String>,
+    pub selected: usize,
+    pub table_state: TableState,
+    /// Info hashes sent to `AddTorrent` this session, for the ✓ mark. Keyed
+    /// by hash (not row) so the mark survives re-searching. The double-Enter
+    /// guard blocks a re-send only while the torrent is actually present in
+    /// the session, so a deleted torrent or a failed add stays re-addable;
+    /// rapid double-presses in the window before the first state push land on
+    /// the engine's `AlreadyManaged` reply instead.
+    pub added: HashSet<String>,
+}
+
+impl SearchState {
+    fn new() -> Self {
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
+        Self {
+            input: String::new(),
+            query: String::new(),
+            generation: 0,
+            in_flight: false,
+            searched_once: false,
+            results: Vec::new(),
+            provider_errors: Vec::new(),
+            selected: 0,
+            table_state,
+            added: HashSet::new(),
+        }
+    }
+}
 
 /// All UI-side state. Constructed once in `run_app`; every field is either
 /// derived from an engine snapshot or owned by a key handler.
@@ -95,6 +151,10 @@ pub struct App {
     /// delete dialog, which warns that deleting also removes the `.torrent`
     /// from the watch folder.
     pub watch_dir_configured: bool,
+    /// Indexer-search state; see [`SearchState`].
+    pub search: SearchState,
+    /// Copied once from `config.search` at startup, like `player_config`.
+    pub search_config: SearchConfig,
 }
 
 impl App {
@@ -144,6 +204,8 @@ impl App {
             player_config: PlayerConfig::default(),
             torrent_identities: HashMap::new(),
             watch_dir_configured: false,
+            search: SearchState::new(),
+            search_config: SearchConfig::default(),
         }
     }
 
@@ -646,6 +708,113 @@ impl App {
 
     pub fn tick_spinner(&mut self) {
         self.spinner_tick = (self.spinner_tick + 1) % 10;
+    }
+
+    /// Append a character to the search query. Rejects control characters
+    /// (like the add dialog's `InputWidget::push`) and bidi controls, plus a
+    /// length cap. Bidi controls matter here because the query is rendered raw
+    /// in the search bar and results title — a pasted U+202E would visually
+    /// reverse the rest of the title line on bidi-aware terminals. Paste goes
+    /// through here too, so typing and pasting obey the same rules.
+    pub fn search_push_char(&mut self, c: char) {
+        if c.is_control() || crate::ui::util::is_bidi_control(c) {
+            return;
+        }
+        if self.search.input.chars().count() >= crate::search::MAX_QUERY_CHARS {
+            return;
+        }
+        self.search.input.push(c);
+    }
+
+    pub fn search_pop_char(&mut self) {
+        self.search.input.pop();
+    }
+
+    /// Arm a search for the current input: bump the generation, remember the
+    /// query, raise the in-flight flag. Returns what the caller needs to spawn
+    /// the task, or `None` for an empty/whitespace query (a silent no-op, like
+    /// the filter's tolerance for empties). No I/O happens here — the caller
+    /// owns the spawn — which is what keeps every Esc/Enter path unit-testable.
+    pub fn fire_search(&mut self) -> Option<(String, u64)> {
+        let query = self.search.input.trim().to_string();
+        if query.is_empty() {
+            return None;
+        }
+        self.search.query = query.clone();
+        Some((query, self.arm_search()))
+    }
+
+    /// Re-arm the previously fired query (the `r` retry): same generation
+    /// bump, no dependence on the edit buffer.
+    pub fn refire_search(&mut self) -> Option<(String, u64)> {
+        if self.search.query.is_empty() {
+            return None;
+        }
+        Some((self.search.query.clone(), self.arm_search()))
+    }
+
+    fn arm_search(&mut self) -> u64 {
+        self.search.generation += 1;
+        self.search.in_flight = true;
+        self.search.provider_errors.clear();
+        self.search.generation
+    }
+
+    /// Apply a search outcome; returns whether anything on screen changed.
+    /// The discard rule for superseded queries lives here: a generation
+    /// mismatch drops the outcome without touching any state. A matching
+    /// outcome arriving while the user is elsewhere is stored silently (they
+    /// see it when they return via `s`) — the `false` return only suppresses
+    /// the repaint.
+    pub fn apply_search_outcome(&mut self, outcome: SearchOutcome) -> bool {
+        if outcome.generation != self.search.generation {
+            return false;
+        }
+        self.search.in_flight = false;
+        self.search.results = outcome.results;
+        self.search.provider_errors = outcome.provider_errors;
+        self.search.searched_once = true;
+        self.search.selected = 0;
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
+        self.search.table_state = table_state;
+        matches!(self.mode, AppMode::Search | AppMode::SearchResults)
+    }
+
+    pub fn search_next(&mut self) {
+        let count = self.search.results.len();
+        if count == 0 {
+            return;
+        }
+        self.search.selected = (self.search.selected + 1).min(count - 1);
+        self.search.table_state.select(Some(self.search.selected));
+    }
+
+    pub fn search_previous(&mut self) {
+        if self.search.results.is_empty() {
+            return;
+        }
+        self.search.selected = self.search.selected.saturating_sub(1);
+        self.search.table_state.select(Some(self.search.selected));
+    }
+
+    pub fn selected_search_result(&self) -> Option<&SearchResult> {
+        self.search.results.get(self.search.selected)
+    }
+
+    /// Whether a torrent with this info hash is currently in the session.
+    /// Case-insensitive because search hashes are normalized to lowercase
+    /// while the engine reports librqbit's formatting.
+    pub fn torrent_in_session(&self, info_hash: &str) -> bool {
+        self.torrents
+            .iter()
+            .any(|t| t.info_hash.eq_ignore_ascii_case(info_hash))
+    }
+
+    /// Whether the frame tick should animate the spinner for a search in
+    /// flight — only while a search view is actually on screen.
+    pub fn search_spinner_active(&self) -> bool {
+        self.search.in_flight && matches!(self.mode, AppMode::Search | AppMode::SearchResults)
     }
 
     /// Whether a file is included in the download. Returns `true` for torrents
@@ -1259,5 +1428,172 @@ mod tests {
         app.clear_expired_messages();
         assert!(app.error_message.is_none());
         assert!(app.info_message.is_none());
+    }
+
+    fn search_result(hash: &str, seeders: u64) -> SearchResult {
+        SearchResult {
+            title: format!("t-{hash}"),
+            info_hash: hash.to_string(),
+            size_bytes: Some(100),
+            seeders,
+            leechers: 0,
+            source: crate::search::SourceSet {
+                apibay: true,
+                torrents_csv: false,
+            },
+        }
+    }
+
+    fn outcome(generation: u64, results: Vec<SearchResult>) -> SearchOutcome {
+        SearchOutcome {
+            generation,
+            results,
+            provider_errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fire_search_ignores_empty_and_whitespace_queries() {
+        let mut app = App::new();
+        assert!(app.fire_search().is_none());
+        app.search.input = "   ".to_string();
+        assert!(app.fire_search().is_none());
+        assert!(!app.search.in_flight);
+        assert_eq!(app.search.generation, 0);
+    }
+
+    #[test]
+    fn fire_search_trims_bumps_generation_and_arms_flight() {
+        let mut app = App::new();
+        app.search.input = "  arch linux  ".to_string();
+        let (query, generation) = app.fire_search().expect("should fire");
+        assert_eq!(query, "arch linux");
+        assert_eq!(generation, 1);
+        assert!(app.search.in_flight);
+        assert_eq!(app.search.query, "arch linux");
+        // The edit buffer keeps the raw text for refining.
+        assert_eq!(app.search.input, "  arch linux  ");
+    }
+
+    #[test]
+    fn stale_generation_outcome_is_dropped_untouched() {
+        let mut app = App::new();
+        app.search.input = "first".to_string();
+        app.fire_search();
+        app.search.input = "second".to_string();
+        app.fire_search();
+        // The gen-1 response arrives after gen-2 fired: dropped, still waiting.
+        let hash = "88066b90278f2de655ee2dd44e784c340b54e45c";
+        assert!(!app.apply_search_outcome(outcome(1, vec![search_result(hash, 5)])));
+        assert!(app.search.results.is_empty());
+        assert!(app.search.in_flight);
+        assert!(!app.search.searched_once);
+        // The current generation's response applies.
+        app.mode = AppMode::SearchResults;
+        assert!(app.apply_search_outcome(outcome(2, vec![search_result(hash, 5)])));
+        assert_eq!(app.search.results.len(), 1);
+        assert!(!app.search.in_flight);
+        assert!(app.search.searched_once);
+    }
+
+    #[test]
+    fn outcome_arriving_outside_search_views_is_stored_silently() {
+        let mut app = App::new();
+        app.search.input = "q".to_string();
+        app.fire_search();
+        app.mode = AppMode::Normal;
+        let hash = "88066b90278f2de655ee2dd44e784c340b54e45c";
+        // Applied (stored for when the user returns) but no repaint requested.
+        assert!(!app.apply_search_outcome(outcome(1, vec![search_result(hash, 5)])));
+        assert_eq!(app.search.results.len(), 1);
+        assert!(!app.search.in_flight);
+    }
+
+    #[test]
+    fn apply_outcome_resets_selection() {
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        app.search.input = "q".to_string();
+        app.fire_search();
+        app.search.selected = 7;
+        let hash = "88066b90278f2de655ee2dd44e784c340b54e45c";
+        app.apply_search_outcome(outcome(1, vec![search_result(hash, 5)]));
+        assert_eq!(app.search.selected, 0);
+        assert_eq!(app.search.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn refire_search_reuses_the_fired_query_not_the_buffer() {
+        let mut app = App::new();
+        assert!(app.refire_search().is_none()); // nothing fired yet
+        app.search.input = "arch".to_string();
+        app.fire_search();
+        app.search.input = "edited but not fired".to_string();
+        let (query, generation) = app.refire_search().expect("should refire");
+        assert_eq!(query, "arch");
+        assert_eq!(generation, 2);
+        assert!(app.search.in_flight);
+    }
+
+    #[test]
+    fn search_navigation_clamps_at_both_ends_and_on_empty() {
+        let mut app = App::new();
+        app.search_next();
+        app.search_previous();
+        assert_eq!(app.search.selected, 0);
+        let h1 = "88066b90278f2de655ee2dd44e784c340b54e45c";
+        let h2 = "22b8f63218f1e726ec2f1fb9b38239f95fc6a629";
+        app.search.results = vec![search_result(h1, 1), search_result(h2, 2)];
+        app.search_next();
+        app.search_next();
+        app.search_next();
+        assert_eq!(app.search.selected, 1);
+        app.search_previous();
+        app.search_previous();
+        app.search_previous();
+        assert_eq!(app.search.selected, 0);
+    }
+
+    #[test]
+    fn search_push_char_filters_controls_and_caps_length() {
+        let mut app = App::new();
+        app.search_push_char('a');
+        app.search_push_char('\u{1b}');
+        // Bidi controls are rejected too: the query renders raw in the search
+        // bar and results title, where a pasted U+202E would reorder the line.
+        app.search_push_char('\u{202E}');
+        app.search_push_char('\u{200F}');
+        app.search_push_char('b');
+        assert_eq!(app.search.input, "ab");
+        app.search.input = "x".repeat(crate::search::MAX_QUERY_CHARS);
+        app.search_push_char('y');
+        assert_eq!(
+            app.search.input.chars().count(),
+            crate::search::MAX_QUERY_CHARS
+        );
+    }
+
+    #[test]
+    fn torrent_in_session_matches_hashes_case_insensitively() {
+        let mut app = App::new();
+        let mut t = make_torrent(0, "t", 1, TorrentStatus::Downloading);
+        t.info_hash = "88066B90278F2DE655EE2DD44E784C340B54E45C".to_string();
+        app.handle_state_push(vec![t]);
+        assert!(app.torrent_in_session("88066b90278f2de655ee2dd44e784c340b54e45c"));
+        assert!(!app.torrent_in_session("22b8f63218f1e726ec2f1fb9b38239f95fc6a629"));
+    }
+
+    #[test]
+    fn search_spinner_only_animates_in_search_views() {
+        let mut app = App::new();
+        app.search.in_flight = true;
+        app.mode = AppMode::Normal;
+        assert!(!app.search_spinner_active());
+        app.mode = AppMode::SearchResults;
+        assert!(app.search_spinner_active());
+        app.mode = AppMode::Search;
+        assert!(app.search_spinner_active());
+        app.search.in_flight = false;
+        assert!(!app.search_spinner_active());
     }
 }

@@ -10,6 +10,12 @@
 //! the engine's critical path and lets the UI notice an engine panic instead of
 //! rendering frozen state forever.
 //!
+//! Two more channels feed the UI from tasks that are not the engine: the
+//! disk-space probe (`Option<u64>`, 1 slot) and indexer-search outcomes
+//! (`SearchOutcome`, 4 slots). Search HTTP deliberately lives in its own
+//! spawned task rather than the engine loop, where a slow indexer would stall
+//! the 100 ms state ticks.
+//!
 //! Because the channels are bounded, the UI must never fan out one send per
 //! torrent: the batch variants (`PauseMany`, `DeleteMany`) exist so a bulk
 //! action cannot fill the command queue while the engine is blocked pushing
@@ -19,6 +25,7 @@ mod app;
 mod config;
 mod engine;
 mod player;
+mod search;
 mod types;
 mod ui;
 
@@ -42,7 +49,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use types::{AppMode, DetailTab};
-use ui::input::{validate_torrent_source, InputWidget};
+use ui::input::{validate_magnet, validate_torrent_source, InputWidget};
 
 /// Speed-limit cap in KB/s (10 GB/s). Applied by [`clamped_speed_limit`] to
 /// every entry point: the throttle dialog, the values read from `config.toml`,
@@ -238,6 +245,7 @@ async fn run_app(
     app.confirm_on_quit = config.general.confirm_on_quit;
     app.player_config = config.player.clone();
     app.watch_dir_configured = config.general.watch_dir.is_some();
+    app.search_config = config.search.clone();
 
     if let Some(msg) = config_warning {
         app.set_error(msg);
@@ -252,6 +260,14 @@ async fn run_app(
     // Free-space probe results. Depth 1: only the newest reading matters, and
     // a full channel just means a probe is still in flight.
     let (disk_tx, mut disk_rx) = mpsc::channel::<Option<u64>>(1);
+    // Indexer-search outcomes from UI-spawned tasks. Generation filtering in
+    // App drops anything from a superseded query, so depth just needs to hold
+    // a small backlog of stale sends.
+    let (search_tx, mut search_rx) = mpsc::channel::<search::SearchOutcome>(4);
+    // Built lazily on the first search so an unused feature costs nothing at
+    // startup; a failed build surfaces as a status-bar error and the next
+    // search attempt retries it.
+    let mut search_client: Option<reqwest::Client> = None;
 
     let engine_config = config.clone();
     // Keep the JoinHandle so we can both detect engine death mid-run and
@@ -328,6 +344,9 @@ async fn run_app(
                 needs_render = true;
             }
         }
+        while let Ok(outcome) = search_rx.try_recv() {
+            needs_render |= app.apply_search_outcome(outcome);
+        }
 
         app.clear_expired_messages();
 
@@ -341,6 +360,19 @@ async fn run_app(
                 match app.mode {
                     AppMode::Detail => {
                         ui::detail::render_detail(f, chunks[1], &mut app);
+                        app.table_area = None;
+                    }
+                    // The search views cover the torrent table, so clicks must
+                    // not map to its hidden rows — same hygiene as Detail. In
+                    // Search (typing) mode the previous results stay visible
+                    // for the refine loop; before any search exists the
+                    // torrent table shows through instead.
+                    AppMode::SearchResults => {
+                        ui::search::render_search_view(f, chunks[1], &mut app);
+                        app.table_area = None;
+                    }
+                    AppMode::Search if app.search.searched_once || app.search.in_flight => {
+                        ui::search::render_search_view(f, chunks[1], &mut app);
                         app.table_area = None;
                     }
                     _ => {
@@ -363,6 +395,13 @@ async fn run_app(
                             app.throttle_step,
                             &app.throttle_input_buf,
                         );
+                    }
+                    // An active error outranks the input bar: the errors fired
+                    // while staying in Search mode (providers disabled, client
+                    // build failure) mean the search cannot proceed, and the
+                    // status bar is the only widget that renders them.
+                    AppMode::Search if app.error_message.is_none() => {
+                        ui::layout::render_search_bar(f, chunks[2], &app.search.input);
                     }
                     _ => {
                         ui::layout::render_status_bar(f, chunks[2], &app);
@@ -446,6 +485,8 @@ async fn run_app(
                             AppMode::ConfirmQuit => handle_quit_mode(&mut app, key),
                             AppMode::Filter => handle_filter_mode(&mut app, key),
                             AppMode::ThrottleInput => handle_throttle_mode(&mut app, key, &cmd_tx).await,
+                            AppMode::Search => handle_search_input_mode(&mut app, key, &search_tx, &mut search_client),
+                            AppMode::SearchResults => handle_search_results_mode(&mut app, key, &cmd_tx, &search_tx, &mut search_client).await,
                         }
                         needs_render = true;
                     }
@@ -463,6 +504,19 @@ async fn run_app(
                                 app.push_filter_char(c);
                             }
                         }
+                        needs_render = true;
+                    }
+                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::Search => {
+                        // Same filter+cap as typing — search_push_char owns both.
+                        for c in s.chars() {
+                            app.search_push_char(c);
+                        }
+                        needs_render = true;
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {
+                        // Without this a resize leaves a stale frame until the
+                        // next key press or animation tick — most visible on
+                        // the static search views, but a gap for every mode.
                         needs_render = true;
                     }
                     Some(Ok(Event::Mouse(mouse)))
@@ -512,6 +566,9 @@ async fn run_app(
                 apply_engine_info(&mut app, info);
                 needs_render = true;
             }
+            Some(outcome) = search_rx.recv() => {
+                needs_render |= app.apply_search_outcome(outcome);
+            }
             _ = frame_interval.tick() => {
                 // Only burn a render frame when something actually animates.
                 // Disk-space refresh is internally throttled to ~5s.
@@ -528,7 +585,7 @@ async fn run_app(
                 }
                 let disk_changed = prev_disk != app.free_disk_space;
 
-                if app.has_fetching_metadata() {
+                if app.has_fetching_metadata() || app.search_spinner_active() {
                     app.tick_spinner();
                     needs_render = true;
                 } else if disk_changed
@@ -562,6 +619,11 @@ async fn handle_normal_mode(
         KeyCode::Char('a') => {
             app.mode = AppMode::Input;
             input_widget.clear();
+        }
+        KeyCode::Char('s') => {
+            // The search buffer is deliberately not cleared: coming back to
+            // search shows the previous query ready to refine.
+            app.mode = AppMode::Search;
         }
         KeyCode::Char('p') => {
             if app.has_marks() {
@@ -737,6 +799,160 @@ async fn handle_input_mode(
         }
         KeyCode::Char(c) => {
             input_widget.push(c);
+        }
+        _ => {}
+    }
+}
+
+/// Build the shared HTTP client for indexer searches. `https_only` because
+/// both providers are HTTPS and a downgrade would leak queries in plaintext;
+/// an explicit User-Agent because an empty one is a common WAF block.
+fn build_search_client(config: &config::SearchConfig) -> reqwest::Result<reqwest::Client> {
+    let timeout = std::time::Duration::from_secs(config.timeout_secs.clamp(1, 30));
+    reqwest::Client::builder()
+        .https_only(true)
+        .timeout(timeout)
+        .connect_timeout(timeout.min(std::time::Duration::from_secs(5)))
+        .user_agent(concat!("torrenttui/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
+/// Fire (or with `retry` re-fire) a search from the current App state and
+/// switch to the results view. All the state transitions live in the App
+/// methods; this owns only the pieces that touch the runtime — the lazy
+/// client and the task spawn.
+fn start_search(
+    app: &mut App,
+    search_tx: &mpsc::Sender<search::SearchOutcome>,
+    search_client: &mut Option<reqwest::Client>,
+    retry: bool,
+) {
+    if !app.search_config.enable_apibay && !app.search_config.enable_torrents_csv {
+        app.set_error("All search providers are disabled in config".to_string());
+        return;
+    }
+    if search_client.is_none() {
+        match build_search_client(&app.search_config) {
+            Ok(client) => *search_client = Some(client),
+            Err(e) => {
+                tracing::debug!("search client build failed: {e}");
+                app.set_error("Search unavailable: could not initialize HTTP client".to_string());
+                return;
+            }
+        }
+    }
+    let Some(client) = search_client.clone() else {
+        return;
+    };
+    let fired = if retry {
+        app.refire_search()
+    } else {
+        app.fire_search()
+    };
+    let Some((query, generation)) = fired else {
+        return; // empty query: silent no-op, stay where we are
+    };
+    search::spawn_search(
+        query,
+        generation,
+        client,
+        app.search_config.clone(),
+        search_tx.clone(),
+    );
+    app.mode = AppMode::SearchResults;
+}
+
+/// Keys while typing a search query. Sync — spawning the search task doesn't
+/// await anything.
+fn handle_search_input_mode(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    search_tx: &mpsc::Sender<search::SearchOutcome>,
+    search_client: &mut Option<reqwest::Client>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            // One level shallower: back to the results if any exist (or are on
+            // the way), otherwise out to Normal. Never cancels a flight.
+            app.mode = if app.search.searched_once || app.search.in_flight {
+                AppMode::SearchResults
+            } else {
+                AppMode::Normal
+            };
+        }
+        KeyCode::Enter => {
+            start_search(app, search_tx, search_client, false);
+        }
+        KeyCode::Backspace => {
+            app.search_pop_char();
+        }
+        KeyCode::Char(c) => {
+            app.search_push_char(c);
+        }
+        _ => {}
+    }
+}
+
+/// Keys in the results view. Enter adds the highlighted result through the
+/// same `AddTorrent` path as the manual flow — the magnet is built locally
+/// from the validated info hash, so nothing is copied or shown to the user.
+async fn handle_search_results_mode(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    cmd_tx: &mpsc::Sender<EngineCommand>,
+    search_tx: &mpsc::Sender<search::SearchOutcome>,
+    search_client: &mut Option<reqwest::Client>,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            // Results (and any in-flight search) persist; `s` from Normal
+            // comes back to them. A landing outcome just repaints nothing.
+            app.mode = AppMode::Normal;
+        }
+        KeyCode::Char('s') => {
+            app.mode = AppMode::Search; // buffer still holds the query
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.search_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.search_previous(),
+        KeyCode::Char('r') => {
+            if !app.search.in_flight {
+                start_search(app, search_tx, search_client, true);
+            }
+        }
+        KeyCode::Enter => {
+            if app.search.in_flight {
+                return;
+            }
+            // Borrow-scope the read like handle_stream_keypress does.
+            let picked = app
+                .selected_search_result()
+                .map(|r| (r.info_hash.clone(), r.title.clone()));
+            let Some((info_hash, title)) = picked else {
+                return;
+            };
+            // Block a re-send only while the torrent is actually in the
+            // session: after a delete (or a failed add) the hash is still in
+            // `added` for the ✓ mark, but Enter must work again. In the brief
+            // window before the first state push the presence check misses and
+            // a double-press reaches the engine, whose AlreadyManaged reply
+            // answers "already downloaded" — that backstop is the design.
+            if app.search.added.contains(&info_hash) && app.torrent_in_session(&info_hash) {
+                app.set_info(format!("Already added: {}", title));
+                return;
+            }
+            let magnet = search::build_magnet(&info_hash, &title);
+            // Belt-and-braces: the same gate the manual flow uses. Parse-time
+            // hash validation makes a failure here impossible unless an
+            // invariant broke, and then an error beats a corrupt command.
+            if let Err(e) = validate_magnet(&magnet) {
+                app.set_error(e);
+                return;
+            }
+            send_cmd(cmd_tx, EngineCommand::AddTorrent(magnet), app).await;
+            app.search.added.insert(info_hash);
+            // Stay in the results for multi-grab; the engine reports
+            // duplicates/failures on its own message channel.
+            app.set_info(format!("Added: {}", title));
         }
         _ => {}
     }
@@ -1392,5 +1608,237 @@ mod tests {
             app.error_message.as_deref(),
             Some("Streaming API not ready yet")
         );
+    }
+
+    fn search_channel() -> (
+        mpsc::Sender<search::SearchOutcome>,
+        mpsc::Receiver<search::SearchOutcome>,
+    ) {
+        mpsc::channel::<search::SearchOutcome>(4)
+    }
+
+    fn search_result_fixture() -> search::SearchResult {
+        search::SearchResult {
+            title: "Arch Linux ISO".to_string(),
+            info_hash: "88066b90278f2de655ee2dd44e784c340b54e45c".to_string(),
+            size_bytes: Some(735051776),
+            seeders: 12,
+            leechers: 1,
+            source: search::SourceSet {
+                apibay: true,
+                torrents_csv: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_mode_s_opens_search() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('s')), &tx).await;
+        assert_eq!(app.mode, AppMode::Search);
+    }
+
+    /// A client that cannot reach the network: everything is proxied to a
+    /// closed local port, so the spawned provider task fails instantly with
+    /// "connection refused" instead of touching real indexers from CI.
+    fn offline_client() -> Option<reqwest::Client> {
+        Some(
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all("http://127.0.0.1:9").expect("static proxy url"))
+                .timeout(std::time::Duration::from_millis(200))
+                .build()
+                .expect("client builds"),
+        )
+    }
+
+    #[tokio::test]
+    async fn search_input_enter_fires_and_switches_to_results() {
+        // Needs a runtime because start_search spawns the provider task; the
+        // offline client makes that task fail locally and its outcome dies
+        // unobserved on the channel we hold.
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = offline_client();
+        let mut app = App::new();
+        app.mode = AppMode::Search;
+        for c in "arch".chars() {
+            handle_search_input_mode(&mut app, key(KeyCode::Char(c)), &search_tx, &mut client);
+        }
+        assert_eq!(app.search.input, "arch");
+        handle_search_input_mode(&mut app, key(KeyCode::Enter), &search_tx, &mut client);
+        assert_eq!(app.mode, AppMode::SearchResults);
+        assert!(app.search.in_flight);
+        assert_eq!(app.search.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn search_input_enter_on_empty_query_is_a_no_op() {
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.mode = AppMode::Search;
+        handle_search_input_mode(&mut app, key(KeyCode::Enter), &search_tx, &mut client);
+        assert_eq!(app.mode, AppMode::Search);
+        assert!(!app.search.in_flight);
+        assert_eq!(app.search.generation, 0);
+    }
+
+    #[test]
+    fn search_input_esc_goes_to_results_only_once_one_exists() {
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.mode = AppMode::Search;
+        handle_search_input_mode(&mut app, key(KeyCode::Esc), &search_tx, &mut client);
+        assert_eq!(app.mode, AppMode::Normal);
+
+        app.mode = AppMode::Search;
+        app.search.searched_once = true;
+        handle_search_input_mode(&mut app, key(KeyCode::Esc), &search_tx, &mut client);
+        assert_eq!(app.mode, AppMode::SearchResults);
+    }
+
+    #[test]
+    fn search_with_all_providers_disabled_errors_without_spawning() {
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.search_config.enable_apibay = false;
+        app.search_config.enable_torrents_csv = false;
+        app.mode = AppMode::Search;
+        app.search.input = "arch".to_string();
+        handle_search_input_mode(&mut app, key(KeyCode::Enter), &search_tx, &mut client);
+        assert_eq!(app.mode, AppMode::Search);
+        assert!(!app.search.in_flight);
+        assert!(app
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("disabled")));
+        assert!(client.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_results_enter_sends_a_valid_magnet_and_marks_added() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        app.search.results = vec![search_result_fixture()];
+        handle_search_results_mode(&mut app, key(KeyCode::Enter), &tx, &search_tx, &mut client)
+            .await;
+        match rx.try_recv().expect("an AddTorrent command") {
+            EngineCommand::AddTorrent(magnet) => {
+                assert!(magnet
+                    .starts_with("magnet:?xt=urn:btih:88066b90278f2de655ee2dd44e784c340b54e45c"));
+                assert!(validate_magnet(&magnet).is_ok());
+            }
+            other => panic!("expected AddTorrent, got {other:?}"),
+        }
+        // Multi-grab: stays in the results view, row marked as added.
+        assert_eq!(app.mode, AppMode::SearchResults);
+        assert!(app
+            .search
+            .added
+            .contains("88066b90278f2de655ee2dd44e784c340b54e45c"));
+    }
+
+    #[tokio::test]
+    async fn search_results_double_enter_blocks_once_the_torrent_appears() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        app.search.results = vec![search_result_fixture()];
+        handle_search_results_mode(&mut app, key(KeyCode::Enter), &tx, &search_tx, &mut client)
+            .await;
+        rx.try_recv().expect("first Enter sends");
+        // Simulate the engine's state push confirming the add. Uppercase hash
+        // exercises the case-insensitive presence check (search hashes are
+        // normalized lowercase, the engine reports librqbit's formatting).
+        let mut t = torrent(0, types::TorrentStatus::Downloading, false);
+        t.info_hash = "88066B90278F2DE655EE2DD44E784C340B54E45C".to_string();
+        app.handle_state_push(vec![t]);
+        handle_search_results_mode(&mut app, key(KeyCode::Enter), &tx, &search_tx, &mut client)
+            .await;
+        assert!(rx.try_recv().is_err(), "second Enter must not send");
+        assert!(app
+            .info_message
+            .as_deref()
+            .is_some_and(|m| m.contains("Already added")));
+    }
+
+    #[tokio::test]
+    async fn search_results_enter_readds_after_the_torrent_is_gone() {
+        // A deleted torrent (or a failed add) must stay re-addable: the ✓ set
+        // remembers the grab, but the guard defers to live session state.
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        app.search.results = vec![search_result_fixture()];
+        app.search
+            .added
+            .insert("88066b90278f2de655ee2dd44e784c340b54e45c".to_string());
+        assert!(app.torrents.is_empty());
+        handle_search_results_mode(&mut app, key(KeyCode::Enter), &tx, &search_tx, &mut client)
+            .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(EngineCommand::AddTorrent(_))),
+            "Enter must re-send when the torrent is no longer in the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_results_enter_while_loading_is_inert() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        app.search.results = vec![search_result_fixture()];
+        app.search.in_flight = true;
+        handle_search_results_mode(&mut app, key(KeyCode::Enter), &tx, &search_tx, &mut client)
+            .await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn search_results_esc_and_q_leave_state_intact() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = App::new();
+            app.mode = AppMode::SearchResults;
+            app.search.searched_once = true;
+            app.search.results = vec![search_result_fixture()];
+            handle_search_results_mode(&mut app, key(code), &tx, &search_tx, &mut client).await;
+            assert_eq!(app.mode, AppMode::Normal);
+            assert_eq!(app.search.results.len(), 1, "results persist");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_results_s_reopens_the_prefilled_input() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        app.search.input = "arch".to_string();
+        handle_search_results_mode(
+            &mut app,
+            key(KeyCode::Char('s')),
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.mode, AppMode::Search);
+        assert_eq!(app.search.input, "arch");
     }
 }

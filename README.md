@@ -18,6 +18,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 ## Features
 
 - **Magnet link & .torrent file support** — add torrents via magnet links or local `.torrent` files
+- **Built-in torrent search** — press `s`, type a query, pick a result, and it starts downloading; queries public indexer APIs directly, with no Prowlarr/Jackett, accounts, or API keys
 - **Stream while downloading** — press `s` on any media file in the Files tab to open it in your default player; pieces are fetched in playback order
 - **Real-time progress** — progress bars, download/upload speeds, ETA, and peer counts
 - **Sorting & filtering** — sort by any column, search torrents by name
@@ -97,6 +98,7 @@ torrenttui -d /path/to/downloads
 | Key | Action |
 |-----|--------|
 | `a` | Add magnet link or .torrent file |
+| `s` | Search torrent indexers |
 | `p` | Pause/unpause selected (or all marked) torrents |
 | `P` | Pause/unpause all torrents |
 | `d` | Delete selected (or all marked) torrents |
@@ -104,7 +106,7 @@ torrenttui -d /path/to/downloads
 | `j` / `k` (or `↓` / `↑`) | Move selection down/up |
 | `Tab` | Cycle sort column / detail tab |
 | `r` | Reverse sort order |
-| `/` | Search/filter torrents |
+| `/` | Filter torrent list |
 | `t` | Set speed limits |
 | `Space` | Mark/unmark current torrent (then advances selection) |
 | `v` | Mark all visible torrents |
@@ -118,6 +120,38 @@ Deleting prompts for `[K]eep files` or `[D]elete files` — that choice is about
 *downloaded data*. Either way, if a watch folder is configured, the matching
 `.torrent`/`.magnet` is removed from it so the torrent does not come back on the next
 launch. See [Watch folder](#watch-folder).
+
+### Search
+
+Press `s`, type what you're looking for (e.g. `arch linux iso`), and hit
+`Enter`. TorrentTUI queries two public indexer APIs — [apibay](https://apibay.org)
+(The Pirate Bay) and [torrents-csv](https://torrents-csv.com) — merges and
+dedups the results, and lists them by seeder count. Press `Enter` on a result
+and it starts downloading immediately; the magnet link is built locally from
+the result's info hash, so nothing is copied or pasted. No Prowlarr, Jackett,
+accounts, or API keys involved. Both providers can be toggled off in
+`[search]` — see [Configuration](#configuration) and [Privacy](#privacy).
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Download the selected result (stays in results for multi-grab) |
+| `j` / `k` (or `↓` / `↑`) | Move selection down/up |
+| `s` | Edit the query (pre-filled) |
+| `r` | Retry the same query |
+| `Esc` / `q` | Back to the torrent list (results are kept) |
+
+#### Where do the magnet links come from?
+
+Nowhere — TorrentTUI makes them itself. The indexers don't return magnet
+links; each result carries the torrent's **info hash**, a 40-character
+fingerprint that uniquely identifies it. A magnet link is just that
+fingerprint wrapped in text, so when you press `Enter` the app assembles one
+locally (`magnet:?xt=urn:btih:<hash>&dn=<name>&tr=…`) with zero extra network
+requests. The engine then asks the BitTorrent network — DHT plus a few open
+trackers — "who has the file with this fingerprint?"; peers answer with the
+full torrent metadata and the download starts. This is the same mechanism The
+Pirate Bay's own website uses: its magnet buttons are built in your browser
+from the same API, and there is no warehouse of magnet links anywhere.
 
 ### Detail view
 
@@ -184,6 +218,12 @@ enable_notifications = true
 [player]
 command = ""                  # empty = OS default (xdg-open / open / start)
 args = []                     # extra args inserted before the URL
+
+[search]
+enable_apibay = true          # The Pirate Bay JSON API (apibay.org), no auth
+enable_torrents_csv = true    # torrents-csv.com public API, no auth
+timeout_secs = 8              # per-provider HTTP timeout (clamped to 1-30)
+max_results = 50              # cap on merged results (clamped to 1-500)
 ```
 
 Paths (`download_dir`, `watch_dir`, `player.command`) may start with `~/`, which expands to your home directory.
@@ -216,7 +256,8 @@ A few defaults worth knowing:
 
 - **Logging is filtered.** Only TorrentTUI's own warnings are written to disk; librqbit's INFO-level output (peer IPs, tracker URLs, info hashes) is silenced. Bumping `RUST_LOG` re-enables it — redact before sharing logs.
 - **UPnP is off by default.** Enabling it (`network.enable_upnp = true`) opens an external port via your router and exposes you to peers outside your LAN.
-- **No telemetry.** TorrentTUI makes no outbound connections except to BitTorrent peers, trackers, and (if DHT is enabled) the DHT network.
+- **No telemetry.** TorrentTUI makes no outbound connections except to BitTorrent peers, trackers, (if DHT is enabled) the DHT network, and — only when you submit a search — the search providers below.
+- **Search queries go to the indexers you enable.** Pressing `Enter` on a search sends the query text (nothing else — no identifiers, accounts, or keys) over HTTPS to `apibay.org` and/or `torrents-csv.com`. No request is made until you submit a search, and either provider can be disabled in `[search]`; disabling both turns the feature off entirely. Queries are not written to the log at the default filter.
 - **Notifications.** Control characters are stripped from torrent names at the engine boundary, and names are additionally Pango-escaped before reaching the Linux notification daemon. macOS plays a sound instead of sending a notification, so no name leaves the process there. Disable entirely with `ui.enable_notifications = false`.
 - **HTTP streaming API is loopback-only and authenticated.** The embedded API used for the `s` stream keybinding binds to `127.0.0.1:0`, is mounted read-only, and requires HTTP basic auth with a random password generated per run. The credentials ride in the stream URL handed to your media player, which means they are visible in that process's argv while it runs. Changing `network.http_api_bind` to a routable interface sends those credentials over plaintext HTTP — do this only on a trusted LAN.
 
