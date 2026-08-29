@@ -10,9 +10,9 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 [![@thijsvos](https://img.shields.io/badge/@thijsvos-000000?logo=x)](https://x.com/thijsvos)
 
 <p align="center">
-  <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: pressing s to search torrent indexers for an Arch Linux ISO, downloading the selected result with Enter, and revealing the data in the file manager with o">
+  <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: opening the command palette with a colon, running the built-in torrent search, downloading an Arch Linux ISO from the results with Enter, and revealing the data in the file manager with o">
 </p>
-<p align="center"><em>Built-in search → pick a result → downloading → reveal in your file manager. No external services.</em></p>
+<p align="center"><em>Command palette → built-in search → pick a result → downloading → reveal in your file manager. No external services.</em></p>
 
 ## Contents
 
@@ -21,6 +21,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 ## Features
 
 - **Magnet link & .torrent file support** — add torrents via magnet links or local `.torrent` files
+- **Command palette** — press `:` and fuzzy-search every action with its keybinding shown; no key memorization required
 - **Built-in torrent search** — press `s`, type a query, pick a result, and it starts downloading; queries public indexer APIs directly, with no Prowlarr/Jackett, accounts, or API keys
 - **Stream while downloading** — press `s` on any media file in the Files tab to open it in your default player; pieces are fetched in playback order
 - **Real-time progress** — progress bars, download/upload speeds, ETA, and peer counts
@@ -101,6 +102,7 @@ torrenttui -d /path/to/downloads
 
 | Key | Action |
 |-----|--------|
+| `:` / `Ctrl+P` | Open the command palette (fuzzy-search every action) |
 | `a` | Add magnet link or .torrent file |
 | `s` | Search torrent indexers |
 | `p` | Pause/unpause selected (or all marked) torrents |
@@ -109,7 +111,7 @@ torrenttui -d /path/to/downloads
 | `o` | Reveal the selected torrent in your file manager (Finder/Explorer/xdg-open); falls back to the download folder while data is still arriving |
 | `Enter` | Open detail view |
 | `j` / `k` (or `↓` / `↑`) | Move selection down/up |
-| `Tab` | Cycle sort column / detail tab |
+| `Tab` | Cycle sort column |
 | `r` | Reverse sort order |
 | `/` | Filter torrent list |
 | `t` | Set speed limits |
@@ -125,6 +127,20 @@ Deleting prompts for `[K]eep files` or `[D]elete files` — that choice is about
 *downloaded data*. Either way, if a watch folder is configured, the matching
 `.torrent`/`.magnet` is removed from it so the torrent does not come back on the next
 launch. See [Watch folder](#watch-folder).
+
+### Command palette
+
+Can't remember a key? Press `:` (or `Ctrl+P`) in the torrent list, the detail
+view, or the search results, and type a few letters of what you want — the
+palette fuzzy-searches every action available right there, shows each one's
+keybinding, and runs the highlighted one on `Enter`. Arrows (or `Ctrl+j`/`k`)
+navigate, `Esc` closes. Actions that don't currently apply (nothing selected,
+nothing to retry) are hidden until they do.
+
+The palette, the `?` help overlay, the status-bar hints, and the keybinding
+tables in this README all come from one action registry in the source
+(`src/actions.rs`) — a test regenerates these tables from it, so the
+documentation cannot drift from the real bindings.
 
 ### Search
 
