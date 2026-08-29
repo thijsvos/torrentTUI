@@ -21,6 +21,7 @@
 //! action cannot fill the command queue while the engine is blocked pushing
 //! state the UI has not drained yet.
 
+mod actions;
 mod app;
 mod config;
 mod engine;
@@ -359,7 +360,14 @@ async fn run_app(
 
                 ui::layout::render_header(f, chunks[0]);
 
-                match app.mode {
+                // While the palette overlay is open, the main area keeps
+                // showing the view it opened over.
+                let view_mode = if app.mode == AppMode::Palette {
+                    app.palette.return_mode.clone()
+                } else {
+                    app.mode.clone()
+                };
+                match view_mode {
                     AppMode::Detail => {
                         ui::detail::render_detail(f, chunks[1], &mut app);
                         app.table_area = None;
@@ -381,6 +389,11 @@ async fn run_app(
                         app.table_area = Some(chunks[1]);
                         ui::table::render_table(f, chunks[1], &mut app);
                     }
+                }
+                if app.mode == AppMode::Palette {
+                    // Click hit-testing is Normal-mode-gated anyway, but keep
+                    // the Detail precedent: no clicks onto a covered table.
+                    app.table_area = None;
                 }
 
                 match app.mode {
@@ -411,7 +424,7 @@ async fn run_app(
                 }
 
                 if app.mode == AppMode::Help {
-                    ui::help::render_help(f, f.area());
+                    ui::help::render_help(f, f.area(), &mut app);
                 }
                 if app.mode == AppMode::ConfirmDelete {
                     let label = if app.has_marks() {
@@ -432,6 +445,9 @@ async fn run_app(
                 }
                 if app.mode == AppMode::ConfirmQuit {
                     ui::dialogs::render_quit_dialog(f, f.area());
+                }
+                if app.mode == AppMode::Palette {
+                    ui::palette::render_palette(f, f.area(), &mut app);
                 }
             })?;
         }
@@ -459,7 +475,11 @@ async fn run_app(
                         }
                         // Ctrl+C: first opens quit dialog, second force-quits
                         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                            let was_detail = app.mode == AppMode::Detail;
+                            // in_detail_view, not mode == Detail: the detail
+                            // view also sits under a palette overlay, and
+                            // skipping the clear there leaked per-tick
+                            // file/peer materialization in the engine.
+                            let was_detail = app.in_detail_view();
                             if app.mode == AppMode::ConfirmQuit {
                                 app.should_quit = true;
                             } else {
@@ -478,6 +498,16 @@ async fn run_app(
                             needs_render = true;
                             continue;
                         }
+                        // Ctrl+P: open the command palette from any non-input
+                        // mode. Consumed even where it can't open, so it never
+                        // types a literal 'p' into a text field.
+                        if key.code == KeyCode::Char('p')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            app.open_palette();
+                            needs_render = true;
+                            continue;
+                        }
                         match app.mode {
                             AppMode::Input => handle_input_mode(&mut app, &mut input_widget, key, &cmd_tx).await,
                             AppMode::Normal => handle_normal_mode(&mut app, &mut input_widget, key, &cmd_tx).await,
@@ -489,6 +519,7 @@ async fn run_app(
                             AppMode::ThrottleInput => handle_throttle_mode(&mut app, key, &cmd_tx).await,
                             AppMode::Search => handle_search_input_mode(&mut app, key, &search_tx, &mut search_client),
                             AppMode::SearchResults => handle_search_results_mode(&mut app, key, &cmd_tx, &search_tx, &mut search_client).await,
+                            AppMode::Palette => handle_palette_mode(&mut app, key, &mut input_widget, &cmd_tx, &search_tx, &mut search_client).await,
                         }
                         needs_render = true;
                     }
@@ -512,6 +543,12 @@ async fn run_app(
                         // Same filter+cap as typing — search_push_char owns both.
                         for c in s.chars() {
                             app.search_push_char(c);
+                        }
+                        needs_render = true;
+                    }
+                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::Palette => {
+                        for c in s.chars() {
+                            app.palette_push_char(c);
                         }
                         needs_render = true;
                     }
@@ -602,6 +639,167 @@ async fn run_app(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Actions. Each user-invokable operation is a named function; the per-mode
+// key handlers and the command palette's `execute_action` both dispatch to
+// these, so the palette is an alternate front door onto the same code, never
+// a second implementation.
+// ---------------------------------------------------------------------------
+
+/// The `q` action: confirm when work is active, quit outright otherwise.
+fn request_quit(app: &mut App) {
+    if app.confirm_on_quit_required() {
+        app.mode = AppMode::ConfirmQuit;
+    } else {
+        app.should_quit = true;
+    }
+}
+
+fn open_add_input(app: &mut App, input_widget: &mut InputWidget) {
+    app.mode = AppMode::Input;
+    input_widget.clear();
+}
+
+/// The search buffer is deliberately not cleared: coming back to search
+/// shows the previous query ready to refine.
+fn open_search_input(app: &mut App) {
+    app.mode = AppMode::Search;
+}
+
+/// Pause/unpause the marked set, or the selected torrent.
+async fn pause_toggle(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    if app.has_marks() {
+        let ids: Vec<usize> = app.marked_ids.iter().copied().collect();
+        // "Any user-paused → resume all" is the intuitive model. A
+        // throttle-paused torrent does not count: it reports Paused
+        // mid duty cycle while the user never asked for it, and
+        // treating it as paused flipped this whole batch to Resume
+        // whenever a speed limit was set (#47).
+        let any_paused = ids.iter().any(|id| {
+            app.torrents.iter().any(|t| {
+                t.id == *id
+                    && matches!(t.status, types::TorrentStatus::Paused)
+                    && !t.throttle_managed
+            })
+        });
+        // Send the whole batch as one message — the 32-slot channel
+        // would block on the 33rd send otherwise, and the engine's own
+        // state_tx send (4-slot) could deadlock while the UI waits.
+        let cmd = if any_paused {
+            EngineCommand::ResumeMany(ids)
+        } else {
+            EngineCommand::PauseMany(ids)
+        };
+        send_cmd(cmd_tx, cmd, app).await;
+        app.clear_marks();
+    } else if let Some(torrent) = app.selected_torrent() {
+        let id = torrent.id;
+        // Resume only what the user paused. A torrent that is Paused
+        // while throttle-managed is mid duty cycle, and `p` there means
+        // "stop it properly", not "hand it back to the throttle".
+        if matches!(torrent.status, types::TorrentStatus::Paused) && torrent.throttle_managed {
+            send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
+        } else {
+            match torrent.status {
+                // Seeding and Complete are pausable too — librqbit
+                // handles a finished torrent fine, and the marked and
+                // `P` paths already pause them, so leaving them out
+                // here made `p` a dropped keypress on a seeding row.
+                types::TorrentStatus::Downloading
+                | types::TorrentStatus::Complete
+                | types::TorrentStatus::Seeding => {
+                    send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
+                }
+                types::TorrentStatus::Paused => {
+                    send_cmd(cmd_tx, EngineCommand::Resume(id), app).await;
+                }
+                types::TorrentStatus::FetchingMetadata => {
+                    app.set_info("Can't pause while fetching metadata".to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Pause or resume everything.
+async fn pause_all(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    // Same test as the `p` handler: only a *user* pause counts as
+    // paused. A throttle-managed torrent reports Paused mid duty
+    // cycle, and treating that as paused made `P` send ResumeAll when
+    // the user asked to pause everything. `.all()` on an empty
+    // iterator is also true, so an idle session needs the emptiness
+    // guard or `P` resumes nothing at all.
+    let pausable: Vec<&types::TorrentInfo> = app
+        .torrents
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.status,
+                types::TorrentStatus::Downloading
+                    | types::TorrentStatus::Paused
+                    | types::TorrentStatus::Complete
+                    | types::TorrentStatus::Seeding
+            )
+        })
+        .collect();
+    let all_paused = !pausable.is_empty()
+        && pausable
+            .iter()
+            .all(|t| matches!(t.status, types::TorrentStatus::Paused) && !t.throttle_managed);
+
+    let cmd = if all_paused {
+        EngineCommand::ResumeAll
+    } else {
+        EngineCommand::PauseAll
+    };
+    send_cmd(cmd_tx, cmd, app).await;
+}
+
+/// Guard on the *visible* list, like `open_detail` does: with a filter that
+/// matches nothing the dialog label is empty and the popup is never drawn,
+/// leaving the user in a modal with nothing on screen.
+fn open_delete_confirm(app: &mut App) {
+    if !app.sorted_torrents().is_empty() || app.has_marks() {
+        app.mode = AppMode::ConfirmDelete;
+    }
+}
+
+async fn open_detail(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    if app.sorted_torrents().is_empty() {
+        return;
+    }
+    app.mode = AppMode::Detail;
+    app.detail_tab = DetailTab::Stats;
+    app.detail_file_index = 0;
+    app.detail_peer_index = 0;
+    app.detail_peer_scroll_offset = 0;
+    // Tell the engine which torrent we're viewing so the next
+    // snapshot includes files/peers/info for only this one.
+    let detail_id = app.selected_torrent_id;
+    send_cmd(cmd_tx, EngineCommand::SetDetailTorrent(detail_id), app).await;
+}
+
+fn open_throttle(app: &mut App) {
+    app.mode = AppMode::ThrottleInput;
+    app.throttle_step = 0;
+    app.throttle_input_buf = if app.speed_limit_download_kbps > 0 {
+        app.speed_limit_download_kbps.to_string()
+    } else {
+        String::new()
+    };
+}
+
+fn toggle_mark_and_advance(app: &mut App) {
+    app.toggle_mark();
+    app.next();
+}
+
+fn open_help(app: &mut App) {
+    app.help_scroll = 0;
+    app.mode = AppMode::Help;
+}
+
 async fn handle_normal_mode(
     app: &mut App,
     input_widget: &mut InputWidget,
@@ -609,167 +807,31 @@ async fn handle_normal_mode(
     cmd_tx: &mpsc::Sender<EngineCommand>,
 ) {
     match key.code {
-        KeyCode::Char('q') => {
-            if app.confirm_on_quit_required() {
-                app.mode = AppMode::ConfirmQuit;
-            } else {
-                app.should_quit = true;
-            }
-        }
+        KeyCode::Char('q') => request_quit(app),
         KeyCode::Char('j') | KeyCode::Down => app.next(),
         KeyCode::Char('k') | KeyCode::Up => app.previous(),
-        KeyCode::Char('a') => {
-            app.mode = AppMode::Input;
-            input_widget.clear();
+        KeyCode::Char('a') => open_add_input(app, input_widget),
+        KeyCode::Char('s') => open_search_input(app),
+        KeyCode::Char('o') => handle_open_folder(app),
+        KeyCode::Char(':') => {
+            app.open_palette();
         }
-        KeyCode::Char('s') => {
-            // The search buffer is deliberately not cleared: coming back to
-            // search shows the previous query ready to refine.
-            app.mode = AppMode::Search;
-        }
-        KeyCode::Char('o') => {
-            handle_open_folder(app);
-        }
-        KeyCode::Char('p') => {
-            if app.has_marks() {
-                let ids: Vec<usize> = app.marked_ids.iter().copied().collect();
-                // "Any user-paused → resume all" is the intuitive model. A
-                // throttle-paused torrent does not count: it reports Paused
-                // mid duty cycle while the user never asked for it, and
-                // treating it as paused flipped this whole batch to Resume
-                // whenever a speed limit was set (#47).
-                let any_paused = ids.iter().any(|id| {
-                    app.torrents.iter().any(|t| {
-                        t.id == *id
-                            && matches!(t.status, types::TorrentStatus::Paused)
-                            && !t.throttle_managed
-                    })
-                });
-                // Send the whole batch as one message — the 32-slot channel
-                // would block on the 33rd send otherwise, and the engine's own
-                // state_tx send (4-slot) could deadlock while the UI waits.
-                let cmd = if any_paused {
-                    EngineCommand::ResumeMany(ids)
-                } else {
-                    EngineCommand::PauseMany(ids)
-                };
-                send_cmd(cmd_tx, cmd, app).await;
-                app.clear_marks();
-            } else if let Some(torrent) = app.selected_torrent() {
-                let id = torrent.id;
-                // Resume only what the user paused. A torrent that is Paused
-                // while throttle-managed is mid duty cycle, and `p` there means
-                // "stop it properly", not "hand it back to the throttle".
-                if matches!(torrent.status, types::TorrentStatus::Paused)
-                    && torrent.throttle_managed
-                {
-                    send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
-                } else {
-                    match torrent.status {
-                        // Seeding and Complete are pausable too — librqbit
-                        // handles a finished torrent fine, and the marked and
-                        // `P` paths already pause them, so leaving them out
-                        // here made `p` a dropped keypress on a seeding row.
-                        types::TorrentStatus::Downloading
-                        | types::TorrentStatus::Complete
-                        | types::TorrentStatus::Seeding => {
-                            send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
-                        }
-                        types::TorrentStatus::Paused => {
-                            send_cmd(cmd_tx, EngineCommand::Resume(id), app).await;
-                        }
-                        types::TorrentStatus::FetchingMetadata => {
-                            app.set_info("Can't pause while fetching metadata".to_string());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        KeyCode::Char('P') => {
-            // Same test as the `p` handler: only a *user* pause counts as
-            // paused. A throttle-managed torrent reports Paused mid duty
-            // cycle, and treating that as paused made `P` send ResumeAll when
-            // the user asked to pause everything. `.all()` on an empty
-            // iterator is also true, so an idle session needs the emptiness
-            // guard or `P` resumes nothing at all.
-            let pausable: Vec<&types::TorrentInfo> = app
-                .torrents
-                .iter()
-                .filter(|t| {
-                    matches!(
-                        t.status,
-                        types::TorrentStatus::Downloading
-                            | types::TorrentStatus::Paused
-                            | types::TorrentStatus::Complete
-                            | types::TorrentStatus::Seeding
-                    )
-                })
-                .collect();
-            let all_paused = !pausable.is_empty()
-                && pausable.iter().all(|t| {
-                    matches!(t.status, types::TorrentStatus::Paused) && !t.throttle_managed
-                });
-
-            let cmd = if all_paused {
-                EngineCommand::ResumeAll
-            } else {
-                EngineCommand::PauseAll
-            };
-            send_cmd(cmd_tx, cmd, app).await;
-        }
-        // Guard on the *visible* list, like Enter does: with a filter that
-        // matches nothing the dialog label is empty and the popup is never
-        // drawn, leaving the user in a modal with nothing on screen.
-        KeyCode::Char('d') if !app.sorted_torrents().is_empty() || app.has_marks() => {
-            app.mode = AppMode::ConfirmDelete;
-        }
-        KeyCode::Enter if !app.sorted_torrents().is_empty() => {
-            app.mode = AppMode::Detail;
-            app.detail_tab = DetailTab::Stats;
-            app.detail_file_index = 0;
-            app.detail_peer_index = 0;
-            app.detail_peer_scroll_offset = 0;
-            // Tell the engine which torrent we're viewing so the next
-            // snapshot includes files/peers/info for only this one.
-            let detail_id = app.selected_torrent_id;
-            send_cmd(cmd_tx, EngineCommand::SetDetailTorrent(detail_id), app).await;
-        }
-        KeyCode::Char('?') => {
-            app.mode = AppMode::Help;
-        }
+        KeyCode::Char('p') => pause_toggle(app, cmd_tx).await,
+        KeyCode::Char('P') => pause_all(app, cmd_tx).await,
+        KeyCode::Char('d') => open_delete_confirm(app),
+        KeyCode::Enter => open_detail(app, cmd_tx).await,
+        KeyCode::Char('?') => open_help(app),
         KeyCode::Tab => {
             let next = app.sort_column.next();
             app.change_sort_column(next);
         }
-        KeyCode::Char('r') => {
-            app.toggle_sort_reversed();
-        }
-        KeyCode::Char('/') => {
-            app.mode = AppMode::Filter;
-        }
-        KeyCode::Char('t') => {
-            app.mode = AppMode::ThrottleInput;
-            app.throttle_step = 0;
-            app.throttle_input_buf = if app.speed_limit_download_kbps > 0 {
-                app.speed_limit_download_kbps.to_string()
-            } else {
-                String::new()
-            };
-        }
-        KeyCode::Char(' ') => {
-            app.toggle_mark();
-            app.next();
-        }
-        KeyCode::Char('v') => {
-            app.mark_all();
-        }
-        KeyCode::Char('V') => {
-            app.clear_marks();
-        }
-        KeyCode::Esc => {
-            app.clear_marks();
-        }
+        KeyCode::Char('r') => app.toggle_sort_reversed(),
+        KeyCode::Char('/') => app.mode = AppMode::Filter,
+        KeyCode::Char('t') => open_throttle(app),
+        KeyCode::Char(' ') => toggle_mark_and_advance(app),
+        KeyCode::Char('v') => app.mark_all(),
+        KeyCode::Char('V') => app.clear_marks(),
+        KeyCode::Esc => app.clear_marks(),
         _ => {}
     }
 }
@@ -917,50 +979,63 @@ async fn handle_search_results_mode(
         KeyCode::Char('s') => {
             app.mode = AppMode::Search; // buffer still holds the query
         }
+        KeyCode::Char(':') => {
+            app.open_palette();
+        }
         KeyCode::Char('j') | KeyCode::Down => app.search_next(),
         KeyCode::Char('k') | KeyCode::Up => app.search_previous(),
-        KeyCode::Char('r') => {
-            if !app.search.in_flight {
-                start_search(app, search_tx, search_client, true);
-            }
-        }
-        KeyCode::Enter => {
-            if app.search.in_flight {
-                return;
-            }
-            // Borrow-scope the read like handle_stream_keypress does.
-            let picked = app
-                .selected_search_result()
-                .map(|r| (r.info_hash.clone(), r.title.clone()));
-            let Some((info_hash, title)) = picked else {
-                return;
-            };
-            // Block a re-send only while the torrent is actually in the
-            // session: after a delete (or a failed add) the hash is still in
-            // `added` for the ✓ mark, but Enter must work again. In the brief
-            // window before the first state push the presence check misses and
-            // a double-press reaches the engine, whose AlreadyManaged reply
-            // answers "already downloaded" — that backstop is the design.
-            if app.search.added.contains(&info_hash) && app.torrent_in_session(&info_hash) {
-                app.set_info(format!("Already added: {}", title));
-                return;
-            }
-            let magnet = search::build_magnet(&info_hash, &title);
-            // Belt-and-braces: the same gate the manual flow uses. Parse-time
-            // hash validation makes a failure here impossible unless an
-            // invariant broke, and then an error beats a corrupt command.
-            if let Err(e) = validate_magnet(&magnet) {
-                app.set_error(e);
-                return;
-            }
-            send_cmd(cmd_tx, EngineCommand::AddTorrent(magnet), app).await;
-            app.search.added.insert(info_hash);
-            // Stay in the results for multi-grab; the engine reports
-            // duplicates/failures on its own message channel.
-            app.set_info(format!("Added: {}", title));
-        }
+        KeyCode::Char('r') => retry_search(app, search_tx, search_client),
+        KeyCode::Enter => download_selected_result(app, cmd_tx).await,
         _ => {}
     }
+}
+
+fn retry_search(
+    app: &mut App,
+    search_tx: &mpsc::Sender<search::SearchOutcome>,
+    search_client: &mut Option<reqwest::Client>,
+) {
+    if !app.search.in_flight {
+        start_search(app, search_tx, search_client, true);
+    }
+}
+
+/// Add the highlighted search result through the same `AddTorrent` path as
+/// the manual flow.
+async fn download_selected_result(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    if app.search.in_flight {
+        return;
+    }
+    // Borrow-scope the read like handle_stream_keypress does.
+    let picked = app
+        .selected_search_result()
+        .map(|r| (r.info_hash.clone(), r.title.clone()));
+    let Some((info_hash, title)) = picked else {
+        return;
+    };
+    // Block a re-send only while the torrent is actually in the
+    // session: after a delete (or a failed add) the hash is still in
+    // `added` for the ✓ mark, but Enter must work again. In the brief
+    // window before the first state push the presence check misses and
+    // a double-press reaches the engine, whose AlreadyManaged reply
+    // answers "already downloaded" — that backstop is the design.
+    if app.search.added.contains(&info_hash) && app.torrent_in_session(&info_hash) {
+        app.set_info(format!("Already added: {}", title));
+        return;
+    }
+    let magnet = search::build_magnet(&info_hash, &title);
+    // Belt-and-braces: the same gate the manual flow uses. Parse-time
+    // hash validation makes a failure here impossible unless an
+    // invariant broke, and then an error beats a corrupt command.
+    if let Err(e) = validate_magnet(&magnet) {
+        app.set_error(e);
+        return;
+    }
+    send_cmd(cmd_tx, EngineCommand::AddTorrent(magnet), app).await;
+    app.search.added.insert(info_hash);
+    // Stay in the results for multi-grab; the engine reports
+    // duplicates/failures on its own message channel.
+    app.set_info(format!("Added: {}", title));
 }
 
 async fn handle_detail_mode(
@@ -969,18 +1044,11 @@ async fn handle_detail_mode(
     cmd_tx: &mpsc::Sender<EngineCommand>,
 ) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.mode = AppMode::Normal;
-            // Detail mode left — stop the engine from materializing
-            // files/peers for the (now-hidden) torrent.
-            send_cmd(cmd_tx, EngineCommand::SetDetailTorrent(None), app).await;
+        KeyCode::Esc | KeyCode::Char('q') => detail_back(app, cmd_tx).await,
+        KeyCode::Char(':') => {
+            app.open_palette();
         }
-        KeyCode::Tab => {
-            app.detail_tab = app.detail_tab.next();
-            app.detail_file_index = 0;
-            app.detail_peer_index = 0;
-            app.detail_peer_scroll_offset = 0;
-        }
+        KeyCode::Tab => cycle_detail_tab(app),
         KeyCode::Char('j') | KeyCode::Down => match app.detail_tab {
             DetailTab::Files => {
                 if let Some(torrent) = app.selected_torrent() {
@@ -1010,23 +1078,7 @@ async fn handle_detail_mode(
             _ => {}
         },
         KeyCode::Char(' ') if app.detail_tab == DetailTab::Files => {
-            if let Some(torrent) = app.selected_torrent() {
-                let torrent_id = torrent.id;
-                let file_count = torrent.files.len();
-                if app.detail_file_index < file_count {
-                    app.toggle_file_selection(torrent_id, app.detail_file_index);
-                    let selected = app.selected_file_indices(torrent_id, file_count);
-                    send_cmd(
-                        cmd_tx,
-                        EngineCommand::SetSelectedFiles {
-                            id: torrent_id,
-                            file_indices: selected,
-                        },
-                        app,
-                    )
-                    .await;
-                }
-            }
+            toggle_file_selection_key(app, cmd_tx).await;
         }
         KeyCode::Char('s') if app.detail_tab == DetailTab::Files => {
             handle_stream_keypress(app);
@@ -1035,28 +1087,155 @@ async fn handle_detail_mode(
             handle_open_folder(app);
         }
         KeyCode::Char('S') if app.detail_tab == DetailTab::Files => {
-            if let Some(torrent) = app.selected_torrent() {
-                let torrent_id = torrent.id;
-                let total_files = torrent.files.len();
-                // Don't send an empty file selection — librqbit may interpret
-                // it as "deselect everything" and pause the torrent. This
-                // happens when the torrent briefly returns to FetchingMetadata.
-                if total_files == 0 {
-                    app.set_info("No files to apply yet (still fetching metadata)".to_string());
-                } else {
-                    let selected = app.selected_file_indices(torrent_id, total_files);
-                    send_cmd(
-                        cmd_tx,
-                        EngineCommand::SetSelectedFiles {
-                            id: torrent_id,
-                            file_indices: selected,
-                        },
-                        app,
-                    )
-                    .await;
+            apply_file_selection(app, cmd_tx).await;
+        }
+        _ => {}
+    }
+}
+
+/// Leave Detail — and stop the engine from materializing files/peers for the
+/// (now-hidden) torrent.
+async fn detail_back(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    app.mode = AppMode::Normal;
+    send_cmd(cmd_tx, EngineCommand::SetDetailTorrent(None), app).await;
+}
+
+fn cycle_detail_tab(app: &mut App) {
+    app.detail_tab = app.detail_tab.next();
+    app.detail_file_index = 0;
+    app.detail_peer_index = 0;
+    app.detail_peer_scroll_offset = 0;
+}
+
+async fn toggle_file_selection_key(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    if let Some(torrent) = app.selected_torrent() {
+        let torrent_id = torrent.id;
+        let file_count = torrent.files.len();
+        if app.detail_file_index < file_count {
+            app.toggle_file_selection(torrent_id, app.detail_file_index);
+            let selected = app.selected_file_indices(torrent_id, file_count);
+            send_cmd(
+                cmd_tx,
+                EngineCommand::SetSelectedFiles {
+                    id: torrent_id,
+                    file_indices: selected,
+                },
+                app,
+            )
+            .await;
+        }
+    }
+}
+
+async fn apply_file_selection(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    if let Some(torrent) = app.selected_torrent() {
+        let torrent_id = torrent.id;
+        let total_files = torrent.files.len();
+        // Don't send an empty file selection — librqbit may interpret
+        // it as "deselect everything" and pause the torrent. This
+        // happens when the torrent briefly returns to FetchingMetadata.
+        if total_files == 0 {
+            app.set_info("No files to apply yet (still fetching metadata)".to_string());
+        } else {
+            let selected = app.selected_file_indices(torrent_id, total_files);
+            send_cmd(
+                cmd_tx,
+                EngineCommand::SetSelectedFiles {
+                    id: torrent_id,
+                    file_indices: selected,
+                },
+                app,
+            )
+            .await;
+        }
+    }
+}
+
+/// Route a palette-chosen action to the same function its keybinding calls.
+/// The palette has already closed (mode restored) by the time this runs, so
+/// mode transitions inside the actions behave exactly as if the key was
+/// pressed in the origin view.
+async fn execute_action(
+    id: actions::ActionId,
+    app: &mut App,
+    input_widget: &mut InputWidget,
+    cmd_tx: &mpsc::Sender<EngineCommand>,
+    search_tx: &mpsc::Sender<search::SearchOutcome>,
+    search_client: &mut Option<reqwest::Client>,
+) {
+    use actions::ActionId as A;
+    match id {
+        A::AddTorrent => open_add_input(app, input_widget),
+        A::OpenSearch => open_search_input(app),
+        A::PauseToggle => pause_toggle(app, cmd_tx).await,
+        A::PauseAll => pause_all(app, cmd_tx).await,
+        A::Delete => open_delete_confirm(app),
+        A::RevealFolder => handle_open_folder(app),
+        A::OpenDetail => open_detail(app, cmd_tx).await,
+        A::CycleSort => {
+            let next = app.sort_column.next();
+            app.change_sort_column(next);
+        }
+        A::ReverseSort => app.toggle_sort_reversed(),
+        A::OpenFilter => app.mode = AppMode::Filter,
+        A::OpenThrottle => open_throttle(app),
+        A::ToggleMark => toggle_mark_and_advance(app),
+        A::MarkAll => app.mark_all(),
+        A::ClearMarks => app.clear_marks(),
+        A::ToggleHelp => open_help(app),
+        A::Quit => request_quit(app),
+        A::CycleTab => cycle_detail_tab(app),
+        A::ToggleFileSelection => toggle_file_selection_key(app, cmd_tx).await,
+        A::ApplyFileSelection => apply_file_selection(app, cmd_tx).await,
+        A::StreamFile => handle_stream_keypress(app),
+        A::DetailBack => detail_back(app, cmd_tx).await,
+        A::DownloadResult => download_selected_result(app, cmd_tx).await,
+        A::EditQuery => app.mode = AppMode::Search,
+        A::RetrySearch => retry_search(app, search_tx, search_client),
+        A::SearchBack => app.mode = AppMode::Normal,
+    }
+}
+
+/// Keys while the command palette is open. Plain letters filter (so `j`
+/// stays typeable in queries); navigation is arrows or Ctrl+j/k.
+async fn handle_palette_mode(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    input_widget: &mut InputWidget,
+    cmd_tx: &mpsc::Sender<EngineCommand>,
+    search_tx: &mpsc::Sender<search::SearchOutcome>,
+    search_client: &mut Option<reqwest::Client>,
+) {
+    match key.code {
+        KeyCode::Esc => app.close_palette(),
+        KeyCode::Enter => {
+            let matches = app.palette_matches();
+            let Some(&target) = matches.get(app.palette_selected_index(&matches)) else {
+                return;
+            };
+            if let Some(anchor) = app.palette.anchor {
+                if !std::ptr::eq(anchor, target) {
+                    // The deliberately-navigated-to action vanished (its
+                    // availability changed under the palette). Re-anchor to
+                    // the top instead of firing whatever shifted into its
+                    // place — one extra Enter beats an unwanted action.
+                    app.palette.anchor = None;
+                    return;
                 }
             }
+            if let Some(id) = target.id {
+                app.close_palette();
+                execute_action(id, app, input_widget, cmd_tx, search_tx, search_client).await;
+            }
         }
+        KeyCode::Down => app.palette_next(),
+        KeyCode::Up => app.palette_previous(),
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => app.palette_next(),
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.palette_previous()
+        }
+        KeyCode::Backspace => app.palette_pop_char(),
+        KeyCode::Char(c) => app.palette_push_char(c),
         _ => {}
     }
 }
@@ -1065,6 +1244,15 @@ fn handle_help_mode(app: &mut App, key: crossterm::event::KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
             app.mode = AppMode::Normal;
+        }
+        // The registry-driven table outgrows short terminals; the renderer
+        // clamps the offset against the real maximum, so saturating math is
+        // all the handler needs.
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.help_scroll = app.help_scroll.saturating_add(1);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
         }
         _ => {}
     }
@@ -1633,6 +1821,222 @@ mod tests {
         let mut app = App::new();
         handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('t')), &tx).await;
         assert_eq!(app.mode, AppMode::ThrottleInput);
+    }
+
+    fn ctrl(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[tokio::test]
+    async fn colon_opens_the_palette_from_every_hosting_mode() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut iw = InputWidget::new();
+
+        let mut app = App::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char(':')), &tx).await;
+        assert_eq!(app.mode, AppMode::Palette);
+        assert_eq!(app.palette.return_mode, AppMode::Normal);
+
+        let mut app = App::new();
+        app.mode = AppMode::Detail;
+        handle_detail_mode(&mut app, key(KeyCode::Char(':')), &tx).await;
+        assert_eq!(app.mode, AppMode::Palette);
+        assert_eq!(app.palette.return_mode, AppMode::Detail);
+
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        handle_search_results_mode(
+            &mut app,
+            key(KeyCode::Char(':')),
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.mode, AppMode::Palette);
+        assert_eq!(app.palette.return_mode, AppMode::SearchResults);
+    }
+
+    #[tokio::test]
+    async fn palette_enter_runs_the_filtered_action() {
+        // Type "pause all", Enter: the palette must dispatch the same
+        // PauseAll the `P` key sends, and land back in Normal mode.
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut iw = InputWidget::new();
+        let mut app = App::new();
+        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Downloading, false)]);
+        assert!(app.open_palette());
+        for c in "pause all".chars() {
+            handle_palette_mode(
+                &mut app,
+                key(KeyCode::Char(c)),
+                &mut iw,
+                &tx,
+                &search_tx,
+                &mut client,
+            )
+            .await;
+        }
+        let top = app.palette_matches();
+        assert!(
+            actions::tui_description(top[0]).contains("all torrents"),
+            "top match should be Pause/unpause all, got {:?}",
+            actions::tui_description(top[0])
+        );
+        handle_palette_mode(
+            &mut app,
+            key(KeyCode::Enter),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv().expect("a command"),
+            EngineCommand::PauseAll
+        ));
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn palette_esc_returns_and_ctrl_jk_navigates() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut iw = InputWidget::new();
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        assert!(app.open_palette());
+        handle_palette_mode(
+            &mut app,
+            ctrl(KeyCode::Char('j')),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.palette_selected_index(&app.palette_matches()), 1);
+        handle_palette_mode(
+            &mut app,
+            ctrl(KeyCode::Char('k')),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.palette_selected_index(&app.palette_matches()), 0);
+        // Plain j is typing, not navigation.
+        handle_palette_mode(
+            &mut app,
+            key(KeyCode::Char('j')),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.palette.input, "j");
+        handle_palette_mode(
+            &mut app,
+            key(KeyCode::Esc),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.mode, AppMode::SearchResults);
+    }
+
+    #[tokio::test]
+    async fn palette_enter_on_a_vanished_anchor_fires_nothing_once() {
+        // The review's misfire scenario: anchor an action, let a background
+        // event remove it from the match list, press Enter. Nothing may
+        // execute; the cursor re-anchors to the top instead.
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut iw = InputWidget::new();
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        app.search.searched_once = true;
+        app.search.query = "q".to_string();
+        app.search.results = vec![search_result_fixture()];
+        assert!(app.open_palette());
+        // Anchor "Download the selected result" (alphabetically second with
+        // an empty query; present because no search is in flight).
+        handle_palette_mode(
+            &mut app,
+            ctrl(KeyCode::Char('j')),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        let anchored = app.palette.anchor.expect("anchored");
+        assert!(actions::tui_description(anchored).contains("Download"));
+        // Background change: a retry starts, hiding DownloadResult.
+        app.search.in_flight = true;
+        handle_palette_mode(
+            &mut app,
+            key(KeyCode::Enter),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert!(rx.try_recv().is_err(), "vanished anchor must not fire");
+        assert_eq!(
+            app.mode,
+            AppMode::Palette,
+            "palette stays open, re-anchored"
+        );
+        assert!(app.palette.anchor.is_none());
+    }
+
+    #[tokio::test]
+    async fn palette_action_executes_in_the_detail_context() {
+        // CycleTab chosen from a Detail-opened palette must mutate detail
+        // state exactly like pressing Tab in Detail.
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut iw = InputWidget::new();
+        let mut app = App::new();
+        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Downloading, false)]);
+        app.mode = AppMode::Detail;
+        assert!(app.open_palette());
+        for c in "cycle detail".chars() {
+            handle_palette_mode(
+                &mut app,
+                key(KeyCode::Char(c)),
+                &mut iw,
+                &tx,
+                &search_tx,
+                &mut client,
+            )
+            .await;
+        }
+        handle_palette_mode(
+            &mut app,
+            key(KeyCode::Enter),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.mode, AppMode::Detail);
+        assert_eq!(app.detail_tab, DetailTab::Info);
     }
 
     #[test]

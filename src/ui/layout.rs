@@ -85,25 +85,27 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let active = app.active_count();
     let total = app.torrents.len();
 
+    // The Normal/Detail/SearchResults lines are assembled from the action
+    // registry so they can never drift from the real bindings; the modal and
+    // text-input modes keep literal strings (their keys aren't actions).
     let hints = match app.mode {
         AppMode::Normal => {
-            if app.torrents.is_empty() {
-                "a:add  s:search  /:filter  ?:help  q:quit"
-            } else {
-                "a:add  s:search  Space:mark  p:(un)pause  d:delete  o:folder  Enter:detail  /:filter  t:throttle  ?:help  q:quit"
-            }
+            crate::actions::hint_line(crate::actions::Scope::Normal, app.torrents.is_empty())
         }
-        AppMode::Input => "Enter:submit  Esc:cancel",
-        AppMode::Detail => {
-            "Tab:switch tab  j/k:navigate  Space:toggle  S:apply  o:folder  Esc:back"
+        AppMode::Input => "Enter:submit  Esc:cancel".to_string(),
+        AppMode::Detail => crate::actions::hint_line(crate::actions::Scope::Detail, false),
+        AppMode::Help => "j/k:scroll  Esc/?:close".to_string(),
+        AppMode::ConfirmDelete => "k:keep files  d:delete files  c:cancel".to_string(),
+        AppMode::ConfirmQuit => "y:quit  n:cancel".to_string(),
+        AppMode::Filter => "Enter:apply  Esc:clear & close".to_string(),
+        AppMode::ThrottleInput => "Enter:confirm  Esc:cancel".to_string(),
+        AppMode::Search => "Enter:search  Esc:back".to_string(),
+        AppMode::SearchResults => {
+            crate::actions::hint_line(crate::actions::Scope::SearchResults, false)
         }
-        AppMode::Help => "Esc/?:close",
-        AppMode::ConfirmDelete => "k:keep files  d:delete files  c:cancel",
-        AppMode::ConfirmQuit => "y:quit  n:cancel",
-        AppMode::Filter => "Enter:apply  Esc:clear & close",
-        AppMode::ThrottleInput => "Enter:confirm  Esc:cancel",
-        AppMode::Search => "Enter:search  Esc:back",
-        AppMode::SearchResults => "Enter:download  j/k:navigate  s:edit query  r:retry  Esc:back",
+        AppMode::Palette => {
+            "type to filter  Enter:run  \u{2191}/\u{2193}:navigate  Esc:close".to_string()
+        }
     };
 
     // Build right-aligned speed section

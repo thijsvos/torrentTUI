@@ -142,6 +142,10 @@ pub enum AppMode {
     /// Browsing indexer-search results (or the loading spinner) in the main
     /// area.
     SearchResults,
+    /// The command palette overlay: fuzzy-search every action, Enter runs it.
+    /// The view it opened over keeps rendering underneath; the mode to return
+    /// to lives in `App::palette`.
+    Palette,
 }
 
 #[repr(u8)]

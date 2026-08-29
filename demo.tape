@@ -21,9 +21,16 @@ Sleep 500ms
 Enter
 Sleep 2.5s
 
-# Built-in search: no Prowlarr/Jackett, no accounts — just press s
-Type "s"
-Sleep 800ms
+# Command palette: press ':', fuzzy-search every action with its keybinding
+Type ":"
+Sleep 1.2s
+Type@110ms "search"
+Sleep 900ms
+Enter
+Sleep 1s
+
+# The palette ran "Search torrent indexers" — now type the query.
+# Built-in search: no Prowlarr/Jackett, no accounts.
 Type@110ms "arch linux iso"
 Sleep 700ms
 Enter

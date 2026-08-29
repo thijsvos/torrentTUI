@@ -12,7 +12,7 @@ body:
     attributes:
       label: TorrentTUI version
       description: Output of `torrenttui --version`, or the release tag you installed.
-      placeholder: v0.4.0
+      placeholder: v0.8.0
     validations:
       required: true
 

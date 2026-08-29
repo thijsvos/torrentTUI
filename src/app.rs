@@ -21,10 +21,46 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::actions::{fuzzy_score, palette_scope, tui_description, ActionInfo, Scope, ACTIONS};
 use crate::config::{PlayerConfig, SearchConfig};
 use crate::search::{SearchOutcome, SearchResult};
 use crate::types::{AppMode, DetailTab, SortColumn, TorrentInfo, TorrentStatus};
 use ratatui::widgets::TableState;
+
+/// Cap on the palette's filter buffer; action names are short, so anything
+/// longer than this can't match and only wastes redraw work.
+const MAX_PALETTE_QUERY_CHARS: usize = 64;
+
+/// State for the command-palette overlay. Ephemeral by design: opening the
+/// palette resets the filter, so it always starts from "show me everything".
+pub struct PaletteState {
+    /// Live filter text (control/bidi chars rejected on entry, like the
+    /// search query).
+    pub input: String,
+    /// The action the cursor is on, tracked by identity rather than by index:
+    /// availability predicates re-filter the match list on background events
+    /// (a search outcome landing, metadata arriving), and an index would let
+    /// a row shift under the cursor between deciding and pressing Enter —
+    /// firing an action the user never chose. `None` = the top match.
+    pub anchor: Option<&'static ActionInfo>,
+    /// Mode the palette opened over — rendered underneath, returned to on
+    /// close, and the selector for which actions are offered.
+    pub return_mode: AppMode,
+    pub table_state: TableState,
+}
+
+impl PaletteState {
+    fn new() -> Self {
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
+        Self {
+            input: String::new(),
+            anchor: None,
+            return_mode: AppMode::Normal,
+            table_state,
+        }
+    }
+}
 
 /// State for the indexer-search feature, grouped because it lives and dies
 /// together: it persists for the whole session (leaving the search views and
@@ -158,6 +194,12 @@ pub struct App {
     /// Copied once from `config.general.download_dir` at startup; the `o`
     /// keybinding resolves the selected torrent's on-disk location against it.
     pub download_dir: String,
+    /// Command-palette overlay state; see [`PaletteState`].
+    pub palette: PaletteState,
+    /// Scroll offset of the help overlay. The registry-driven table outgrew
+    /// a 24-line terminal, so the overlay scrolls; reset when help opens and
+    /// clamped against the visible height by the renderer.
+    pub help_scroll: u16,
 }
 
 impl App {
@@ -210,6 +252,8 @@ impl App {
             search: SearchState::new(),
             search_config: SearchConfig::default(),
             download_dir: String::new(),
+            palette: PaletteState::new(),
+            help_scroll: 0,
         }
     }
 
@@ -782,7 +826,7 @@ impl App {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
         self.search.table_state = table_state;
-        matches!(self.mode, AppMode::Search | AppMode::SearchResults)
+        self.in_search_view()
     }
 
     pub fn search_next(&mut self) {
@@ -815,10 +859,131 @@ impl App {
             .any(|t| t.info_hash.eq_ignore_ascii_case(info_hash))
     }
 
+    /// Whether a search view is what the user currently sees — directly, or
+    /// underneath the palette overlay.
+    pub fn in_search_view(&self) -> bool {
+        match &self.mode {
+            AppMode::Search | AppMode::SearchResults => true,
+            AppMode::Palette => matches!(
+                self.palette.return_mode,
+                AppMode::Search | AppMode::SearchResults
+            ),
+            _ => false,
+        }
+    }
+
     /// Whether the frame tick should animate the spinner for a search in
     /// flight — only while a search view is actually on screen.
     pub fn search_spinner_active(&self) -> bool {
-        self.search.in_flight && matches!(self.mode, AppMode::Search | AppMode::SearchResults)
+        self.search.in_flight && self.in_search_view()
+    }
+
+    /// Whether a detail view is what the user currently sees — directly, or
+    /// underneath the palette overlay. The Ctrl+C intercept uses this to know
+    /// the engine's `SetDetailTorrent` materialization must be cleared; the
+    /// plain `mode == Detail` check missed the palette-over-Detail case and
+    /// leaked per-tick file/peer building.
+    pub fn in_detail_view(&self) -> bool {
+        match &self.mode {
+            AppMode::Detail => true,
+            AppMode::Palette => self.palette.return_mode == AppMode::Detail,
+            _ => false,
+        }
+    }
+
+    /// Open the command palette over the current mode. Returns whether it
+    /// opened — text-input modes refuse, because their keys (including `:`)
+    /// must stay typeable.
+    pub fn open_palette(&mut self) -> bool {
+        if palette_scope(&self.mode).is_none() {
+            return false;
+        }
+        self.palette.return_mode = self.mode.clone();
+        self.palette.input.clear();
+        self.palette.anchor = None;
+        self.palette.table_state = {
+            let mut ts = TableState::default();
+            ts.select(Some(0));
+            ts
+        };
+        self.mode = AppMode::Palette;
+        true
+    }
+
+    /// Close the palette and return to the mode it opened over.
+    pub fn close_palette(&mut self) {
+        self.mode = self.palette.return_mode.clone();
+    }
+
+    /// The actions the palette currently offers: in-palette registry rows for
+    /// the scope it opened from (plus Global), filtered by availability and
+    /// the fuzzy query, best score first (name as the tiebreak so ordering is
+    /// deterministic).
+    pub fn palette_matches(&self) -> Vec<&'static ActionInfo> {
+        let Some(scope) = palette_scope(&self.palette.return_mode) else {
+            return Vec::new();
+        };
+        let mut scored: Vec<(u32, &'static ActionInfo)> = ACTIONS
+            .iter()
+            .filter(|a| a.in_palette && (a.scope == scope || a.scope == Scope::Global))
+            .filter(|a| (a.available)(self))
+            .filter_map(|a| fuzzy_score(&self.palette.input, tui_description(a)).map(|s| (s, a)))
+            .collect();
+        scored.sort_by(|(sa, a), (sb, b)| {
+            sb.cmp(sa)
+                .then_with(|| tui_description(a).cmp(tui_description(b)))
+        });
+        scored.into_iter().map(|(_, a)| a).collect()
+    }
+
+    /// Where the cursor sits in the given match list: the anchored action's
+    /// position, or the top when nothing is anchored or the anchor vanished
+    /// (its availability changed while the palette was open).
+    pub fn palette_selected_index(&self, matches: &[&'static ActionInfo]) -> usize {
+        self.palette
+            .anchor
+            .and_then(|anchor| matches.iter().position(|a| std::ptr::eq(*a, anchor)))
+            .unwrap_or(0)
+    }
+
+    /// Append a character to the palette filter, mirroring the search query's
+    /// control/bidi hygiene. Any edit resets the cursor to the top hit.
+    pub fn palette_push_char(&mut self, c: char) {
+        if c.is_control() || crate::ui::util::is_bidi_control(c) {
+            return;
+        }
+        if self.palette.input.chars().count() >= MAX_PALETTE_QUERY_CHARS {
+            return;
+        }
+        self.palette.input.push(c);
+        self.palette.anchor = None;
+        self.palette.table_state.select(Some(0));
+    }
+
+    pub fn palette_pop_char(&mut self) {
+        self.palette.input.pop();
+        self.palette.anchor = None;
+        self.palette.table_state.select(Some(0));
+    }
+
+    pub fn palette_next(&mut self) {
+        let matches = self.palette_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let idx = (self.palette_selected_index(&matches) + 1).min(matches.len() - 1);
+        self.palette.anchor = Some(matches[idx]);
+        self.palette.table_state.select(Some(idx));
+    }
+
+    pub fn palette_previous(&mut self) {
+        let matches = self.palette_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let idx = self.palette_selected_index(&matches).saturating_sub(1);
+        self.palette.anchor = Some(matches[idx]);
+        self.palette.table_state.select(Some(idx));
     }
 
     /// Whether a file is included in the download. Returns `true` for torrents
@@ -1586,6 +1751,148 @@ mod tests {
         app.handle_state_push(vec![t]);
         assert!(app.torrent_in_session("88066b90278f2de655ee2dd44e784c340b54e45c"));
         assert!(!app.torrent_in_session("22b8f63218f1e726ec2f1fb9b38239f95fc6a629"));
+    }
+
+    #[test]
+    fn palette_opens_only_over_non_input_modes_and_returns_there() {
+        let mut app = App::new();
+        for mode in [AppMode::Normal, AppMode::Detail, AppMode::SearchResults] {
+            app.mode = mode.clone();
+            assert!(app.open_palette(), "{mode:?} should host the palette");
+            assert_eq!(app.mode, AppMode::Palette);
+            assert_eq!(app.palette.return_mode, mode);
+            app.close_palette();
+            assert_eq!(app.mode, mode);
+        }
+        for mode in [
+            AppMode::Input,
+            AppMode::Search,
+            AppMode::Filter,
+            AppMode::Help,
+        ] {
+            app.mode = mode.clone();
+            assert!(!app.open_palette(), "{mode:?} must refuse the palette");
+            assert_eq!(app.mode, mode, "refusal must not change mode");
+        }
+    }
+
+    #[test]
+    fn palette_matches_respect_scope_availability_and_query() {
+        let mut app = App::new();
+        app.mode = AppMode::Normal;
+        app.open_palette();
+        let names: Vec<&str> = app
+            .palette_matches()
+            .iter()
+            .map(|a| crate::actions::tui_description(a))
+            .collect();
+        // Normal scope, empty session: add/search always there, delete and
+        // pause hidden (nothing to act on), detail actions absent entirely.
+        assert!(names.contains(&"Add magnet link or .torrent file"));
+        assert!(names.contains(&"Search torrent indexers"));
+        assert!(!names.iter().any(|n| n.contains("Delete")));
+        assert!(!names.iter().any(|n| n.contains("Cycle detail tabs")));
+
+        // With a torrent, the selection-scoped actions appear.
+        app.handle_state_push(vec![make_torrent(0, "t", 10, TorrentStatus::Downloading)]);
+        let names: Vec<&str> = app
+            .palette_matches()
+            .iter()
+            .map(|a| crate::actions::tui_description(a))
+            .collect();
+        assert!(names.iter().any(|n| n.contains("Delete")));
+
+        // The fuzzy query narrows the list and ranks the word-start match
+        // first ("delete" is also a scattered subsequence of "Add magnet
+        // link or .torrent file" — subsequences are allowed, ranking is what
+        // makes the palette feel right).
+        for c in "delete".chars() {
+            app.palette_push_char(c);
+        }
+        let matches = app.palette_matches();
+        assert!(!matches.is_empty());
+        assert!(crate::actions::tui_description(matches[0]).contains("Delete"));
+    }
+
+    #[test]
+    fn palette_from_detail_offers_detail_actions_only() {
+        let mut app = App::new();
+        app.handle_state_push(vec![make_torrent(0, "t", 10, TorrentStatus::Downloading)]);
+        app.mode = AppMode::Detail;
+        app.open_palette();
+        let names: Vec<&str> = app
+            .palette_matches()
+            .iter()
+            .map(|a| crate::actions::tui_description(a))
+            .collect();
+        assert!(names.contains(&"Cycle detail tabs"));
+        assert!(names.contains(&"Back to the torrent list"));
+        assert!(!names.contains(&"Add magnet link or .torrent file"));
+        // File actions need the Files tab with files — hidden on Stats.
+        assert!(!names.iter().any(|n| n.contains("Stream")));
+    }
+
+    #[test]
+    fn palette_input_filters_hostile_chars_and_resets_selection() {
+        let mut app = App::new();
+        app.mode = AppMode::Normal;
+        app.open_palette();
+        app.palette_next();
+        assert!(app.palette.anchor.is_some());
+        app.palette_push_char('\u{1b}');
+        app.palette_push_char('\u{202E}');
+        assert_eq!(app.palette.input, "");
+        app.palette_push_char('a');
+        assert_eq!(app.palette.input, "a");
+        assert!(app.palette.anchor.is_none(), "edits reset the cursor");
+        assert_eq!(app.palette_selected_index(&app.palette_matches()), 0);
+    }
+
+    #[test]
+    fn palette_cursor_follows_the_anchored_action_when_the_list_shifts() {
+        // The misfire the review caught: rows appearing above the cursor
+        // (an availability change from a background event) must not change
+        // which action the cursor is on.
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        app.search.in_flight = true; // hides Download/Retry rows
+        app.search.searched_once = true;
+        app.search.query = "q".to_string();
+        app.open_palette();
+        app.palette_next(); // anchor the second visible action
+        let anchored = app.palette.anchor.expect("anchored");
+        let before = app.palette_selected_index(&app.palette_matches());
+
+        // The outcome lands while the palette is open: new rows appear.
+        app.search.in_flight = false;
+        app.search.results = vec![search_result("88066b90278f2de655ee2dd44e784c340b54e45c", 1)];
+        let matches = app.palette_matches();
+        assert!(matches.len() > 2, "rows should have appeared");
+        let after = app.palette_selected_index(&matches);
+        assert!(
+            std::ptr::eq(matches[after], anchored),
+            "cursor must still be on the anchored action"
+        );
+        assert_ne!(
+            before, after,
+            "its index moved — identity tracking did the work"
+        );
+    }
+
+    #[test]
+    fn search_spinner_animates_under_the_palette_too() {
+        let mut app = App::new();
+        app.search.in_flight = true;
+        app.mode = AppMode::SearchResults;
+        app.open_palette();
+        assert!(app.search_spinner_active());
+        // And an arriving outcome still requests a repaint.
+        let outcome = SearchOutcome {
+            generation: 0,
+            results: Vec::new(),
+            provider_errors: Vec::new(),
+        };
+        assert!(app.apply_search_outcome(outcome));
     }
 
     #[test]
