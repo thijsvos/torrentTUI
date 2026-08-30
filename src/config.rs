@@ -44,15 +44,16 @@ pub struct NetworkConfig {
     /// IGD/UPnP service, which exposes you to peers outside your LAN.
     #[serde(default)]
     pub enable_upnp: bool,
-    /// Download cap in KB/s, where `0` means unlimited. Enforced by pausing
-    /// and unpausing torrents on a duty cycle rather than by rate limiting,
-    /// since librqbit offers no limiter — expect capped torrents to show as
-    /// "Throttled" in the table.
+    /// Download cap in KB/s (KiB/s), where `0` means unlimited. Enforced by
+    /// librqbit's token-bucket rate limiter directly in the peer IO path, so
+    /// the cap shapes traffic smoothly — no torrent is ever paused to hold a
+    /// limit, and changes made with `t` apply live. Values 1-15 are raised to
+    /// 16: the limiter grants permits in whole 16 KiB chunks, so a smaller
+    /// per-second quota cannot be served.
     #[serde(default)]
     pub max_download_speed_kbps: u64,
-    /// Upload cap in KB/s, `0` for unlimited. Same duty-cycle mechanism as the
-    /// download cap, but with one global budget instead of a bucket per
-    /// torrent.
+    /// Upload cap in KB/s, `0` for unlimited. Same limiter as the download
+    /// cap; the two are independent buckets and never interact.
     #[serde(default)]
     pub max_upload_speed_kbps: u64,
     /// Bind address for the embedded HTTP API that serves file-stream URLs to

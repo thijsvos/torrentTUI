@@ -320,7 +320,6 @@ impl App {
                 || a.peers_connected != b.peers_connected
                 || a.peers_total != b.peers_total
                 || a.eta_seconds != b.eta_seconds
-                || a.throttle_managed != b.throttle_managed
                 || a.files.len() != b.files.len()
                 || a.peers.len() != b.peers.len()
         })
@@ -1093,7 +1092,6 @@ mod tests {
             trackers: Vec::new(),
             piece_length: None,
             content_path: None,
-            throttle_managed: false,
         }
     }
 

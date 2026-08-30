@@ -14,6 +14,10 @@ use std::fmt;
 /// torrent — split purely on whether it is uploading *right now*, so a seeding
 /// torrent with no active peers flips between the two tick to tick. Code that
 /// means "finished" must match both; several places in the engine do.
+///
+/// `Paused` always means the user (or a persisted previous session) paused
+/// it. Speed limits are enforced inside librqbit's rate limiter, so the
+/// engine never pauses a torrent on its own.
 pub enum TorrentStatus {
     FetchingMetadata,
     Downloading,
@@ -89,12 +93,6 @@ pub struct TorrentInfo {
     /// re-deriving a path from the (display-sanitized) name, which can differ
     /// from what is actually on disk.
     pub content_path: Option<String>,
-    /// True when a speed limit governs this torrent — the engine owns its
-    /// pause/unpause duty cycle. Not the same as "currently paused": it stays
-    /// set while the torrent is transferring between cycles. A user pause
-    /// clears it, so `status == Paused && !throttle_managed` is how you tell a
-    /// user pause from a throttle pause (#47).
-    pub throttle_managed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -234,7 +232,6 @@ mod tests {
             trackers: Vec::new(),
             piece_length: None,
             content_path: None,
-            throttle_managed: false,
         }
     }
 

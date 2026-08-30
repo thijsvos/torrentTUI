@@ -2,18 +2,18 @@
 //! `Session`.
 //!
 //! [`TorrentEngine`] is a thin, stateless wrapper over the session — every
-//! method is a lookup or a passthrough. All the *mutable* engine state lives in
-//! `run_engine`'s locals, deliberately: which torrents the user paused, which
-//! the throttle paused, the per-torrent token buckets, and the caches that stop
-//! the display flickering during a duty cycle. Keeping it on one task's stack
-//! is what makes it safe to mutate without locks.
+//! method is a lookup or a passthrough. What little *mutable* engine state
+//! remains (the finished-notification set, the Detail-view target) lives in
+//! `run_engine`'s locals, deliberately: keeping it on one task's stack is what
+//! makes it safe to mutate without locks.
 //!
-//! Throttling is a token bucket per torrent plus one global upload bucket,
-//! stepped every 100 ms. librqbit exposes no rate limiter, so a torrent that
-//! overdraws its bucket is genuinely paused and unpaused again once it has
-//! reaccumulated `UNPAUSE_HYSTERESIS` of its budget. That is why `Paused` can
-//! appear in the table without the user having asked for it, and why the
-//! hysteresis, the cooldown and the cached peer/speed values exist.
+//! Speed limits are librqbit's own token-bucket rate limiter — configured at
+//! session creation and swapped live through `session.ratelimits`. The
+//! limiter sits directly in the peer IO path, so a cap shapes traffic
+//! smoothly; a torrent under a limit keeps transferring instead of being
+//! duty-cycle paused the way earlier versions (on librqbit 8, which had no
+//! limiter) had to. `Paused` in the table therefore always means the user —
+//! or a persisted previous session — paused it.
 
 use crate::config::Config;
 use crate::engine::watch;
@@ -24,12 +24,14 @@ use librqbit::{
     api::TorrentIdOrHash,
     dht::Id20,
     http_api::{HttpApi, HttpApiOptions},
+    limits::LimitsConfig,
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListenerOptions,
     ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
 };
 use librqbit_dualstack_sockets::{BindOpts, TcpListener};
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -81,24 +83,9 @@ fn pick_listen_port(start: u16) -> u16 {
 /// symlink-to-huge-file OOM.
 pub(crate) const MAX_TORRENT_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-// Throttle algorithm tuning -------------------------------------------------
-
-/// How often the throttle loop runs.
-const THROTTLE_TICK: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Window over which an "effective" download speed is computed for throttled
-/// torrents (so the displayed speed averages out the duty cycle).
-const SPEED_WINDOW_SECS: f64 = 5.0;
-
-/// Fraction of the per-torrent budget that must be reaccumulated before a
-/// throttle-paused torrent is unpaused. Hysteresis to prevent oscillation.
-const UNPAUSE_HYSTERESIS: f64 = 0.2;
-
-/// Maximum burst, as a multiple of the steady-state per-torrent budget.
-const BURST_MULTIPLIER: i64 = 2;
-
-/// Minimum time between pause/unpause transitions for a single torrent.
-const STATE_CHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(1000);
+/// How often the engine rebuilds and pushes a state snapshot to the UI. Also
+/// the cadence for completion notifications and bookkeeping pruning.
+const STATE_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
 
@@ -170,20 +157,10 @@ struct WatchCleanup {
     exclude: Option<PathBuf>,
 }
 
-/// Lightweight per-torrent snapshot used by the throttle loop. Avoids the cost
-/// of building full peer/file lists on every 100 ms tick.
-struct ThrottleSnapshot {
-    id: usize,
-    status: TorrentStatus,
-    downloaded_bytes: u64,
-    upload_speed: u64,
-}
-
 /// Thin wrapper over librqbit's `Session` — lookups, passthroughs and snapshot
-/// building, with no state of its own. Everything mutable (user-paused set,
-/// throttle buckets, display caches) lives in `run_engine`'s locals, so a
-/// second `TorrentEngine` would be a session view with no throttling attached
-/// rather than a second engine.
+/// building, with no state of its own. Even the speed limits live inside the
+/// session (`session.ratelimits`), so a second `TorrentEngine` over the same
+/// session would just be another view of the same engine.
 pub struct TorrentEngine {
     session: Arc<Session>,
 }
@@ -203,6 +180,13 @@ impl TorrentEngine {
                 enable_upnp_port_forwarding: config.network.enable_upnp,
                 ..Default::default()
             }),
+            // Configured limits bite from the first byte: the limiter is part
+            // of the session, so torrents adopted from fastresume are capped
+            // before the first command ever arrives.
+            ratelimits: LimitsConfig {
+                download_bps: speed_limit_bps(config.network.max_download_speed_kbps),
+                upload_bps: speed_limit_bps(config.network.max_upload_speed_kbps),
+            },
             ..Default::default()
         };
 
@@ -265,11 +249,10 @@ impl TorrentEngine {
         }
     }
 
-    /// Pause a torrent in the session and nothing else. The caller owns the
-    /// bookkeeping: `run_engine` distinguishes a user pause (`user_paused`,
-    /// which the throttle loop must never undo) from a throttle pause
-    /// (`throttle_paused`, which it unpauses once tokens recover). Calling this
-    /// without updating the right set means the throttle loop fights the user.
+    /// Pause a torrent in the session. A plain passthrough — since speed
+    /// limits moved into librqbit's rate limiter, nothing in the engine pauses
+    /// torrents on its own, so a pause always came from the user (or from a
+    /// previous session via fastresume).
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> Result<()> {
         self.session.pause(handle).await?;
         Ok(())
@@ -278,6 +261,18 @@ impl TorrentEngine {
     pub async fn unpause(&self, handle: &ManagedTorrentHandle) -> Result<()> {
         self.session.unpause(handle).await?;
         Ok(())
+    }
+
+    /// Apply session-wide speed limits, live. librqbit swaps the governor
+    /// bucket behind an `ArcSwap`, so the new caps take effect on the next
+    /// chunk without restarting anything. `0` means unlimited.
+    pub fn set_speed_limits(&self, download_kbps: u64, upload_kbps: u64) {
+        self.session
+            .ratelimits
+            .set_download_bps(speed_limit_bps(download_kbps));
+        self.session
+            .ratelimits
+            .set_upload_bps(speed_limit_bps(upload_kbps));
     }
 
     /// Delete a torrent, addressed by info hash rather than id. librqbit's
@@ -331,33 +326,11 @@ impl TorrentEngine {
         self.session.get(TorrentIdOrHash::Hash(hash)).is_some()
     }
 
-    /// Lightweight snapshot of `(id, handle)` pairs. Lets the throttle loop
-    /// look up handles in O(1) instead of O(N) `get_handle` per torrent.
+    /// Lightweight snapshot of `(id, handle)` pairs. Lets the bulk command
+    /// handlers look up handles in O(1) instead of O(N) `get_handle` per id.
     fn handle_snapshot(&self) -> Vec<(usize, ManagedTorrentHandle)> {
         self.session
             .with_torrents(|iter| iter.map(|(id, h)| (id, h.clone())).collect())
-    }
-
-    /// Cheap snapshot for the throttle loop. Does not allocate file/peer
-    /// lists, which dominate the cost of `get_all_torrents`.
-    fn throttle_snapshot(&self) -> Vec<ThrottleSnapshot> {
-        self.session.with_torrents(|iter| {
-            iter.map(|(id, handle)| {
-                let stats = handle.stats();
-                let upload_speed = stats
-                    .live
-                    .as_ref()
-                    .map(|l| (l.upload_speed.mbps * MIB_TO_BYTES) as u64)
-                    .unwrap_or(0);
-                ThrottleSnapshot {
-                    id,
-                    status: derive_status(&stats),
-                    downloaded_bytes: stats.progress_bytes,
-                    upload_speed,
-                }
-            })
-            .collect()
-        })
     }
 
     /// Build per-torrent snapshots for the UI. When `detail_id` is `Some`,
@@ -510,7 +483,6 @@ impl TorrentEngine {
                     trackers,
                     piece_length,
                     content_path,
-                    throttle_managed: false, // set by push_state
                 }
             })
             .collect()
@@ -518,8 +490,8 @@ impl TorrentEngine {
     }
 
     /// Look up a live torrent by id. Linear scan under the session lock, which
-    /// is why the throttle loop uses `handle_snapshot()` once per tick instead
-    /// of calling this per torrent. `None` means the torrent is no longer in
+    /// is why the bulk command handlers use `handle_snapshot()` once per batch
+    /// instead of calling this per id. `None` means the torrent is no longer in
     /// the session — a double-tapped delete, or a stale mark — and callers
     /// generally stay quiet about it rather than surfacing an error.
     pub fn get_handle(&self, id: usize) -> Option<ManagedTorrentHandle> {
@@ -583,13 +555,20 @@ pub(crate) fn compute_eta(remaining: u64, dl_bps: u64) -> Option<u64> {
     }
 }
 
-/// One step of the per-torrent token bucket. Returns the new token balance
-/// after crediting `rate * elapsed_secs` and debiting `bytes_delta`, capped at
-/// `BURST_MULTIPLIER * rate`. Pure helper so the math can be tested directly.
-pub(crate) fn step_bucket(prev: i64, rate: i64, elapsed_secs: f64, bytes_delta: i64) -> i64 {
-    let credit = (rate as f64 * elapsed_secs) as i64;
-    let next = prev.saturating_add(credit).saturating_sub(bytes_delta);
-    next.min(rate.saturating_mul(BURST_MULTIPLIER))
+/// Config/dialog speed limit ("KB/s" meaning KiB/s, `0` = unlimited) → the
+/// bytes/sec quota librqbit's rate limiter takes. Applies the same clamp as
+/// every other entry point, which also enforces the 16 KiB/s floor: librqbit
+/// acquires limiter permits in whole 16 KiB chunks, and governor reports an
+/// acquire larger than the per-second quota as impossible — an error that
+/// kills the peer task it happens on instead of pacing it. Saturating math
+/// throughout; `clamped_speed_limit`'s cap keeps `kbps * 1024` within `u32`.
+pub(crate) fn speed_limit_bps(kbps: u64) -> Option<NonZeroU32> {
+    if kbps == 0 {
+        return None;
+    }
+    let clamped = crate::clamped_speed_limit(kbps);
+    let bps = clamped.saturating_mul(1024).min(u64::from(u32::MAX)) as u32;
+    NonZeroU32::new(bps)
 }
 
 /// Build the HTTP stream URL the UI hands to external media players. Pure so
@@ -751,13 +730,13 @@ fn spawn_watch_cleanup(
     });
 }
 
-/// The engine task. Owns the librqbit session, all throttle bookkeeping, and
-/// the watch folder, and runs until it receives `Shutdown` or the command
-/// channel closes — both are normal exits that return `Ok`.
+/// The engine task. Owns the librqbit session and the watch folder, and runs
+/// until it receives `Shutdown` or the command channel closes — both are
+/// normal exits that return `Ok`.
 ///
-/// Two arms drive everything: an incoming command, or the throttle tick. Both
-/// end by calling `push_state`, so the UI gets a fresh snapshot after every
-/// action without each command handler having to remember to send one.
+/// Two arms drive everything: an incoming command, or the state-push tick.
+/// Both end by calling `push_state`, so the UI gets a fresh snapshot after
+/// every action without each command handler having to remember to send one.
 ///
 /// Startup failures are degraded, never fatal: a failed HTTP API bind just
 /// means the UI never receives `HttpApiReady` and streaming stays disabled, and
@@ -884,91 +863,39 @@ pub async fn run_engine(
     let mut cleanup_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     // A fixed cadence, not a fresh `sleep` per loop iteration: the latter
-    // restarts on every command, so a burst of them could starve the throttle
-    // indefinitely and skew the token buckets' elapsed time.
-    let mut throttle_tick = tokio::time::interval(THROTTLE_TICK);
-    throttle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // restarts on every command, so a burst of them could starve the UI of
+    // snapshots indefinitely.
+    let mut state_tick = tokio::time::interval(STATE_PUSH_INTERVAL);
+    state_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let enable_notifications = config.ui.enable_notifications;
     let mut cmd_rx = cmd_rx;
 
     let mut finished_set: HashSet<usize> = HashSet::new();
 
-    // Speed-limit state. Use saturating_mul to avoid u64 overflow when the
-    // user types an unreasonably large limit.
-    // Clamp with the same cap the UI applies, so the enforced limit and the
-    // one shown in the status bar cannot disagree. Unclamped, `as i64` below
-    // is a *truncating* cast: a large enough value goes negative, pins
-    // `ul_tokens` at -1 and pauses every torrent forever.
-    let mut download_limit_bps: u64 =
-        crate::clamped_speed_limit(config.network.max_download_speed_kbps).saturating_mul(1024);
-    let mut upload_limit_bps: u64 =
-        crate::clamped_speed_limit(config.network.max_upload_speed_kbps).saturating_mul(1024);
-    // Which torrents the *download* bucket paused, and which the *upload*
-    // bucket paused. They must stay separate: a shared set let the upload
-    // block's symmetric unpause release torrents the download bucket had just
-    // paused, defeating the download limit whenever both were set.
-    let mut throttle_paused: HashSet<usize> = HashSet::new();
-    let mut ul_throttle_paused: HashSet<usize> = HashSet::new();
-    let mut throttle_managed: HashSet<usize> = HashSet::new();
-    let mut user_paused: HashSet<usize> = HashSet::new();
-    let mut per_torrent_tokens: HashMap<usize, i64> = HashMap::new();
-    let mut per_torrent_prev_bytes: HashMap<usize, u64> = HashMap::new();
-    let mut ul_tokens: i64 = 0;
-    let mut prev_ul_estimated: f64 = 0.0;
-    let mut last_throttle_tick = std::time::Instant::now();
-    let mut cached_peers: HashMap<usize, (u32, u32)> = HashMap::new();
-    let mut cached_upload_speed: HashMap<usize, u64> = HashMap::new();
-    let mut speed_tracker: HashMap<usize, (std::time::Instant, u64, u64)> = HashMap::new();
-    let mut per_torrent_last_change: HashMap<usize, std::time::Instant> = HashMap::new();
     // Tracks which torrent the UI is showing in Detail mode. When None, the
     // per-tick snapshot skips files/peers/trackers entirely.
     let mut detail_torrent_id: Option<usize> = None;
 
     /// Build the latest per-torrent snapshot and broadcast it to the UI. Also
-    /// fires completion notifications, applies throttle-managed display
-    /// overrides (effective speed + paused flag), and prunes the bookkeeping
-    /// (finished-set / peers / upload-speed / speed-tracker) of torrents that
-    /// no longer exist. Runs at the end of every command except `Shutdown`,
-    /// which breaks out of the loop first, and on every timer tick.
-    #[allow(clippy::too_many_arguments)]
+    /// fires completion notifications and prunes the finished-set of torrents
+    /// that no longer exist. Runs at the end of every command except
+    /// `Shutdown`, which breaks out of the loop first, and on every timer
+    /// tick.
     async fn push_state(
         engine: &TorrentEngine,
         state_tx: &mpsc::Sender<Vec<TorrentInfo>>,
         msg_tx: &mpsc::Sender<String>,
         finished_set: &mut HashSet<usize>,
-        throttle_managed: &HashSet<usize>,
-        download_limit_bps: u64,
-        cached_peers: &mut HashMap<usize, (u32, u32)>,
-        cached_upload_speed: &mut HashMap<usize, u64>,
-        speed_tracker: &mut HashMap<usize, (std::time::Instant, u64, u64)>,
         enable_notifications: bool,
         detail_id: Option<usize>,
     ) {
-        let now = std::time::Instant::now();
-        let mut torrents = engine.get_all_torrents(detail_id);
+        let torrents = engine.get_all_torrents(detail_id);
 
         let current_ids: HashSet<usize> = torrents.iter().map(|t| t.id).collect();
         finished_set.retain(|id| current_ids.contains(id));
-        cached_peers.retain(|id, _| current_ids.contains(id));
-        cached_upload_speed.retain(|id, _| current_ids.contains(id));
-        speed_tracker.retain(|id, _| current_ids.contains(id));
 
-        // Match the throttle loop's `active_count` divisor: count only
-        // throttle-managed torrents that are still downloading. Otherwise a
-        // completed torrent lingering in `throttle_managed` between a command
-        // and the next cleanup tick inflates the divisor, so the displayed
-        // per-torrent cap undershoots what's actually enforced.
-        let managed_count = torrents
-            .iter()
-            .filter(|t| {
-                throttle_managed.contains(&t.id)
-                    && !matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding)
-            })
-            .count()
-            .max(1) as u64;
-
-        for t in &mut torrents {
+        for t in &torrents {
             if matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding)
                 && !finished_set.contains(&t.id)
             {
@@ -1006,49 +933,11 @@ pub async fn run_engine(
                     }
                 }
             }
-            // Only smooth over the two states the duty cycle flips between.
-            // Letting this cover Error would hide the error text behind a
-            // permanent "Throttled" label, since nothing removes an errored
-            // torrent from `throttle_managed`.
-            if throttle_managed.contains(&t.id)
-                && matches!(t.status, TorrentStatus::Downloading | TorrentStatus::Paused)
-            {
-                t.throttle_managed = true;
-                let tracker = speed_tracker
-                    .entry(t.id)
-                    .or_insert((now, t.downloaded_bytes, 0));
-                let elapsed = now.duration_since(tracker.0).as_secs_f64();
-                if elapsed >= SPEED_WINDOW_SECS {
-                    let bytes_delta = t.downloaded_bytes.saturating_sub(tracker.1);
-                    tracker.2 = (bytes_delta as f64 / elapsed) as u64;
-                    tracker.0 = now;
-                    tracker.1 = t.downloaded_bytes;
-                }
-                t.download_speed = tracker.2;
-                if download_limit_bps > 0 {
-                    t.download_speed = t.download_speed.min(download_limit_bps / managed_count);
-                }
-                if t.download_speed > 0 {
-                    let remaining = t.size_bytes.saturating_sub(t.downloaded_bytes);
-                    t.eta_seconds = compute_eta(remaining, t.download_speed);
-                }
-                if t.peers_connected > 0 || t.peers_total > 0 {
-                    cached_peers.insert(t.id, (t.peers_connected, t.peers_total));
-                } else if let Some(&(c_conn, c_total)) = cached_peers.get(&t.id) {
-                    t.peers_connected = c_conn;
-                    t.peers_total = c_total;
-                }
-                if t.upload_speed > 0 {
-                    cached_upload_speed.insert(t.id, t.upload_speed);
-                } else if let Some(&c_ul) = cached_upload_speed.get(&t.id) {
-                    t.upload_speed = c_ul;
-                }
-            }
         }
 
         // try_send, not send: these are snapshots, so a full channel means the
         // UI is behind and the next tick supersedes this one anyway. Awaiting
-        // here would stall command handling and the throttle loop behind UI
+        // here would stall command handling and the state tick behind UI
         // drain latency.
         let _ = state_tx.try_send(torrents);
     }
@@ -1086,15 +975,6 @@ pub async fn run_engine(
                                 tracing::error!("Failed to pause torrent {}: {}", id, e);
                             }
                         }
-                        user_paused.insert(id);
-                        throttle_paused.remove(&id);
-                        ul_throttle_paused.remove(&id);
-                        throttle_managed.remove(&id);
-                        per_torrent_tokens.remove(&id);
-                        per_torrent_prev_bytes.remove(&id);
-                        per_torrent_last_change.remove(&id);
-                        cached_upload_speed.remove(&id);
-                        speed_tracker.remove(&id);
                     }
                     Some(EngineCommand::Resume(id)) => {
                         if let Some(handle) = engine.get_handle(id) {
@@ -1102,24 +982,6 @@ pub async fn run_engine(
                                 tracing::error!("Failed to resume torrent {}: {}", id, e);
                             }
                         }
-                        user_paused.remove(&id);
-                        throttle_paused.remove(&id);
-                        ul_throttle_paused.remove(&id);
-                        let throttling = download_limit_bps > 0 || upload_limit_bps > 0;
-                        if throttling {
-                            throttle_managed.insert(id);
-                        } else {
-                            throttle_managed.remove(&id);
-                        }
-                        per_torrent_tokens.insert(id, 0);
-                        // Reset the effective-speed window too, or the average
-                        // spans the pause and under-reports after a resume.
-                        speed_tracker.remove(&id);
-                        per_torrent_prev_bytes.remove(&id);
-                        per_torrent_last_change.remove(&id);
-                        cached_upload_speed.remove(&id);
-                        ul_tokens = 0;
-                        last_throttle_tick = std::time::Instant::now();
                     }
                     Some(EngineCommand::Delete { id, delete_files }) => {
                         // Read the hash before deleting — deletion is what
@@ -1153,15 +1015,6 @@ pub async fn run_engine(
                             }
                         }
                         finished_set.remove(&id);
-                        user_paused.remove(&id);
-                        throttle_paused.remove(&id);
-                        ul_throttle_paused.remove(&id);
-                        throttle_managed.remove(&id);
-                        per_torrent_tokens.remove(&id);
-                        per_torrent_prev_bytes.remove(&id);
-                        per_torrent_last_change.remove(&id);
-                        cached_upload_speed.remove(&id);
-                        speed_tracker.remove(&id);
                     }
                     Some(EngineCommand::PauseMany(ids)) => {
                         // One snapshot, then O(1) lookups. `get_handle` is a
@@ -1175,15 +1028,6 @@ pub async fn run_engine(
                                     tracing::error!("Failed to pause torrent {}: {}", id, e);
                                 }
                             }
-                            user_paused.insert(id);
-                            throttle_paused.remove(&id);
-                        ul_throttle_paused.remove(&id);
-                            throttle_managed.remove(&id);
-                            per_torrent_tokens.remove(&id);
-                            per_torrent_prev_bytes.remove(&id);
-                            per_torrent_last_change.remove(&id);
-                            cached_upload_speed.remove(&id);
-                            speed_tracker.remove(&id);
                         }
                     }
                     Some(EngineCommand::ResumeMany(ids)) => {
@@ -1192,32 +1036,13 @@ pub async fn run_engine(
                         // id made a bulk action O(M*N) with M lock acquisitions.
                         let handles: HashMap<usize, ManagedTorrentHandle> =
                             engine.handle_snapshot().into_iter().collect();
-                        let throttling = download_limit_bps > 0 || upload_limit_bps > 0;
                         for id in ids {
                             if let Some(handle) = handles.get(&id) {
                                 if let Err(e) = engine.unpause(handle).await {
                                     tracing::error!("Failed to resume torrent {}: {}", id, e);
                                 }
                             }
-                            user_paused.remove(&id);
-                            throttle_paused.remove(&id);
-                        ul_throttle_paused.remove(&id);
-                            if throttling {
-                                throttle_managed.insert(id);
-                            } else {
-                                throttle_managed.remove(&id);
-                            }
-                            per_torrent_tokens.insert(id, 0);
-                            speed_tracker.remove(&id);
-                        // Reset the effective-speed window too, or the average
-                        // spans the pause and under-reports after a resume.
-                        speed_tracker.remove(&id);
-                            per_torrent_prev_bytes.remove(&id);
-                            per_torrent_last_change.remove(&id);
-                            cached_upload_speed.remove(&id);
                         }
-                        ul_tokens = 0;
-                        last_throttle_tick = std::time::Instant::now();
                     }
                     Some(EngineCommand::DeleteMany { ids, delete_files }) => {
                         // One snapshot for the whole batch, before any
@@ -1243,15 +1068,6 @@ pub async fn run_engine(
                                 }
                             }
                             finished_set.remove(&id);
-                            user_paused.remove(&id);
-                            throttle_paused.remove(&id);
-                        ul_throttle_paused.remove(&id);
-                            throttle_managed.remove(&id);
-                            per_torrent_tokens.remove(&id);
-                            per_torrent_prev_bytes.remove(&id);
-                            per_torrent_last_change.remove(&id);
-                            cached_upload_speed.remove(&id);
-                            speed_tracker.remove(&id);
                         }
                         // One cleanup pass and one failure message for the
                         // whole batch — see `spawn_watch_cleanup` on why the
@@ -1269,65 +1085,26 @@ pub async fn run_engine(
                         }
                     }
                     Some(EngineCommand::PauseAll) => {
-                        for (id, handle) in engine.handle_snapshot() {
+                        for (_, handle) in engine.handle_snapshot() {
                             let _ = engine.pause(&handle).await;
-                            user_paused.insert(id);
                         }
-                        throttle_paused.clear();
-                        ul_throttle_paused.clear();
-                        throttle_managed.clear();
-                        per_torrent_tokens.clear();
-                        per_torrent_prev_bytes.clear();
-                        per_torrent_last_change.clear();
-                        cached_upload_speed.clear();
-                        speed_tracker.clear();
                     }
                     Some(EngineCommand::ResumeAll) => {
-                        let throttling = download_limit_bps > 0 || upload_limit_bps > 0;
-                        for (id, handle) in engine.handle_snapshot() {
+                        for (_, handle) in engine.handle_snapshot() {
                             let _ = engine.unpause(&handle).await;
-                            user_paused.remove(&id);
-                            if throttling {
-                                throttle_managed.insert(id);
-                            }
                         }
-                        throttle_paused.clear();
-                        ul_throttle_paused.clear();
-                        if !throttling {
-                            throttle_managed.clear();
-                        }
-                        per_torrent_tokens.clear();
-                        per_torrent_prev_bytes.clear();
-                        per_torrent_last_change.clear();
-                        cached_upload_speed.clear();
-                        ul_tokens = 0;
-                        last_throttle_tick = std::time::Instant::now();
                     }
                     Some(EngineCommand::SetSpeedLimits { download_kbps, upload_kbps }) => {
-                        download_limit_bps = download_kbps.saturating_mul(1024);
-                        upload_limit_bps = upload_kbps.saturating_mul(1024);
-                        per_torrent_tokens.clear();
-                        per_torrent_prev_bytes.clear();
-                        per_torrent_last_change.clear();
-                        cached_upload_speed.clear();
-                        ul_tokens = 0;
-                        last_throttle_tick = std::time::Instant::now();
-                        tracing::info!(
-                            "Speed limits set: down={}KB/s up={}KB/s",
-                            download_kbps, upload_kbps
-                        );
+                        engine.set_speed_limits(download_kbps, upload_kbps);
+                        // Echo the clamped values, so the message agrees with
+                        // both the enforced quota and the status-bar badge.
+                        let down = crate::clamped_speed_limit(download_kbps);
+                        let up = crate::clamped_speed_limit(upload_kbps);
+                        tracing::info!("Speed limits set: down={}KB/s up={}KB/s", down, up);
                         let _ = msg_tx.send(format!(
                             "Speed limits updated: \u{2193} {} KB/s / \u{2191} {} KB/s",
-                            download_kbps, upload_kbps
+                            down, up
                         )).await;
-                        if download_kbps == 0 && upload_kbps == 0 {
-                            for id in throttle_paused.drain().chain(ul_throttle_paused.drain()) {
-                                if let Some(handle) = engine.get_handle(id) {
-                                    let _ = engine.unpause(&handle).await;
-                                }
-                            }
-                            throttle_managed.clear();
-                        }
                     }
                     Some(EngineCommand::SetDetailTorrent(id)) => {
                         detail_torrent_id = id;
@@ -1356,205 +1133,11 @@ pub async fn run_engine(
                         break;
                     }
                 }
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id).await;
+                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, enable_notifications, detail_torrent_id).await;
             }
-            _ = throttle_tick.tick() => {
-                let throttling = download_limit_bps > 0 || upload_limit_bps > 0;
-                if throttling {
-                    let now = std::time::Instant::now();
-                    // Clamp at 1s so a system suspend-resume can't credit
-                    // hours of fictitious bytes into the token buckets (the
-                    // upload-bucket math at `ul_delta as i64` would otherwise
-                    // saturate to i64::MAX and corrupt `prev_ul_estimated`).
-                    let elapsed_secs = now
-                        .duration_since(last_throttle_tick)
-                        .as_secs_f64()
-                        .min(1.0);
-                    last_throttle_tick = now;
-
-                    // Lightweight snapshot avoids the full peer/file allocation
-                    // path that dominates the cost of get_all_torrents.
-                    let snapshot = engine.throttle_snapshot();
-                    // O(1) handle lookup instead of O(N) get_handle per call.
-                    let handle_map: HashMap<usize, ManagedTorrentHandle> =
-                        engine.handle_snapshot().into_iter().collect();
-
-                    for t in &snapshot {
-                        if matches!(t.status, TorrentStatus::Downloading)
-                            && !user_paused.contains(&t.id)
-                            && !throttle_managed.contains(&t.id)
-                        {
-                            throttle_managed.insert(t.id);
-                            per_torrent_prev_bytes.entry(t.id).or_insert(t.downloaded_bytes);
-                        }
-                    }
-
-                    if download_limit_bps > 0 {
-                        let active_count = snapshot.iter()
-                            .filter(|t| throttle_managed.contains(&t.id)
-                                && !user_paused.contains(&t.id)
-                                && !matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding))
-                            .count()
-                            .max(1) as u64;
-                        let per_torrent_limit = download_limit_bps / active_count;
-                        let unpause_threshold =
-                            (per_torrent_limit as f64 * UNPAUSE_HYSTERESIS) as i64;
-
-                        for t in &snapshot {
-                            if !throttle_managed.contains(&t.id)
-                                || user_paused.contains(&t.id)
-                                || matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding)
-                            {
-                                continue;
-                            }
-
-                            let prev = per_torrent_prev_bytes
-                                .entry(t.id)
-                                .or_insert(t.downloaded_bytes);
-                            // While throttle-paused, librqbit can still settle
-                            // in-flight pieces — debiting that against the
-                            // active bucket would keep tokens below the unpause
-                            // threshold forever. Reset the cursor so the next
-                            // active tick measures only real flow.
-                            let delta = if throttle_paused.contains(&t.id) {
-                                0
-                            } else {
-                                t.downloaded_bytes.saturating_sub(*prev) as i64
-                            };
-                            *prev = t.downloaded_bytes;
-
-                            let tokens_entry = per_torrent_tokens.entry(t.id).or_insert(0);
-                            *tokens_entry = step_bucket(
-                                *tokens_entry,
-                                per_torrent_limit as i64,
-                                elapsed_secs,
-                                delta,
-                            );
-                            let tokens = *tokens_entry;
-
-                            let can_change = per_torrent_last_change
-                                .get(&t.id)
-                                .is_none_or(|lc| {
-                                    now.duration_since(*lc) >= STATE_CHANGE_COOLDOWN
-                                });
-
-                            if tokens < 0 {
-                                if can_change
-                                    && !throttle_paused.contains(&t.id)
-                                    && matches!(t.status, TorrentStatus::Downloading)
-                                {
-                                    if let Some(handle) = handle_map.get(&t.id) {
-                                        let _ = engine.pause(handle).await;
-                                        throttle_paused.insert(t.id);
-                                        per_torrent_last_change.insert(t.id, now);
-                                    }
-                                }
-                            } else if tokens > unpause_threshold
-                                && can_change
-                                && (throttle_paused.contains(&t.id)
-                                    || matches!(t.status, TorrentStatus::Paused))
-                                && !user_paused.contains(&t.id)
-                            {
-                                if let Some(handle) = handle_map.get(&t.id) {
-                                    let _ = engine.unpause(handle).await;
-                                    throttle_paused.remove(&t.id);
-                                    per_torrent_last_change.insert(t.id, now);
-                                }
-                            }
-                        }
-                    }
-
-                    if upload_limit_bps > 0 {
-                        let current_ul_speed: u64 = snapshot.iter().map(|t| t.upload_speed).sum();
-                        let ul_delta = (current_ul_speed as f64 * elapsed_secs) + prev_ul_estimated;
-                        let ul_delta_whole = ul_delta as i64;
-                        prev_ul_estimated = ul_delta - ul_delta_whole as f64;
-
-                        ul_tokens = ul_tokens
-                            .saturating_add((upload_limit_bps as f64 * elapsed_secs) as i64)
-                            .saturating_sub(ul_delta_whole)
-                            .min(upload_limit_bps as i64);
-
-                        let unpause_threshold =
-                            (upload_limit_bps as f64 * UNPAUSE_HYSTERESIS) as i64;
-
-                        if ul_tokens < 0 {
-                            for t in &snapshot {
-                                // A finished torrent is the only kind that is
-                                // purely uploading, so the upload cap has to
-                                // cover it or it does nothing for seeding.
-                                if matches!(
-                                    t.status,
-                                    TorrentStatus::Downloading
-                                        | TorrentStatus::Complete
-                                        | TorrentStatus::Seeding
-                                ) && !user_paused.contains(&t.id)
-                                    && !ul_throttle_paused.contains(&t.id)
-                                    && !throttle_paused.contains(&t.id)
-                                {
-                                    if let Some(handle) = handle_map.get(&t.id) {
-                                        let _ = engine.pause(handle).await;
-                                        ul_throttle_paused.insert(t.id);
-                                        throttle_managed.insert(t.id);
-                                        per_torrent_last_change.insert(t.id, now);
-                                    }
-                                }
-                            }
-                        } else if ul_tokens > unpause_threshold {
-                            // Symmetric unpause, but only of what *this* bucket
-                            // paused, and only when the download bucket is not
-                            // still overdrawn. Releasing from the shared set
-                            // used to hand back torrents the download limit had
-                            // just paused, ten times a second.
-                            for t in &snapshot {
-                                if ul_throttle_paused.contains(&t.id)
-                                    && !user_paused.contains(&t.id)
-                                    && per_torrent_tokens.get(&t.id).copied().unwrap_or(0) >= 0
-                                {
-                                    if let Some(handle) = handle_map.get(&t.id) {
-                                        let _ = engine.unpause(handle).await;
-                                        ul_throttle_paused.remove(&t.id);
-                                        per_torrent_last_change.insert(t.id, now);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    for t in &snapshot {
-                        if matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding) {
-                            throttle_managed.remove(&t.id);
-                            throttle_paused.remove(&t.id);
-                            per_torrent_tokens.remove(&t.id);
-                            per_torrent_prev_bytes.remove(&t.id);
-                            per_torrent_last_change.remove(&t.id);
-                            cached_upload_speed.remove(&t.id);
-                            speed_tracker.remove(&t.id);
-                        }
-                    }
-
-                    let current_ids: HashSet<usize> = snapshot.iter().map(|t| t.id).collect();
-                    throttle_paused.retain(|id| current_ids.contains(id));
-                    ul_throttle_paused.retain(|id| current_ids.contains(id));
-                    throttle_managed.retain(|id| current_ids.contains(id));
-                    user_paused.retain(|id| current_ids.contains(id));
-                    per_torrent_tokens.retain(|id, _| current_ids.contains(id));
-                    per_torrent_prev_bytes.retain(|id, _| current_ids.contains(id));
-                    per_torrent_last_change.retain(|id, _| current_ids.contains(id));
-                }
-
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id).await;
+            _ = state_tick.tick() => {
+                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, enable_notifications, detail_torrent_id).await;
             }
-        }
-    }
-
-    // Release our own pauses before exiting. librqbit persists `is_paused`,
-    // so a torrent caught mid duty cycle would come back Paused on the next
-    // launch — and the adopt loop only picks up `Downloading`, so nothing
-    // would ever resume it.
-    for id in throttle_paused.drain().chain(ul_throttle_paused.drain()) {
-        if let Some(handle) = engine.get_handle(id) {
-            let _ = engine.unpause(&handle).await;
         }
     }
 
@@ -1623,24 +1206,34 @@ mod tests {
     }
 
     #[test]
-    fn step_bucket_credits_then_debits() {
-        // 1 MB/s rate, 0.1s elapsed -> credit ~100_000; debit 50_000.
-        let next = step_bucket(0, 1_000_000, 0.1, 50_000);
-        assert_eq!(next, 50_000);
+    fn speed_limit_zero_means_unlimited() {
+        assert_eq!(speed_limit_bps(0), None);
     }
 
     #[test]
-    fn step_bucket_caps_at_burst() {
-        // Even with a huge previous balance, cap at 2 * rate.
-        let next = step_bucket(i64::MAX, 1_000, 0.1, 0);
-        assert_eq!(next, 2_000);
+    fn speed_limit_converts_kib_not_kilo_or_megabit() {
+        // Config "KB/s" means KiB/s: ×1024 to bytes/sec — not ×1000, and not
+        // a megabit conversion. Getting this wrong is the #46 bug class.
+        assert_eq!(speed_limit_bps(1024).map(|v| v.get()), Some(1024 * 1024));
+        assert_eq!(speed_limit_bps(16).map(|v| v.get()), Some(16 * 1024));
     }
 
     #[test]
-    fn step_bucket_can_go_negative() {
-        // Spent more than credited — expected, drives the pause decision.
-        let next = step_bucket(0, 100, 0.1, 1_000);
-        assert!(next < 0);
+    fn speed_limit_floors_at_one_chunk_per_second() {
+        // librqbit acquires limiter permits in whole 16 KiB chunks; a quota
+        // below one chunk/sec makes governor kill the peer task instead of
+        // pacing it. 1 KB/s must clamp up to 16 KiB/s, not pass through.
+        assert_eq!(speed_limit_bps(1).map(|v| v.get()), Some(16 * 1024));
+        assert_eq!(speed_limit_bps(15).map(|v| v.get()), Some(16 * 1024));
+    }
+
+    #[test]
+    fn speed_limit_never_overflows_the_limiter_quota() {
+        // The limiter quota is a NonZeroU32 of bytes/sec; the shared cap must
+        // keep kbps × 1024 inside it (and huge inputs must not panic).
+        let max = speed_limit_bps(u64::MAX).map(|v| v.get()).unwrap_or(0);
+        assert!(max > 0);
+        assert_eq!(u64::from(max), crate::clamped_speed_limit(u64::MAX) * 1024);
     }
 
     #[test]
