@@ -259,6 +259,8 @@ bind_interface = ""           # bind all BitTorrent traffic to an interface, e.g
 
 Paths (`download_dir`, `watch_dir`, `player.command`) may start with `~/`, which expands to your home directory.
 
+The `[privacy]` keys are all off by default and opt-in. See [Privacy](#privacy) for exactly what each one does and its caveats, or jump to the copy-paste [recipes](#recipes).
+
 ### Watch folder
 
 Set `watch_dir` and any `.torrent` file dropped there is added automatically,
@@ -291,6 +293,37 @@ A few defaults worth knowing:
 - **Search queries go to the indexers you enable.** Pressing `Enter` on a search sends the query text (nothing else — no identifiers, accounts, or keys) over HTTPS to `apibay.org` and/or `torrents-csv.com`. No request is made until you submit a search, and either provider can be disabled in `[search]`; disabling both turns the feature off entirely. Queries are not written to the log at the default filter. When `privacy.proxy_url` is set, these queries also go through the proxy.
 - **Notifications.** Control characters are stripped from torrent names at the engine boundary, and names are additionally Pango-escaped before reaching the Linux notification daemon. macOS plays a sound instead of sending a notification, so no name leaves the process there. Disable entirely with `ui.enable_notifications = false`.
 - **HTTP streaming API is loopback-only and authenticated.** The embedded API used for the `s` stream keybinding binds to `127.0.0.1:0`, is mounted read-only, and requires HTTP basic auth with a random password generated per run. The credentials ride in the stream URL handed to your media player, which means they are visible in that process's argv while it runs. Changing `network.http_api_bind` to a routable interface sends those credentials over plaintext HTTP — do this only on a trusted LAN.
+
+### Recipes
+
+Copy one of these into the `[privacy]` block of your `config.toml` (see [Configuration](#configuration) for where that file lives). Every `[privacy]` key is applied when the session starts, so **restart TorrentTUI after editing**. Each recipe states the essentials; follow the link for the full behavior and caveats.
+
+**Route all BitTorrent traffic through a VPN interface** — the most complete option:
+
+```toml
+[privacy]
+bind_interface = "wg0"   # WireGuard on Linux; use "utun3"/"tun0" as appropriate — check `ip addr` / `ifconfig`
+```
+
+Pins *every* protocol — DHT, UDP **and** HTTP trackers, peer connections, LSD — to that interface, so if the VPN drops, traffic fails instead of escaping via your default route. **macOS/Linux only:** any value makes the app refuse to start on Windows, and startup also fails on an unknown interface name. Indexer search is *not* interface-bound (it follows the OS routing table, which is your VPN only when that is the default route). See the VPN notes under [SOCKS5 proxy](#socks5-proxy).
+
+**Route through a local SOCKS5 proxy (e.g. Tor on `127.0.0.1:9050`)** — lockdown mode:
+
+```toml
+[privacy]
+proxy_url = "socks5://127.0.0.1:9050"   # socks5:// only; prefix user:pass@ if the proxy needs auth
+```
+
+Outgoing peer connections, HTTP(S) tracker announces, and indexer search (auto-upgraded to `socks5h://` so DNS resolves proxy-side too) go through the proxy. DHT, incoming/uTP/UPnP and LSD are disabled, `udp://` trackers are stripped from magnets, and the watch folder is turned off; a green `[proxy]` badge appears once the session is locked down. **Not covered:** `udp://` trackers embedded inside `.torrent` files still announce directly (prefer magnets), and the torrent client still resolves tracker hostnames through your system DNS. See [SOCKS5 proxy](#socks5-proxy).
+
+**Block known-bad peers from a local blocklist file** — combine with either option above:
+
+```toml
+[privacy]
+blocklist_url = "~/lists/blocklist.p2p"   # PeerGuardian .p2p, plain or gzipped
+```
+
+Filters **both incoming and outgoing** peer connections. Loaded once at startup and **fail-closed**: if the file can't be read or parses to zero ranges the app exits rather than run unprotected, and the startup line reports how many ranges loaded. Prefer a **local file** over an `http(s)://` URL whenever `proxy_url` or `bind_interface` is set — a remote list is fetched by a client bound to neither, so it would escape your proxy/VPN. See [IP blocklist](#ip-blocklist).
 
 ### SOCKS5 proxy
 
