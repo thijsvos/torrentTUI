@@ -658,6 +658,85 @@ async fn start_http_api(
     ))
 }
 
+/// True for librqbit's "redundant transition" errors — `pause` on a paused
+/// torrent ("torrent is already paused") and `unpause` on a live one
+/// ("torrent is already live"). These are the *normal* outcome of bulk
+/// toggles, not failures: `p` on a mixed marked set and `P`/`R` on a mixed
+/// session deliberately send the whole set and let the engine sort it out.
+/// Matched on the message text because librqbit raises them via `bail!` with
+/// no dedicated variant; the worst a wording change upstream can cause is a
+/// spurious warning, never a hidden failure.
+fn is_benign_state_error(msg: &str) -> bool {
+    msg.contains("already live") || msg.contains("already paused")
+}
+
+/// One status-bar line for a failed bulk operation. The status bar renders a
+/// single unwrapped line and the message channel is bounded, so a batch gets
+/// exactly one summary — count plus the first error — never one send per id.
+fn bulk_op_error_message(op: &str, failed: usize, first_err: &str) -> String {
+    format!(
+        "\u{26a0} {} failed for {} torrent(s): {}",
+        op, failed, first_err
+    )
+}
+
+/// Failure accumulator for one bulk pause/resume batch — see
+/// [`bulk_op_error_message`] for the reporting contract and
+/// [`is_benign_state_error`] for why redundant transitions don't count.
+#[derive(Default)]
+struct BulkOpFailures {
+    failed: usize,
+    first_err: String,
+}
+
+impl BulkOpFailures {
+    fn record(&mut self, op: &str, id: usize, res: Result<()>) {
+        let Err(e) = res else { return };
+        let msg = e.to_string();
+        if is_benign_state_error(&msg) {
+            tracing::debug!("{} skipped for torrent {}: {}", op, id, msg);
+            return;
+        }
+        tracing::error!("{} failed for torrent {}: {}", op, id, msg);
+        if self.failed == 0 {
+            self.first_err = msg;
+        }
+        self.failed += 1;
+    }
+
+    async fn report(&self, op: &str, msg_tx: &mpsc::Sender<String>) {
+        if self.failed > 0 {
+            let _ = msg_tx
+                .send(bulk_op_error_message(op, self.failed, &self.first_err))
+                .await;
+        }
+    }
+}
+
+/// Surface a failed engine operation on the status bar as well as in the log.
+/// Pause/resume failures used to be log-only, which made a failed `p` look
+/// like a dead key: the default `torrenttui=warn` filter writes to a file
+/// nobody is watching while the UI shows nothing. Mirrors the message shape
+/// the Delete handler already uses. Benign redundant-transition errors (a
+/// double-tapped `p` racing the next state push) are logged at debug and not
+/// shown — see [`is_benign_state_error`].
+async fn report_op_error(
+    op: &str,
+    id: usize,
+    e: &impl std::fmt::Display,
+    msg_tx: &mpsc::Sender<String>,
+) {
+    let msg = e.to_string();
+    if is_benign_state_error(&msg) {
+        tracing::debug!("{} skipped for torrent {}: {}", op, id, msg);
+        return;
+    }
+    tracing::error!("{} failed for torrent {}: {}", op, id, msg);
+    let _ = msg_tx
+        .send(format!("\u{26a0} {} failed: {}", op, msg))
+        .await;
+}
+
 /// Spawn a background task that deletes the watch-folder files which fed the
 /// torrents identified by `hashes`, and reap any previously finished ones off
 /// `tasks`. Returns immediately — the deletion has not happened yet. A silent
@@ -972,14 +1051,14 @@ pub async fn run_engine(
                     Some(EngineCommand::Pause(id)) => {
                         if let Some(handle) = engine.get_handle(id) {
                             if let Err(e) = engine.pause(&handle).await {
-                                tracing::error!("Failed to pause torrent {}: {}", id, e);
+                                report_op_error("Pause", id, &e, &msg_tx).await;
                             }
                         }
                     }
                     Some(EngineCommand::Resume(id)) => {
                         if let Some(handle) = engine.get_handle(id) {
                             if let Err(e) = engine.unpause(&handle).await {
-                                tracing::error!("Failed to resume torrent {}: {}", id, e);
+                                report_op_error("Resume", id, &e, &msg_tx).await;
                             }
                         }
                     }
@@ -1022,13 +1101,13 @@ pub async fn run_engine(
                         // id made a bulk action O(M*N) with M lock acquisitions.
                         let handles: HashMap<usize, ManagedTorrentHandle> =
                             engine.handle_snapshot().into_iter().collect();
+                        let mut failures = BulkOpFailures::default();
                         for id in ids {
                             if let Some(handle) = handles.get(&id) {
-                                if let Err(e) = engine.pause(handle).await {
-                                    tracing::error!("Failed to pause torrent {}: {}", id, e);
-                                }
+                                failures.record("Pause", id, engine.pause(handle).await);
                             }
                         }
+                        failures.report("Pause", &msg_tx).await;
                     }
                     Some(EngineCommand::ResumeMany(ids)) => {
                         // One snapshot, then O(1) lookups. `get_handle` is a
@@ -1036,13 +1115,13 @@ pub async fn run_engine(
                         // id made a bulk action O(M*N) with M lock acquisitions.
                         let handles: HashMap<usize, ManagedTorrentHandle> =
                             engine.handle_snapshot().into_iter().collect();
+                        let mut failures = BulkOpFailures::default();
                         for id in ids {
                             if let Some(handle) = handles.get(&id) {
-                                if let Err(e) = engine.unpause(handle).await {
-                                    tracing::error!("Failed to resume torrent {}: {}", id, e);
-                                }
+                                failures.record("Resume", id, engine.unpause(handle).await);
                             }
                         }
+                        failures.report("Resume", &msg_tx).await;
                     }
                     Some(EngineCommand::DeleteMany { ids, delete_files }) => {
                         // One snapshot for the whole batch, before any
@@ -1085,14 +1164,23 @@ pub async fn run_engine(
                         }
                     }
                     Some(EngineCommand::PauseAll) => {
-                        for (_, handle) in engine.handle_snapshot() {
-                            let _ = engine.pause(&handle).await;
+                        // Pauses every handle and lets the benign-error filter
+                        // absorb the already-paused ones — real failures get
+                        // the same single-summary treatment as PauseMany.
+                        let mut failures = BulkOpFailures::default();
+                        for (id, handle) in engine.handle_snapshot() {
+                            failures.record("Pause", id, engine.pause(&handle).await);
                         }
+                        failures.report("Pause", &msg_tx).await;
                     }
                     Some(EngineCommand::ResumeAll) => {
-                        for (_, handle) in engine.handle_snapshot() {
-                            let _ = engine.unpause(&handle).await;
+                        // See PauseAll — already-live errors are the normal
+                        // case for a blanket resume.
+                        let mut failures = BulkOpFailures::default();
+                        for (id, handle) in engine.handle_snapshot() {
+                            failures.record("Resume", id, engine.unpause(&handle).await);
                         }
+                        failures.report("Resume", &msg_tx).await;
                     }
                     Some(EngineCommand::SetSpeedLimits { download_kbps, upload_kbps }) => {
                         engine.set_speed_limits(download_kbps, upload_kbps);
@@ -1160,6 +1248,69 @@ pub async fn run_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn report_op_error_reaches_the_status_channel() {
+        let (tx, mut rx) = mpsc::channel(16);
+        report_op_error("Pause", 3, &"boom", &tx).await;
+        assert_eq!(rx.recv().await.unwrap(), "\u{26a0} Pause failed: boom");
+    }
+
+    #[tokio::test]
+    async fn report_op_error_stays_quiet_on_redundant_transitions() {
+        // A double-tapped `p` racing the next state push makes librqbit bail
+        // with "torrent is already paused" — success from the user's view.
+        let (tx, mut rx) = mpsc::channel(16);
+        report_op_error("Pause", 3, &"torrent is already paused", &tx).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn benign_state_errors_are_recognized() {
+        assert!(is_benign_state_error("torrent is already paused"));
+        assert!(is_benign_state_error("torrent is already live"));
+        assert!(!is_benign_state_error("disk full"));
+    }
+
+    #[test]
+    fn bulk_op_error_message_shape_is_pinned() {
+        assert_eq!(
+            bulk_op_error_message("Resume", 2, "boom"),
+            "\u{26a0} Resume failed for 2 torrent(s): boom"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_failures_send_one_summary_with_the_first_real_error() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut failures = BulkOpFailures::default();
+        failures.record("Resume", 0, Ok(()));
+        // Benign redundant transition: the normal case for a mixed `p` batch,
+        // must not count as a failure.
+        failures.record("Resume", 1, Err(anyhow::anyhow!("torrent is already live")));
+        failures.record("Resume", 2, Err(anyhow::anyhow!("boom")));
+        failures.record("Resume", 3, Err(anyhow::anyhow!("later")));
+        failures.report("Resume", &tx).await;
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            "\u{26a0} Resume failed for 2 torrent(s): boom"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one summary per batch");
+    }
+
+    #[tokio::test]
+    async fn bulk_report_sends_nothing_without_real_failures() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut failures = BulkOpFailures::default();
+        failures.record("Pause", 0, Ok(()));
+        failures.record(
+            "Pause",
+            1,
+            Err(anyhow::anyhow!("torrent is already paused")),
+        );
+        failures.report("Pause", &tx).await;
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn pick_listen_port_skips_taken_port() {

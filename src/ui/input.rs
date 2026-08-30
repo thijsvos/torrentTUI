@@ -8,6 +8,11 @@ use ratatui::{
 
 const PLACEHOLDER: &str = "magnet:?xt=urn:btih:... or /path/to/file.torrent";
 
+/// Cap on the add-torrent buffer. Magnet links with a long tracker list run
+/// 1–2 KB, so this leaves generous headroom while keeping an accidental
+/// paste of the wrong clipboard buffer from growing the string unbounded.
+const MAX_INPUT_CHARS: usize = 4096;
+
 pub struct InputWidget {
     buffer: String,
 }
@@ -37,17 +42,28 @@ impl InputWidget {
         // Reject control chars (e.g. \x1b from an OSC sequence, \x07 BEL,
         // raw newlines from a multi-line paste). Tabs are also dropped here
         // since the input is a single-line magnet/path.
-        if c.is_control() {
+        if c.is_control() || self.buffer.chars().count() >= MAX_INPUT_CHARS {
             return;
         }
         self.buffer.push(c);
     }
 
     /// Push a string (e.g. the payload of a bracketed-paste event), filtering
-    /// control characters character-by-character.
+    /// control characters character-by-character. Tracks the length locally
+    /// and breaks at the cap: routing a multi-megabyte paste through `push`
+    /// would recount the whole buffer per character — O(paste × cap) on the
+    /// event loop, the same freeze class the cap exists to prevent.
     pub fn push_str(&mut self, s: &str) {
+        let mut len = self.buffer.chars().count();
         for c in s.chars() {
-            self.push(c);
+            if len >= MAX_INPUT_CHARS {
+                break;
+            }
+            if c.is_control() {
+                continue;
+            }
+            self.buffer.push(c);
+            len += 1;
         }
     }
 
@@ -142,6 +158,16 @@ mod tests {
     fn input_buffer_starts_empty() {
         let w = InputWidget::new();
         assert_eq!(w.value(), "");
+    }
+
+    #[test]
+    fn push_caps_the_buffer() {
+        let mut w = InputWidget::new();
+        w.push_str(&"m".repeat(MAX_INPUT_CHARS + 100));
+        assert_eq!(w.value().chars().count(), MAX_INPUT_CHARS);
+        // Still capped one char at a time as well.
+        w.push('x');
+        assert_eq!(w.value().chars().count(), MAX_INPUT_CHARS);
     }
 
     #[test]
