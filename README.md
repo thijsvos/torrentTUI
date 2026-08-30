@@ -147,7 +147,8 @@ documentation cannot drift from the real bindings.
 Press `s`, type what you're looking for (e.g. `arch linux iso`), and hit
 `Enter`. TorrentTUI queries two public indexer APIs — [apibay](https://apibay.org)
 (The Pirate Bay) and [torrents-csv](https://torrents-csv.com) — merges and
-dedups the results, and lists them by seeder count. Press `Enter` on a result
+dedups the results, and lists them by seeder count — press `Tab` to sort by
+size, title, or leechers instead. Press `Enter` on a result
 and it starts downloading immediately; the magnet link is built locally from
 the result's info hash, so nothing is copied or pasted. No Prowlarr, Jackett,
 accounts, or API keys involved. Both providers can be toggled off in
@@ -157,6 +158,8 @@ accounts, or API keys involved. Both providers can be toggled off in
 |-----|--------|
 | `Enter` | Download the selected result (stays in results for multi-grab) |
 | `j` / `k` (or `↓` / `↑`) | Move selection down/up |
+| `Tab` | Cycle sort column (Seeders → Size → Title → Leechers) |
+| `R` | Reverse sort order |
 | `s` | Edit the query (pre-filled) |
 | `r` | Retry the same query |
 | `Esc` / `q` | Back to the torrent list (results are kept) |

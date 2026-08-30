@@ -63,13 +63,31 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let header = Row::new(["", "Title", "Size", "Seed", "Leech", "Source"].map(|h| {
-        Cell::from(h).style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-    }))
+    // Sort indicator on the active column, same language as the torrent
+    // table: ▼ descending, ▲ ascending.
+    let sort_index = app.search.sort_column.column_index();
+    let arrow = if app.result_sort_descending() {
+        "\u{25bc}"
+    } else {
+        "\u{25b2}"
+    };
+    let header = Row::new(
+        ["", "Title", "Size", "Seed", "Leech", "Source"]
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let label = if i == sort_index {
+                    format!("{} {}", h, arrow)
+                } else {
+                    h.to_string()
+                };
+                Cell::from(label).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }),
+    )
     .height(1);
 
     let rows: Vec<Row> = app
@@ -100,8 +118,8 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(2),  // added mark
             Constraint::Min(20),    // Title
             Constraint::Length(10), // Size
-            Constraint::Length(6),  // Seeders
-            Constraint::Length(6),  // Leechers
+            Constraint::Length(7),  // Seeders (room for the sort arrow)
+            Constraint::Length(8),  // Leechers (room for the sort arrow)
             Constraint::Length(7),  // Source
         ],
     )
@@ -160,6 +178,41 @@ mod tests {
             leechers: 0,
             source: SourceSet::default(),
         }
+    }
+
+    #[test]
+    fn header_marks_the_sorted_column_with_a_direction_arrow() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = app_with_results(vec![result()]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+
+        let screen = |t: &Terminal<TestBackend>| -> String {
+            t.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        terminal
+            .draw(|f| render_search_view(f, f.area(), &mut app))
+            .unwrap();
+        assert!(screen(&terminal).contains("Seed \u{25bc}"));
+
+        app.cycle_result_sort(); // -> Size, natural descending
+        terminal
+            .draw(|f| render_search_view(f, f.area(), &mut app))
+            .unwrap();
+        let s = screen(&terminal);
+        assert!(s.contains("Size \u{25bc}"), "{s}");
+        assert!(!s.contains("Seed \u{25bc}"));
+
+        app.reverse_result_sort();
+        terminal
+            .draw(|f| render_search_view(f, f.area(), &mut app))
+            .unwrap();
+        assert!(screen(&terminal).contains("Size \u{25b2}"));
     }
 
     #[test]

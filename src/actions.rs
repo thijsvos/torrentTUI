@@ -48,6 +48,8 @@ pub enum ActionId {
     DownloadResult,
     EditQuery,
     RetrySearch,
+    CycleResultSort,
+    ReverseResultSort,
     SearchBack,
 }
 
@@ -396,6 +398,30 @@ pub const ACTIONS: &[ActionInfo] = &[
         available: always,
     },
     ActionInfo {
+        id: Some(ActionId::CycleResultSort),
+        scope: Scope::SearchResults,
+        section: Section::Search,
+        keys: "`Tab`",
+        description: "Cycle sort column (Seeders → Size → Title → Leechers)",
+        short: Some("Cycle result sort column"),
+        hint: Some("Tab:sort"),
+        hint_when_empty: false,
+        in_palette: true,
+        available: has_search_result,
+    },
+    ActionInfo {
+        id: Some(ActionId::ReverseResultSort),
+        scope: Scope::SearchResults,
+        section: Section::Search,
+        keys: "`R`",
+        description: "Reverse sort order",
+        short: Some("Reverse result sort order"),
+        hint: None,
+        hint_when_empty: false,
+        in_palette: true,
+        available: has_search_result,
+    },
+    ActionInfo {
         id: Some(ActionId::EditQuery),
         scope: Scope::SearchResults,
         section: Section::Search,
@@ -639,7 +665,7 @@ mod tests {
         let search = hint_line(Scope::SearchResults, false);
         assert_eq!(
             search,
-            "Enter:download  j/k:navigate  s:edit query  r:retry  Esc:back"
+            "Enter:download  j/k:navigate  Tab:sort  s:edit query  r:retry  Esc:back"
         );
     }
 
