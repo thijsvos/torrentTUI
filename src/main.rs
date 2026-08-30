@@ -194,7 +194,11 @@ async fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
+        // Alternate format prints the whole context chain — for a privacy
+        // startup failure the actionable part ("error reading blocklist from
+        // …", "error creating bind device …") is librqbit's inner context,
+        // which plain `{}` would hide.
+        eprintln!("Error: {:#}", e);
     }
 
     Ok(())
@@ -265,6 +269,7 @@ async fn run_app(
     app.player_config = config.player.clone();
     app.watch_dir_configured = config.general.watch_dir.is_some();
     app.search_config = config.search.clone();
+    app.search_proxy_url = config.privacy.proxy_url().map(str::to_string);
     app.download_dir = config.general.download_dir.clone();
 
     if let Some(msg) = config_warning {
@@ -293,18 +298,24 @@ async fn run_app(
     // Keep the JoinHandle so we can both detect engine death mid-run and
     // await its persistence flush on shutdown. Wrapped in Option so we can
     // consume it from either path.
-    let mut engine_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
-        if let Err(e) =
+    // The handle carries run_engine's Result so a startup failure (bad
+    // [privacy] settings, unreadable blocklist, unknown bind interface)
+    // reaches stderr with its full context chain — logging it and exiting
+    // with a generic message left the user no clue why the app refused to
+    // start.
+    let mut engine_handle: Option<tokio::task::JoinHandle<Result<()>>> =
+        Some(tokio::spawn(async move {
             engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx, info_tx).await
-        {
-            tracing::error!("Engine error: {}", e);
-        }
-    }));
+        }));
 
     if let Some(ref source) = cli.torrent_source {
-        // Same tilde story as --download-dir; magnet links never start with
-        // `~` so expansion is a no-op for them.
-        let source = config::expand_tilde(source);
+        // Trim before anything else: the engine's proxy-mode udp-tracker strip
+        // gates on `source.starts_with("magnet:?")`, so a CLI arg with leading
+        // whitespace (`torrenttui " magnet:?..."`) would otherwise skip
+        // stripping yet still be added as a magnet with its udp trackers
+        // intact. Same tilde story as --download-dir; magnets never start with
+        // `~`, so expansion is a no-op for them.
+        let source = config::expand_tilde(source.trim());
         match validate_torrent_source(&source) {
             Ok(()) => {
                 send_cmd(&cmd_tx, EngineCommand::AddTorrent(source), &mut app).await;
@@ -323,6 +334,7 @@ async fn run_app(
     ));
     let mut needs_render = true;
     let mut engine_died = false;
+    let mut engine_error: Option<anyhow::Error> = None;
 
     loop {
         // Detect engine death: previously a panic in the spawned task would
@@ -331,12 +343,19 @@ async fn run_app(
         if engine_handle.as_ref().is_some_and(|h| h.is_finished()) {
             if let Some(h) = engine_handle.take() {
                 match h.await {
-                    Ok(()) => tracing::info!("Engine task ended"),
+                    Ok(Ok(())) => tracing::info!("Engine task ended"),
+                    Ok(Err(e)) => {
+                        tracing::error!("Engine error: {:#}", e);
+                        engine_error = Some(e);
+                    }
                     Err(e) => tracing::error!("Engine task panicked: {}", e),
                 }
             }
             if !app.should_quit {
-                app.set_error("Engine task ended unexpectedly; quitting".to_string());
+                app.set_error(match engine_error.as_ref() {
+                    Some(e) => format!("Engine failed: {:#}; quitting", e),
+                    None => "Engine task ended unexpectedly; quitting".to_string(),
+                });
                 app.should_quit = true;
                 // Without this the loop can quit without ever drawing the
                 // message, so the TUI just vanishes. The Err below is what
@@ -375,7 +394,7 @@ async fn run_app(
             terminal.draw(|f| {
                 let chunks = ui::layout::get_layout(f.area());
 
-                ui::layout::render_header(f, chunks[0]);
+                ui::layout::render_header(f, chunks[0], &app);
 
                 // While the palette overlay is open, the main area keeps
                 // showing the view it opened over.
@@ -477,7 +496,9 @@ async fn run_app(
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
             }
             return if engine_died {
-                Err(anyhow::anyhow!("engine task ended unexpectedly"))
+                Err(engine_error
+                    .take()
+                    .unwrap_or_else(|| anyhow::anyhow!("engine task ended unexpectedly")))
             } else {
                 Ok(())
             };
@@ -876,15 +897,31 @@ async fn handle_input_mode(
 
 /// Build the shared HTTP client for indexer searches. `https_only` because
 /// both providers are HTTPS and a downgrade would leak queries in plaintext;
-/// an explicit User-Agent because an empty one is a common WAF block.
-fn build_search_client(config: &config::SearchConfig) -> reqwest::Result<reqwest::Client> {
+/// an explicit User-Agent because an empty one is a common WAF block. In
+/// proxy mode the queries ride the same SOCKS5 proxy as the torrent traffic
+/// — otherwise a search would hand the indexer the real address the proxy
+/// exists to withhold.
+fn build_search_client(
+    config: &config::SearchConfig,
+    proxy_url: Option<&str>,
+) -> reqwest::Result<reqwest::Client> {
     let timeout = std::time::Duration::from_secs(config.timeout_secs.clamp(1, 30));
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .https_only(true)
         .timeout(timeout)
         .connect_timeout(timeout.min(std::time::Duration::from_secs(5)))
-        .user_agent(concat!("torrenttui/", env!("CARGO_PKG_VERSION")))
-        .build()
+        .user_agent(concat!("torrenttui/", env!("CARGO_PKG_VERSION")));
+    if let Some(url) = proxy_url {
+        // socks5h = resolve hostnames on the proxy side. Plain socks5 would
+        // resolve apibay.org/torrents-csv.com through the system resolver
+        // first, telling the local DNS server which indexers are in use —
+        // the socks5h swap keeps even the lookup behind the proxy. (librqbit
+        // accepts only socks5:// for its side, so the config stores that and
+        // the upgrade happens here.)
+        let url = url.replacen("socks5://", "socks5h://", 1);
+        builder = builder.proxy(reqwest::Proxy::all(url)?);
+    }
+    builder.build()
 }
 
 /// Fire (or with `retry` re-fire) a search from the current App state and
@@ -902,7 +939,7 @@ fn start_search(
         return;
     }
     if search_client.is_none() {
-        match build_search_client(&app.search_config) {
+        match build_search_client(&app.search_config, app.search_proxy_url.as_deref()) {
             Ok(client) => *search_client = Some(client),
             Err(e) => {
                 tracing::debug!("search client build failed: {e}");
@@ -1423,6 +1460,22 @@ fn apply_engine_info(app: &mut App, info: EngineInfo) {
     match info {
         EngineInfo::HttpApiReady { base_url } => {
             app.http_api_base = Some(base_url);
+        }
+        EngineInfo::Privacy(status) => {
+            // One startup line saying what actually applied; the header badge
+            // carries the ongoing reminder.
+            let mut parts = Vec::new();
+            if status.proxy {
+                parts.push("SOCKS5 proxy (DHT/listener/LSD off)".to_string());
+            }
+            if let Some(ref iface) = status.bind_interface {
+                parts.push(format!("bound to {}", iface));
+            }
+            if let Some(ranges) = status.blocklist_ranges {
+                parts.push(format!("blocklist: {} ranges", ranges));
+            }
+            app.set_info(format!("Privacy active: {}", parts.join(" \u{b7} ")));
+            app.privacy = Some(status);
         }
     }
 }
@@ -2042,6 +2095,25 @@ mod tests {
         handle_open_folder(&mut app);
         assert!(app.info_message.is_none());
         assert!(app.error_message.is_none());
+    }
+
+    #[test]
+    fn privacy_report_sets_the_badge_state_and_a_startup_message() {
+        use crate::engine::torrent::PrivacyStatus;
+        let mut app = App::new();
+        assert!(app.privacy.is_none());
+        apply_engine_info(
+            &mut app,
+            EngineInfo::Privacy(PrivacyStatus {
+                proxy: true,
+                bind_interface: None,
+                blocklist_ranges: Some(1234),
+            }),
+        );
+        assert!(app.privacy.as_ref().is_some_and(|p| p.proxy));
+        let info = app.info_message.as_deref().unwrap_or_default();
+        assert!(info.contains("Privacy active"), "got: {info}");
+        assert!(info.contains("blocklist: 1234 ranges"), "got: {info}");
     }
 
     #[test]

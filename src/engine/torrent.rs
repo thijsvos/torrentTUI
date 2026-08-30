@@ -25,8 +25,9 @@ use librqbit::{
     dht::Id20,
     http_api::{HttpApi, HttpApiOptions},
     limits::LimitsConfig,
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListenerOptions,
-    ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions, DhtSessionConfig,
+    ListenerOptions, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
+    TorrentStatsState,
 };
 use librqbit_dualstack_sockets::{BindOpts, TcpListener};
 use std::collections::{HashMap, HashSet};
@@ -90,9 +91,9 @@ const STATE_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 // ---------------------------------------------------------------------------
 
 /// One-shot facts the engine pushes to the UI outside the per-tick state
-/// snapshot — currently just the HTTP API base URL, but the channel exists so
-/// future engine→UI metadata (listening port, DHT status, etc.) has a place
-/// to land without bloating the per-tick `Vec<TorrentInfo>`.
+/// snapshot — the HTTP API base URL and the privacy posture; the channel
+/// exists so future engine→UI metadata (listening port, DHT status, etc.)
+/// has a place to land without bloating the per-tick `Vec<TorrentInfo>`.
 #[derive(Debug, Clone)]
 pub enum EngineInfo {
     /// The embedded HTTP API is listening on this base URL (e.g.
@@ -101,6 +102,24 @@ pub enum EngineInfo {
     /// keeps `http_api_base = None`, so `s` reports "Streaming API not ready
     /// yet" instead of opening a player.
     HttpApiReady { base_url: String },
+    /// Which `[privacy]` features the session actually started with. Sent
+    /// once at engine startup, and only when at least one is active — the
+    /// header badge and the startup status message both render from it, so
+    /// they reflect the running session rather than a parsed config that
+    /// might have failed to apply.
+    Privacy(PrivacyStatus),
+}
+
+/// The active privacy posture, as applied at session creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivacyStatus {
+    /// A SOCKS5 proxy is carrying outgoing peer + HTTP tracker traffic (and
+    /// the session is locked down: no DHT, no listener/UPnP, no LSD).
+    pub proxy: bool,
+    /// All BitTorrent sockets are bound to this interface.
+    pub bind_interface: Option<String>,
+    /// A blocklist is active, with this many loaded ranges.
+    pub blocklist_ranges: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -158,11 +177,118 @@ struct WatchCleanup {
 }
 
 /// Thin wrapper over librqbit's `Session` — lookups, passthroughs and snapshot
-/// building, with no state of its own. Even the speed limits live inside the
-/// session (`session.ratelimits`), so a second `TorrentEngine` over the same
-/// session would just be another view of the same engine.
+/// building, with no state of its own beyond startup facts. Even the speed
+/// limits live inside the session (`session.ratelimits`), so a second
+/// `TorrentEngine` over the same session would just be another view of the
+/// same engine.
 pub struct TorrentEngine {
     session: Arc<Session>,
+    /// True when a SOCKS5 proxy is configured. The `AddTorrent` path strips
+    /// `udp://` trackers from magnets in this mode — a SOCKS5 proxy carries
+    /// TCP only, so a udp announce would go around it, straight to the
+    /// tracker, carrying the real address.
+    proxy_active: bool,
+    /// What `run_engine` reports to the UI at startup; `None` when no
+    /// privacy feature is configured.
+    privacy_status: Option<PrivacyStatus>,
+}
+
+/// The network shape derived from config — the privacy-critical decisions,
+/// pulled out of `Session::new_with_opts` (which needs a real session) so they
+/// can be unit-tested. `build_session_opts` turns this plus the rate limits
+/// into `SessionOptions`; `TorrentEngine::new` just calls both. Extracting this
+/// is what makes the proxy lockdown testable — a regression that re-enabled DHT
+/// or the listener under a proxy would otherwise ship silently.
+#[derive(Debug)]
+struct NetworkPlan {
+    dht: bool,
+    /// The listen port, or `None` to run with no incoming listener at all.
+    listen_port: Option<u16>,
+    upnp: bool,
+    disable_lsd: bool,
+    proxy_url: Option<String>,
+    blocklist_url: Option<String>,
+    bind_interface: Option<String>,
+}
+
+impl NetworkPlan {
+    /// Derive the plan from config, applying proxy lockdown. Fails on a proxy
+    /// URL whose scheme librqbit would reject, before any socket is touched.
+    fn from_config(config: &Config) -> Result<Self> {
+        let proxy_url = config
+            .privacy
+            .checked_proxy_url()
+            .map_err(|msg| anyhow::anyhow!(msg))?
+            .map(str::to_string);
+        let proxied = proxy_url.is_some();
+
+        // Proxy lockdown. A SOCKS5 proxy carries outgoing TCP only, so
+        // everything else would bypass it and expose the real address: DHT
+        // and UDP trackers are plain UDP, the listener accepts *direct*
+        // incoming connections (and its uTP socket and UPnP mapping exist
+        // only to invite them), and LSD multicasts on the LAN. Rather than
+        // ship a proxy that quietly leaks, proxy mode turns all of those off
+        // — even when the config says `enable_dht = true`.
+        Ok(Self {
+            dht: config.network.enable_dht && !proxied,
+            listen_port: (!proxied).then_some(config.network.listen_port),
+            upnp: config.network.enable_upnp && !proxied,
+            disable_lsd: proxied,
+            proxy_url,
+            blocklist_url: config.privacy.blocklist_url(),
+            bind_interface: config.privacy.bind_interface().map(str::to_string),
+        })
+    }
+
+    fn proxied(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
+    /// The status to report to the UI, or `None` when nothing privacy-related
+    /// is active. `blocklist_ranges` is filled in by the caller once the
+    /// session has loaded the list.
+    fn privacy_status(&self, blocklist_ranges: Option<usize>) -> Option<PrivacyStatus> {
+        let active =
+            self.proxied() || self.bind_interface.is_some() || self.blocklist_url.is_some();
+        active.then(|| PrivacyStatus {
+            proxy: self.proxied(),
+            bind_interface: self.bind_interface.clone(),
+            blocklist_ranges,
+        })
+    }
+}
+
+/// Build `SessionOptions` from a `NetworkPlan` and rate limits. The
+/// `pick_listen_port` probe (which binds a socket) is only run when the plan
+/// asks for a listener, so proxy mode touches no ports.
+fn build_session_opts(plan: &NetworkPlan, ratelimits: LimitsConfig) -> SessionOptions {
+    let listen = plan.listen_port.map(|port| ListenerOptions {
+        listen_addr: (Ipv6Addr::UNSPECIFIED, pick_listen_port(port)).into(),
+        enable_upnp_port_forwarding: plan.upnp,
+        ..Default::default()
+    });
+    SessionOptions {
+        dht: plan.dht.then(DhtSessionConfig::default),
+        fastresume: true,
+        persistence: Some(SessionPersistenceConfig::Json { folder: None }),
+        listen,
+        disable_local_service_discovery: plan.disable_lsd,
+        connect: plan.proxy_url.clone().map(|url| ConnectionOptions {
+            proxy_url: Some(url),
+            ..Default::default()
+        }),
+        // Fail-closed by design: librqbit errors out of session creation
+        // when the blocklist can't be fetched or the interface doesn't
+        // exist, and the app treats that as fatal — starting without a
+        // protection the user asked for would be worse than not starting.
+        blocklist_url: plan.blocklist_url.clone(),
+        bind_device_name: plan.bind_interface.clone(),
+        // Configured limits bite from the first byte: the limiter is part
+        // of the session, so torrents adopted from fastresume are capped
+        // before the first command ever arrives.
+        ratelimits,
+        ..Default::default()
+    }
 }
 
 impl TorrentEngine {
@@ -170,28 +296,64 @@ impl TorrentEngine {
         let download_dir = PathBuf::from(&config.general.download_dir);
         std::fs::create_dir_all(&download_dir)?;
 
-        let port = pick_listen_port(config.network.listen_port);
-        let opts = SessionOptions {
-            dht: config.network.enable_dht.then(DhtSessionConfig::default),
-            fastresume: true,
-            persistence: Some(SessionPersistenceConfig::Json { folder: None }),
-            listen: Some(ListenerOptions {
-                listen_addr: (Ipv6Addr::UNSPECIFIED, port).into(),
-                enable_upnp_port_forwarding: config.network.enable_upnp,
-                ..Default::default()
-            }),
-            // Configured limits bite from the first byte: the limiter is part
-            // of the session, so torrents adopted from fastresume are capped
-            // before the first command ever arrives.
-            ratelimits: LimitsConfig {
+        let plan = NetworkPlan::from_config(config)?;
+        let proxy_active = plan.proxied();
+        let opts = build_session_opts(
+            &plan,
+            LimitsConfig {
                 download_bps: speed_limit_bps(config.network.max_download_speed_kbps),
                 upload_bps: speed_limit_bps(config.network.max_upload_speed_kbps),
             },
-            ..Default::default()
-        };
+        );
 
-        let session = Session::new_with_opts(download_dir, opts).await?;
-        Ok(Self { session })
+        let session = Session::new_with_opts(download_dir, opts)
+            .await
+            .context("starting torrent session (check the [privacy] settings if any are set)")?;
+
+        // Fail-closed on an empty blocklist: librqbit skips unparseable lines
+        // and returns Ok, so a wrong-format file (CIDR .txt, an HTML error
+        // page served 200) would otherwise load as zero ranges and run
+        // effectively unprotected behind a green badge.
+        if plan.blocklist_url.is_some() && session.blocklist.len() == 0 {
+            anyhow::bail!(
+                "blocklist loaded 0 ranges — check the file is PeerGuardian .p2p format \
+                 (name:start-end per line); refusing to start unprotected"
+            );
+        }
+
+        let privacy_status = plan.privacy_status(
+            plan.blocklist_url
+                .is_some()
+                .then(|| session.blocklist.len()),
+        );
+
+        Ok(Self {
+            session,
+            proxy_active,
+            privacy_status,
+        })
+    }
+
+    /// True when the session runs behind a SOCKS5 proxy (lockdown mode).
+    pub fn proxy_active(&self) -> bool {
+        self.proxy_active
+    }
+
+    /// Count torrents whose tracker list still contains a `udp://` entry. Used
+    /// once at startup in proxy mode to warn about torrents restored from a
+    /// previous session, whose udp trackers announce directly around the proxy
+    /// and which the app has no public API to sanitize in place.
+    pub fn torrents_with_udp_trackers(&self) -> usize {
+        // `with_torrents` takes an `Fn`, so accumulate through a Cell.
+        let count = std::cell::Cell::new(0usize);
+        self.session.with_torrents(|torrents| {
+            for (_, handle) in torrents {
+                if handle.shared().trackers.iter().any(|u| u.scheme() == "udp") {
+                    count.set(count.get() + 1);
+                }
+            }
+        });
+        count.get()
     }
 
     /// Add a magnet URI or a `.torrent` file path. The trailing `bool` is
@@ -658,6 +820,80 @@ async fn start_http_api(
     ))
 }
 
+/// What `strip_udp_trackers` did to a magnet link.
+pub(crate) struct StrippedMagnet {
+    pub magnet: String,
+    /// How many `tr=` parameters were dropped.
+    pub removed: usize,
+    /// How many trackers the magnet still carries.
+    pub trackers_left: usize,
+}
+
+/// Form-decode one `application/x-www-form-urlencoded` component the way a URL
+/// query parser does: `+` becomes a space, then percent-decode. This is how
+/// librqbit reads magnet `tr=` values (`Url::query_pairs`), so matching it
+/// exactly is what keeps [`strip_udp_trackers`] from disagreeing with librqbit
+/// about a crafted value's scheme.
+fn form_decode(component: &str) -> String {
+    let spaced: String = component
+        .chars()
+        .map(|c| if c == '+' { ' ' } else { c })
+        .collect();
+    percent_encoding::percent_decode_str(&spaced)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// True if `tr_value` (already form-decoded) names a udp tracker, decided by
+/// the SAME parser librqbit dispatches on (`url::Url::parse` then `.scheme()`).
+/// A hand-rolled `starts_with("udp://")` on a partly-decoded string is
+/// bypassable: `url` strips interior tabs/newlines and trims leading control
+/// characters, so `ud\tp://...` or a space-prefixed value parses as scheme
+/// `udp` for librqbit while a substring check keeps it — and it would then
+/// announce directly, around the proxy, leaking the real address.
+fn is_udp_tracker(tr_value: &str) -> bool {
+    url::Url::parse(tr_value).is_ok_and(|u| u.scheme() == "udp")
+}
+
+/// Drop `tr=` parameters naming `udp://` trackers from a magnet link. Used in
+/// proxy mode only: a SOCKS5 proxy is TCP-only, so librqbit would announce to
+/// udp trackers *directly*, leaking the real address to them — while the
+/// http(s) trackers that remain are announced through the proxy. Everything
+/// except the dropped parameters passes through byte-for-byte (no re-encoding,
+/// no reordering), so hashes, names and exotic parameters survive untouched.
+/// `.torrent` files are the documented gap: their announce lists live inside
+/// the metainfo where the app never looks.
+pub(crate) fn strip_udp_trackers(magnet: &str) -> StrippedMagnet {
+    let Some((base, query)) = magnet.split_once('?') else {
+        return StrippedMagnet {
+            magnet: magnet.to_string(),
+            removed: 0,
+            trackers_left: 0,
+        };
+    };
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = 0usize;
+    let mut trackers_left = 0usize;
+    for param in query.split('&') {
+        let (name, value) = param.split_once('=').unwrap_or((param, ""));
+        if form_decode(name).eq_ignore_ascii_case("tr") {
+            if is_udp_tracker(&form_decode(value)) {
+                removed += 1;
+                continue;
+            }
+            trackers_left += 1;
+        }
+        kept.push(param);
+    }
+
+    StrippedMagnet {
+        magnet: format!("{}?{}", base, kept.join("&")),
+        removed,
+        trackers_left,
+    }
+}
+
 /// True for librqbit's "redundant transition" errors — `pause` on a paused
 /// torrent ("torrent is already paused") and `unpause` on a live one
 /// ("torrent is already live"). These are the *normal* outcome of bulk
@@ -835,6 +1071,35 @@ pub async fn run_engine(
 ) -> Result<()> {
     let engine = TorrentEngine::new(&config).await?;
 
+    // Report the applied privacy posture once, right after the session that
+    // embodies it exists — the header badge renders from this, never from
+    // the raw config.
+    if let Some(status) = engine.privacy_status.clone() {
+        if let Err(e) = info_tx.send(EngineInfo::Privacy(status)).await {
+            tracing::warn!("privacy status send dropped (UI gone?): {}", e);
+        }
+    }
+
+    // Warn about restored torrents that carry udp:// trackers under a proxy.
+    // librqbit restores persisted torrents inside `Session::new_with_opts`,
+    // before the app can strip anything, and its UDP tracker client announces
+    // them directly — around the proxy. The app cannot rewrite a live
+    // torrent's tracker list through librqbit's public API, so the honest move
+    // is to flag it so the user can re-add by magnet (which strips) or switch
+    // to `bind_interface`.
+    if engine.proxy_active() {
+        let leaky = engine.torrents_with_udp_trackers();
+        if leaky > 0 {
+            let _ = msg_tx
+                .send(format!(
+                    "\u{26a0} Proxy mode: {} restored torrent(s) still list udp:// trackers, \
+                     which announce directly. Re-add by magnet, or use privacy.bind_interface",
+                    leaky
+                ))
+                .await;
+        }
+    }
+
     // Bring up the embedded HTTP API for media streaming. A bind failure
     // (port in use, address invalid) is degraded gracefully: the UI just
     // won't get an HttpApiReady and the `s` keybind shows an error if
@@ -889,7 +1154,21 @@ pub async fn run_engine(
     // means "no cleanup", so a watcher we refused to start never causes files
     // to be deleted.
     let mut watch_cleanup: Option<WatchCleanup> = None;
-    if let Some(ref dir) = config.general.watch_dir {
+    if engine.proxy_active() && config.general.watch_dir.is_some() {
+        // librqbit's watcher adds `.torrent` AND `.magnet` files directly, on
+        // its own thread, never through EngineCommand::AddTorrent — so the
+        // udp-tracker strip cannot reach them and a dropped magnet would
+        // announce its udp trackers around the proxy. Disable the watcher
+        // entirely in proxy mode rather than ship that leak.
+        let _ = msg_tx
+            .send(
+                "Watch folder disabled in proxy mode (watched files bypass udp-tracker \
+                 stripping)"
+                    .to_string(),
+            )
+            .await;
+        tracing::info!("watch folder disabled: proxy mode active");
+    } else if let Some(ref dir) = config.general.watch_dir {
         let path = PathBuf::from(dir);
         let download_dir = PathBuf::from(&config.general.download_dir);
         // Compare canonicalized paths when possible (handles trailing slash,
@@ -1026,6 +1305,25 @@ pub async fn run_engine(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(EngineCommand::AddTorrent(source)) => {
+                        // Proxy mode: drop udp:// trackers before the magnet
+                        // reaches librqbit (see strip_udp_trackers). Warn when
+                        // that leaves the magnet trackerless — with DHT also
+                        // off in this mode there is no discovery path left.
+                        let source = if engine.proxy_active() && source.starts_with("magnet:?") {
+                            let stripped = strip_udp_trackers(&source);
+                            if stripped.removed > 0 && stripped.trackers_left == 0 {
+                                let _ = msg_tx
+                                    .send(
+                                        "\u{26a0} Proxy mode: magnet had only udp:// trackers \
+                                         (unusable through a SOCKS5 proxy) — it may not find peers"
+                                            .to_string(),
+                                    )
+                                    .await;
+                            }
+                            stripped.magnet
+                        } else {
+                            source
+                        };
                         match engine.add_torrent(&source).await {
                             Ok((id, handle, already_managed)) => {
                                 let stats = handle.stats();
@@ -1248,6 +1546,156 @@ pub async fn run_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_udp_trackers_drops_udp_and_keeps_the_rest_verbatim() {
+        let magnet = "magnet:?xt=urn:btih:1234567890abcdef1234567890abcdef12345678\
+                      &dn=Some%20Name\
+                      &tr=udp%3A%2F%2Ftracker.example%3A1337%2Fannounce\
+                      &tr=https%3A%2F%2Ftr.example%3A443%2Fannounce\
+                      &tr=UDP%3A%2F%2Fupper.example%3A80\
+                      &tr=http%3A%2F%2Fplain.example%2Fannounce\
+                      &x.pe=10.0.0.1%3A6881";
+        let stripped = strip_udp_trackers(magnet);
+        assert_eq!(stripped.removed, 2);
+        assert_eq!(stripped.trackers_left, 2);
+        assert_eq!(
+            stripped.magnet,
+            "magnet:?xt=urn:btih:1234567890abcdef1234567890abcdef12345678\
+             &dn=Some%20Name\
+             &tr=https%3A%2F%2Ftr.example%3A443%2Fannounce\
+             &tr=http%3A%2F%2Fplain.example%2Fannounce\
+             &x.pe=10.0.0.1%3A6881",
+            "non-udp params must survive byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn strip_udp_trackers_flags_a_magnet_left_trackerless() {
+        let stripped = strip_udp_trackers(
+            "magnet:?xt=urn:btih:1234567890abcdef1234567890abcdef12345678\
+             &tr=udp%3A%2F%2Fonly.example%3A1337",
+        );
+        assert_eq!(stripped.removed, 1);
+        assert_eq!(stripped.trackers_left, 0);
+    }
+
+    #[test]
+    fn strip_udp_trackers_handles_unencoded_and_queryless_magnets() {
+        // Unencoded tr= values occur in the wild; the sniff must decode-agnostic.
+        let stripped = strip_udp_trackers(
+            "magnet:?xt=urn:btih:abc&tr=udp://x.example:1337&tr=wss://y.example",
+        );
+        assert_eq!(stripped.removed, 1);
+        assert_eq!(stripped.trackers_left, 1);
+        assert_eq!(
+            stripped.magnet,
+            "magnet:?xt=urn:btih:abc&tr=wss://y.example"
+        );
+
+        let untouched = strip_udp_trackers("magnet:no-question-mark");
+        assert_eq!(untouched.magnet, "magnet:no-question-mark");
+        assert_eq!(untouched.removed, 0);
+    }
+
+    #[test]
+    fn strip_udp_trackers_matches_librqbits_url_parser_on_crafted_values() {
+        // These are the bypasses a substring sniff misses: librqbit form-
+        // decodes then url::Url::parse, which strips an interior tab and maps
+        // a leading '+' to a space it then trims — both yield scheme "udp".
+        // The strip must agree, or the udp announce leaks around the proxy.
+        for (label, tr) in [
+            ("interior tab", "tr=ud%09p%3A%2F%2Fevil.example%3A1337"),
+            ("leading plus", "tr=+udp%3A%2F%2Fevil.example"),
+            ("leading space", "tr=%20udp%3A%2F%2Fevil.example"),
+            ("uppercase TR name", "TR=udp%3A%2F%2Fevil.example"),
+        ] {
+            let stripped = strip_udp_trackers(&format!("magnet:?xt=urn:btih:abc&{}", tr));
+            assert_eq!(stripped.removed, 1, "{label}: should be stripped");
+            assert_eq!(stripped.trackers_left, 0, "{label}");
+        }
+    }
+
+    #[test]
+    fn is_udp_tracker_agrees_with_scheme() {
+        assert!(is_udp_tracker("udp://x:1337"));
+        assert!(is_udp_tracker("ud\tp://x:1337")); // url strips interior tab
+        assert!(is_udp_tracker(" udp://x")); // leading space trimmed
+        assert!(!is_udp_tracker("https://x/announce"));
+        assert!(!is_udp_tracker("wss://x"));
+        assert!(!is_udp_tracker("not a url"));
+    }
+
+    fn cfg_with_privacy(proxy: &str, dht: bool) -> Config {
+        let mut cfg = Config::default();
+        cfg.network.enable_dht = dht;
+        cfg.privacy.proxy_url = proxy.to_string();
+        cfg
+    }
+
+    #[test]
+    fn proxy_mode_locks_down_the_network_plan() {
+        // The core safety property: a proxy forces DHT/listener/LSD off even
+        // with enable_dht = true. Pinned here because the real SessionOptions
+        // path needs a live session and can't be unit-tested.
+        let plan =
+            NetworkPlan::from_config(&cfg_with_privacy("socks5://127.0.0.1:1080", true)).unwrap();
+        assert!(!plan.dht, "DHT must be off under proxy");
+        assert!(plan.listen_port.is_none(), "no listener under proxy");
+        assert!(!plan.upnp, "no UPnP under proxy");
+        assert!(plan.disable_lsd, "LSD off under proxy");
+        assert_eq!(plan.proxy_url.as_deref(), Some("socks5://127.0.0.1:1080"));
+
+        // And the SessionOptions built from it agree.
+        let opts = build_session_opts(&plan, LimitsConfig::default());
+        assert!(opts.dht.is_none());
+        assert!(opts.listen.is_none());
+        assert!(opts.disable_local_service_discovery);
+        assert_eq!(
+            opts.connect.and_then(|c| c.proxy_url).as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+    }
+
+    #[test]
+    fn without_a_proxy_dht_and_listener_stay_on() {
+        let plan = NetworkPlan::from_config(&cfg_with_privacy("", true)).unwrap();
+        assert!(plan.dht);
+        assert!(plan.listen_port.is_some());
+        assert!(!plan.disable_lsd);
+        assert!(plan.proxy_url.is_none());
+        let opts = build_session_opts(&plan, LimitsConfig::default());
+        assert!(opts.dht.is_some());
+        assert!(opts.listen.is_some());
+        assert!(opts.connect.is_none());
+    }
+
+    #[test]
+    fn a_bad_proxy_scheme_fails_the_plan_before_any_socket() {
+        let err = NetworkPlan::from_config(&cfg_with_privacy("http://127.0.0.1:8080", true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("privacy.proxy_url"), "got: {err}");
+    }
+
+    #[test]
+    fn blocklist_and_bind_pass_through_the_plan() {
+        let mut cfg = Config::default();
+        cfg.privacy.bind_interface = "wg0".to_string();
+        cfg.privacy.blocklist_url = "/tmp/x.p2p".to_string();
+        let plan = NetworkPlan::from_config(&cfg).unwrap();
+        assert_eq!(plan.bind_interface.as_deref(), Some("wg0"));
+        assert!(plan.blocklist_url.is_some());
+        let opts = build_session_opts(&plan, LimitsConfig::default());
+        assert_eq!(opts.bind_device_name.as_deref(), Some("wg0"));
+        assert!(opts.blocklist_url.is_some());
+    }
+
+    #[test]
+    fn privacy_status_is_none_when_nothing_is_active() {
+        let plan = NetworkPlan::from_config(&Config::default()).unwrap();
+        assert!(plan.privacy_status(None).is_none());
+    }
 
     #[tokio::test]
     async fn report_op_error_reaches_the_status_channel() {

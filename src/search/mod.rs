@@ -39,11 +39,17 @@ const MAX_TITLE_CHARS: usize = 300;
 
 /// Open trackers appended as `tr=` params to locally built magnet links.
 /// Best-effort peer discovery hints — DHT (on by default) does the real work
-/// if these rot.
+/// if these rot. The `https://` entries matter beyond redundancy: in proxy
+/// mode the engine strips `udp://` trackers (a SOCKS5 proxy cannot carry
+/// them) and disables DHT, so they are the discovery path that remains —
+/// each verified live (bencoded announce response) on 2026-08-30.
 const TRACKERS: &[&str] = &[
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.tracker.cl:1337/announce",
     "udp://exodus.desync.com:6969/announce",
+    "https://tracker.gcrenwp.top:443/announce",
+    "https://tr.nyacat.pw:443/announce",
+    "https://t.213891.xyz:443/announce",
 ];
 
 /// Which indexers produced a result. A set rather than an enum so a row
