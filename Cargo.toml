@@ -1,6 +1,6 @@
 [package]
 name = "torrenttui"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 # Stated in the README and CONTRIBUTING; declared here so cargo enforces it
 # with a clear message instead of failing deep inside a dependency.
@@ -55,10 +55,15 @@ unicode-width = "0.2"
 # librqbit already enables on the shared reqwest build (0.13 calls the TLS
 # feature `rustls`, not `rustls-tls`), so this adds no second TLS stack and no
 # new crates to the lockfile.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "socks"] }
 # Percent-encoding for indexer query strings and the dn=/tr= params of locally
 # built magnet links; already in the graph transitively via url.
 percent-encoding = "2"
+# URL parsing: used to classify magnet `tr=` trackers by scheme EXACTLY the way
+# librqbit does (so the proxy-mode udp strip can't be bypassed by a crafted
+# magnet the two parsers disagree on) and to build correct `file://` blocklist
+# URLs. Already in the graph transitively via librqbit/reqwest — no new crate.
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"

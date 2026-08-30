@@ -237,6 +237,10 @@ pub struct App {
     /// bind failed at startup, stays `None` forever and the `s` stream
     /// keybinding shows an error.
     pub http_api_base: Option<String>,
+    /// The privacy posture the session actually started with — `None` until
+    /// (and unless) the engine reports `EngineInfo::Privacy`, so the header
+    /// badge can never show a protection that failed to apply.
+    pub privacy: Option<crate::engine::torrent::PrivacyStatus>,
     /// External player command + args for the `s` stream keybinding. Loaded
     /// once from `config.player` at startup.
     pub player_config: PlayerConfig,
@@ -252,6 +256,11 @@ pub struct App {
     pub search: SearchState,
     /// Copied once from `config.search` at startup, like `player_config`.
     pub search_config: SearchConfig,
+    /// Copied once from `config.privacy.proxy_url()` at startup. When set,
+    /// the lazily built search client routes indexer queries through the same
+    /// SOCKS5 proxy as the torrent traffic — a proxied session that still
+    /// sent search queries directly would undercut the badge's promise.
+    pub search_proxy_url: Option<String>,
     /// Copied once from `config.general.download_dir` at startup; the `o`
     /// keybinding resolves the selected torrent's on-disk location against it.
     pub download_dir: String,
@@ -309,11 +318,13 @@ impl App {
             sort_dirty: true,
             confirm_on_quit: true,
             http_api_base: None,
+            privacy: None,
             player_config: PlayerConfig::default(),
             torrent_identities: HashMap::new(),
             watch_dir_configured: false,
             search: SearchState::new(),
             search_config: SearchConfig::default(),
+            search_proxy_url: None,
             download_dir: String::new(),
             palette: PaletteState::new(),
             help_scroll: 0,

@@ -37,17 +37,38 @@ pub fn get_layout(area: Rect) -> Vec<Rect> {
         .to_vec()
 }
 
-pub fn render_header(f: &mut Frame, area: Rect) {
-    let title = Paragraph::new(Line::from(vec![
+pub fn render_header(f: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![
         Span::styled("TorrentTUI", Style::default().fg(Color::Cyan)),
         Span::raw(concat!(" v", env!("CARGO_PKG_VERSION"))),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    )
-    .centered();
+    ];
+    // Privacy badge — rendered only from the engine-reported posture (what
+    // the session actually started with), never from the raw config.
+    if let Some(ref privacy) = app.privacy {
+        let mut parts: Vec<&str> = Vec::new();
+        if privacy.proxy {
+            parts.push("proxy");
+        }
+        if let Some(ref iface) = privacy.bind_interface {
+            parts.push(iface);
+        }
+        if privacy.blocklist_ranges.is_some() {
+            parts.push("blocklist");
+        }
+        if !parts.is_empty() {
+            spans.push(Span::styled(
+                format!("  [{}]", parts.join("+")),
+                Style::default().fg(Color::Green),
+            ));
+        }
+    }
+    let title = Paragraph::new(Line::from(spans))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .centered();
     f.render_widget(title, area);
 }
 
@@ -336,6 +357,38 @@ pub fn format_eta(seconds: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_shows_the_privacy_badge_only_when_the_engine_reported_one() {
+        use crate::engine::torrent::PrivacyStatus;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let screen = |t: &Terminal<TestBackend>| -> String {
+            t.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let mut app = App::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 3)).unwrap();
+        terminal.draw(|f| render_header(f, f.area(), &app)).unwrap();
+        assert!(!screen(&terminal).contains('['), "no badge before report");
+
+        app.privacy = Some(PrivacyStatus {
+            proxy: true,
+            bind_interface: Some("wg0".to_string()),
+            blocklist_ranges: Some(3),
+        });
+        terminal.draw(|f| render_header(f, f.area(), &app)).unwrap();
+        assert!(
+            screen(&terminal).contains("[proxy+wg0+blocklist]"),
+            "screen: {}",
+            screen(&terminal)
+        );
+    }
 
     #[test]
     fn speed_zero() {

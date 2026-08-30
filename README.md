@@ -27,6 +27,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 - **Real-time progress** — progress bars, download/upload speeds, ETA, and peer counts
 - **Sorting & filtering** — sort by any column, search torrents by name
 - **Bandwidth limits** — session-wide download/upload rate limits, applied smoothly by librqbit's token-bucket limiter and adjustable live with `t`
+- **Privacy pack** — SOCKS5 proxy with honest lockdown (no DHT/UDP leaking around it), PeerGuardian IP blocklists, and VPN interface binding; see [Privacy](#privacy)
 - **Selective file download** — choose which files to download from multi-file torrents
 - **Reveal in file manager** — press `o` to open the selected torrent's data in Finder, Explorer, or your Linux file manager
 - **Detail view** — inspect torrent info, individual file progress, and peer details
@@ -249,6 +250,11 @@ enable_apibay = true          # The Pirate Bay JSON API (apibay.org), no auth
 enable_torrents_csv = true    # torrents-csv.com public API, no auth
 timeout_secs = 8              # per-provider HTTP timeout (clamped to 1-30)
 max_results = 50              # cap on merged results (clamped to 1-500)
+
+[privacy]                     # all applied at startup; restart to change
+proxy_url = ""                # SOCKS5 proxy: "socks5://[user:pass@]host:port"
+blocklist_url = ""            # PeerGuardian .p2p list: path, ~/path, file:// or http(s)://
+bind_interface = ""           # bind all BitTorrent traffic to an interface, e.g. "wg0"
 ```
 
 Paths (`download_dir`, `watch_dir`, `player.command`) may start with `~/`, which expands to your home directory.
@@ -282,9 +288,37 @@ A few defaults worth knowing:
 - **Logging is filtered.** Only TorrentTUI's own warnings are written to disk; librqbit's INFO-level output (peer IPs, tracker URLs, info hashes) is silenced. Bumping `RUST_LOG` re-enables it — redact before sharing logs.
 - **UPnP is off by default.** Enabling it (`network.enable_upnp = true`) opens an external port via your router and exposes you to peers outside your LAN.
 - **No telemetry.** TorrentTUI makes no outbound connections except to BitTorrent peers, trackers, (if DHT is enabled) the DHT network, and — only when you submit a search — the search providers below.
-- **Search queries go to the indexers you enable.** Pressing `Enter` on a search sends the query text (nothing else — no identifiers, accounts, or keys) over HTTPS to `apibay.org` and/or `torrents-csv.com`. No request is made until you submit a search, and either provider can be disabled in `[search]`; disabling both turns the feature off entirely. Queries are not written to the log at the default filter.
+- **Search queries go to the indexers you enable.** Pressing `Enter` on a search sends the query text (nothing else — no identifiers, accounts, or keys) over HTTPS to `apibay.org` and/or `torrents-csv.com`. No request is made until you submit a search, and either provider can be disabled in `[search]`; disabling both turns the feature off entirely. Queries are not written to the log at the default filter. When `privacy.proxy_url` is set, these queries also go through the proxy.
 - **Notifications.** Control characters are stripped from torrent names at the engine boundary, and names are additionally Pango-escaped before reaching the Linux notification daemon. macOS plays a sound instead of sending a notification, so no name leaves the process there. Disable entirely with `ui.enable_notifications = false`.
 - **HTTP streaming API is loopback-only and authenticated.** The embedded API used for the `s` stream keybinding binds to `127.0.0.1:0`, is mounted read-only, and requires HTTP basic auth with a random password generated per run. The credentials ride in the stream URL handed to your media player, which means they are visible in that process's argv while it runs. Changing `network.http_api_bind` to a routable interface sends those credentials over plaintext HTTP — do this only on a trusted LAN.
+
+### SOCKS5 proxy
+
+Set `privacy.proxy_url = "socks5://host:port"` and the session runs in **lockdown mode**. A SOCKS5 proxy only carries TCP, so rather than ship a proxy that quietly leaks, TorrentTUI turns off everything that would bypass it:
+
+| Traffic | With `proxy_url` set |
+|---|---|
+| Outgoing peer connections | ✅ through the proxy |
+| HTTP(S) tracker announces | ✅ through the proxy |
+| Indexer search queries (`s`) | ✅ through the proxy |
+| DHT (UDP) | **disabled** — would bypass the proxy (even if `enable_dht = true`) |
+| Incoming connections / uTP / UPnP | **disabled** — direct by nature and pointless behind a proxy |
+| Local service discovery | **disabled** — multicasts on your LAN |
+| `udp://` trackers in magnets you add (add dialog, search, CLI) | **stripped** before they reach the engine, using the same URL parser librqbit dispatches on |
+| `udp://` trackers inside `.torrent` files | ⚠ **still announced directly** — librqbit reads the announce list from the metainfo, where TorrentTUI cannot filter it. Prefer magnets when proxying |
+| Torrents restored from a previous session | ⚠ keep the trackers they were added with. A torrent added *before* proxy mode may carry `udp://` trackers that announce directly; the app **warns at startup** how many, so you can re-add them by magnet (which strips) or switch to `bind_interface` |
+| Watch folder (`.torrent` **and** `.magnet`) | **disabled in proxy mode** — librqbit's watcher adds those files itself, bypassing the strip, so the whole feature is turned off rather than leak |
+| DNS lookups for tracker hostnames | ⚠ librqbit resolves them through the **system resolver** before dialing the proxy, so your DNS server sees tracker hostnames, timed with activity (peer addresses are raw IPs — no lookup). Indexer search lookups *are* proxied (`socks5h`) |
+
+Two librqbit implementation details worth knowing. Its UDP tracker client binds a UDP socket at session creation regardless of configuration; in proxy mode nothing ever sends on it (magnets are stripped and DHT is off) and its port is never announced, but you will see it in `lsof`. And the search-built magnets include verified `https://` open trackers so peer discovery survives udp-stripping — a magnet carrying *only* `udp://` trackers gets a status-bar warning, because with DHT off it then has no way to find peers.
+
+The header shows a green `[proxy]` badge once the session is actually running locked down, and the app refuses to start on a malformed proxy URL rather than fall back to a direct connection.
+
+**Using a VPN? `bind_interface` is the more complete option.** It pins *every* protocol — DHT, UDP **and** HTTP trackers, peer connections — to the interface you name (`wg0`, `utun3`, …), including the udp trackers the proxy cannot cover, and if the VPN drops, traffic fails instead of escaping through your default route. **Caveats:** on **Windows** interface binding is unsupported by the underlying library — any `bind_interface` value makes the app refuse to start (it is a macOS/Linux feature). And **combining** `proxy_url` with `bind_interface` does *not* bind the proxy's own connections (the SOCKS5 socket and the proxied HTTP tracker client are not interface-bound), so in combined mode a VPN drop can let proxy traffic escape — bind alone is the fail-safe configuration.
+
+### IP blocklist
+
+`privacy.blocklist_url` loads a PeerGuardian `.p2p` list (plain or gzipped) from a local path, `file://` URL, or `http(s)://` URL, and applies it to **both incoming and outgoing** peer connections. It is loaded once at startup and fail-closed: if the list cannot be fetched, and — because a wrong-format file would otherwise load as zero ranges — if it parses to **no ranges at all**, TorrentTUI exits with an error instead of running unprotected. The startup status line reports how many ranges loaded. Note an `http(s)` blocklist is fetched with librqbit's own client, which is bound to **neither** the proxy **nor** `bind_interface` — use a **local file** when either is set, so the fetch can't escape.
 
 ## Docker
 
