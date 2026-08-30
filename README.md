@@ -10,9 +10,9 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 [![@thijsvos](https://img.shields.io/badge/@thijsvos-000000?logo=x)](https://x.com/thijsvos)
 
 <p align="center">
-  <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: opening the command palette with a colon, running the built-in torrent search, downloading an Arch Linux ISO from the results with Enter, and revealing the data in the file manager with o">
+  <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: opening the command palette with a colon, running the built-in torrent search, downloading an Arch Linux ISO from the results with Enter, capping the download at 500 KB/s live with t while the speed settles smoothly at the limit, and revealing the data in the file manager with o">
 </p>
-<p align="center"><em>Command palette → built-in search → pick a result → downloading → reveal in your file manager. No external services.</em></p>
+<p align="center"><em>Command palette → built-in search → pick a result → downloading → a 500 KB/s cap applied live, no pause flicker → reveal in your file manager. No external services.</em></p>
 
 ## Contents
 

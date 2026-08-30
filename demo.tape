@@ -46,7 +46,21 @@ Sleep 2.5s
 
 # Back to the list — the download is starting
 Type "q"
-Sleep 6.5s
+Sleep 6s
+
+# Bandwidth limits: cap download at 500 KB/s, upload at 100 KB/s. The
+# limiter is librqbit's token bucket, so the speed settles smoothly at the
+# cap — no pause/unpause flicker — and the change applies instantly.
+Type "t"
+Sleep 1.2s
+Type@140ms "500"
+Sleep 600ms
+Enter
+Sleep 800ms
+Type@140ms "100"
+Sleep 600ms
+Enter
+Sleep 7s
 
 # Reveal the torrent's data in the file manager
 Type "o"
