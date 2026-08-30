@@ -325,6 +325,28 @@ blocklist_url = "~/lists/blocklist.p2p"   # PeerGuardian .p2p, plain or gzipped
 
 Filters **both incoming and outgoing** peer connections. Loaded once at startup and **fail-closed**: if the file can't be read or parses to zero ranges the app exits rather than run unprotected, and the startup line reports how many ranges loaded. Prefer a **local file** over an `http(s)://` URL whenever `proxy_url` or `bind_interface` is set — a remote list is fetched by a client bound to neither, so it would escape your proxy/VPN. See [IP blocklist](#ip-blocklist).
 
+#### Worked example: Mullvad
+
+Mullvad works with both mechanisms. Connect it in **WireGuard** mode first (the interface and the proxy below only exist while connected), then pick one:
+
+**Bind to the Mullvad interface (recommended, macOS/Linux).** With WireGuard connected, Mullvad creates a tunnel interface — on Linux it is usually `wg0-mullvad` (run `ip addr` to confirm), on macOS a `utunN` device (run `ifconfig` to find the number, which can change between reconnects):
+
+```toml
+[privacy]
+bind_interface = "wg0-mullvad"   # macOS: the utunN Mullvad created — check `ifconfig`
+```
+
+This is the fuller option: DHT and all trackers keep working (more peers) and the binding is fail-closed if the tunnel drops.
+
+**Mullvad's SOCKS5 proxy (any OS, or a different exit).** Mullvad publishes a SOCKS5 proxy reachable only through the WireGuard tunnel, with no auth (per Mullvad's docs, `10.64.0.1:1080` for the current server; they also list per-server proxies to make just this app exit elsewhere):
+
+```toml
+[privacy]
+proxy_url = "socks5://10.64.0.1:1080"
+```
+
+Use this on **Windows** (where `bind_interface` is unsupported) or when you want torrentTUI to exit from a different Mullvad server than the rest of your machine. It runs in lockdown mode, so peer discovery leans on trackers (DHT is off). Either option combines with a local `blocklist_url`.
+
 ### SOCKS5 proxy
 
 Set `privacy.proxy_url = "socks5://host:port"` and the session runs in **lockdown mode**. A SOCKS5 proxy only carries TCP, so rather than ship a proxy that quietly leaks, TorrentTUI turns off everything that would bypass it:
