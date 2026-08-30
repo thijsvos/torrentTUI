@@ -549,11 +549,10 @@ async fn run_app(
                         needs_render = true;
                     }
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::Filter => {
-                        for c in s.chars() {
-                            if !c.is_control() {
-                                app.push_filter_char(c);
-                            }
-                        }
+                        // Batch entry point: filters + caps like typing, but
+                        // re-sorts the table once instead of per character —
+                        // a per-char loop froze the UI on large pastes.
+                        app.push_filter_str(&s);
                         needs_render = true;
                     }
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::Search => {

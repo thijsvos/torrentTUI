@@ -31,6 +31,12 @@ use ratatui::widgets::TableState;
 /// longer than this can't match and only wastes redraw work.
 const MAX_PALETTE_QUERY_CHARS: usize = 64;
 
+/// Cap on the torrent-table filter (mirrors `search::MAX_QUERY_CHARS`).
+/// Torrent names are bounded, so a longer needle can't match anything — and
+/// without a cap a stray paste of the wrong clipboard buffer grows
+/// `filter_text` without limit.
+const MAX_FILTER_CHARS: usize = 200;
+
 /// State for the command-palette overlay. Ephemeral by design: opening the
 /// palette resets the filter, so it always starts from "show me everything".
 pub struct PaletteState {
@@ -186,6 +192,10 @@ pub struct App {
     pub spinner_tick: usize,
     pub should_quit: bool,
     pub filter_text: String,
+    /// Counts `rebuild_sort_cache` runs so tests can pin batching claims —
+    /// e.g. that one paste re-sorts once, not once per character.
+    #[cfg(test)]
+    pub sort_rebuilds: usize,
     pub free_disk_space: Option<u64>,
     pub disk_space_timer: Option<std::time::Instant>,
     pub throttle_step: u8, // 0 = download, 1 = upload
@@ -279,6 +289,8 @@ impl App {
             spinner_tick: 0,
             should_quit: false,
             filter_text: String::new(),
+            #[cfg(test)]
+            sort_rebuilds: 0,
             free_disk_space: None,
             disk_space_timer: None,
             throttle_step: 0,
@@ -376,7 +388,7 @@ impl App {
         })
     }
 
-    /// Set a new sort column and refresh the cache. Prefer these five wrappers
+    /// Set a new sort column and refresh the cache. Prefer these wrappers
     /// over assigning `sort_column` / `sort_reversed` / `filter_text` directly:
     /// each has to pair `invalidate_sort` with `ensure_sort_cache` *and*
     /// `restore_selection`, and skipping the last one leaves the user's cursor
@@ -397,11 +409,48 @@ impl App {
     }
 
     /// Append a character to the filter and refresh — see `change_sort_column`.
+    /// Owns the same trims typing and paste share: control and bidi-override
+    /// characters are dropped (`filter_text` renders raw in the filter bar
+    /// and status line, so a pasted U+202E would garble both — same rationale
+    /// as `search_push_char`) and the filter is capped at `MAX_FILTER_CHARS`.
     pub fn push_filter_char(&mut self, c: char) {
+        if c.is_control()
+            || crate::ui::util::is_bidi_control(c)
+            || self.filter_text.chars().count() >= MAX_FILTER_CHARS
+        {
+            return;
+        }
         self.filter_text.push(c);
         self.invalidate_sort();
         self.ensure_sort_cache();
         self.restore_selection();
+    }
+
+    /// Append a whole string (a bracketed-paste payload) and refresh ONCE.
+    /// The per-character wrapper re-sorts the table on every push, which
+    /// turned a large accidental paste into an
+    /// O(chars × torrents·log(torrents)) freeze of the whole event loop.
+    /// Same control-char filter and `MAX_FILTER_CHARS` cap as
+    /// `push_filter_char`.
+    pub fn push_filter_str(&mut self, s: &str) {
+        let mut len = self.filter_text.chars().count();
+        let mut changed = false;
+        for c in s.chars() {
+            if len >= MAX_FILTER_CHARS {
+                break;
+            }
+            if c.is_control() || crate::ui::util::is_bidi_control(c) {
+                continue;
+            }
+            self.filter_text.push(c);
+            len += 1;
+            changed = true;
+        }
+        if changed {
+            self.invalidate_sort();
+            self.ensure_sort_cache();
+            self.restore_selection();
+        }
     }
 
     /// Drop the trailing filter character and refresh — see
@@ -424,6 +473,10 @@ impl App {
     }
 
     fn rebuild_sort_cache(&mut self) {
+        #[cfg(test)]
+        {
+            self.sort_rebuilds += 1;
+        }
         let filter_lower = self.filter_text.to_lowercase();
         // Collect indices into `self.torrents` after applying the filter.
         let mut indices: Vec<usize> = self
@@ -1259,6 +1312,66 @@ mod tests {
         let sorted = app.sorted_torrents();
         assert_eq!(sorted.len(), 1);
         assert_eq!(sorted[0].name, "Alpha");
+    }
+
+    #[test]
+    fn filter_paste_drops_control_and_bidi_chars_and_applies() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
+            make_torrent(1, "Beta", 200, TorrentStatus::Paused),
+        ]);
+        // Escape, newline and a bidi override smuggled into the payload must
+        // not survive — filter_text renders raw in the filter bar.
+        app.push_filter_str("al\u{1b}ph\n\u{202e}a");
+        assert_eq!(app.filter_text, "alpha");
+        let sorted = app.sorted_torrents();
+        assert_eq!(sorted.len(), 1);
+        assert_eq!(sorted[0].name, "Alpha");
+    }
+
+    #[test]
+    fn filter_paste_resorts_once_while_typing_resorts_per_char() {
+        // The freeze regression this pins: the paste path used to route
+        // through push_filter_char per character, re-sorting the table each
+        // time. The counter makes the batching claim testable.
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
+            make_torrent(1, "Beta", 200, TorrentStatus::Paused),
+        ]);
+        let base = app.sort_rebuilds;
+        app.push_filter_str("alpha");
+        assert_eq!(app.sort_rebuilds, base + 1, "one paste = one resort");
+
+        let base = app.sort_rebuilds;
+        for c in "beta".chars() {
+            app.push_filter_char(c);
+        }
+        assert_eq!(app.sort_rebuilds, base + 4, "typing resorts per char");
+    }
+
+    #[test]
+    fn filter_paste_larger_than_the_cap_is_truncated() {
+        let mut app = app_with_torrents(vec![make_torrent(
+            0,
+            "Alpha",
+            100,
+            TorrentStatus::Downloading,
+        )]);
+        // Pins the cap and cache coherence for a huge accidental paste (the
+        // once-per-character resort half of that regression is pinned by
+        // `filter_paste_resorts_once_while_typing_resorts_per_char`).
+        app.push_filter_str(&"x".repeat(10_000));
+        assert_eq!(app.filter_text.chars().count(), MAX_FILTER_CHARS);
+        assert!(app.sorted_torrents().is_empty());
+    }
+
+    #[test]
+    fn typed_filter_chars_respect_the_cap_too() {
+        let mut app = app_with_torrents(Vec::new());
+        for _ in 0..(MAX_FILTER_CHARS + 5) {
+            app.push_filter_char('x');
+        }
+        assert_eq!(app.filter_text.chars().count(), MAX_FILTER_CHARS);
     }
 
     #[test]

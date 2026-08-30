@@ -26,8 +26,9 @@ cargo audit
 
 `RUSTFLAGS` matters: CI sets it globally, including for the test job, so a
 warning in test code passes locally without it and fails in CI. `cargo audit`
-is a third CI job (it reads `.cargo/audit.toml`) that a dependency bump will
-trip.
+is a third CI job that a dependency bump can trip; if an advisory ever needs
+to be ignored deliberately, record it in `.cargo/audit.toml` with the
+rationale and the condition for removing it.
 
 If you touch the engine, smoke-test against a public-domain torrent (e.g. one of [archive.org's](https://archive.org/) `.torrent` files) before submitting.
 
