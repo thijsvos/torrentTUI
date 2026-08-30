@@ -53,12 +53,16 @@ use tracing_subscriber::EnvFilter;
 use types::{AppMode, DetailTab};
 use ui::input::{validate_magnet, validate_torrent_source, InputWidget};
 
-/// Speed-limit cap in KB/s: the largest value whose bytes/sec conversion
-/// (× 1024) still fits the `NonZeroU32` quota librqbit's rate limiter takes —
-/// ⌊u32::MAX / 1024⌋, ≈4 GiB/s. Applied by [`clamped_speed_limit`] to every
-/// entry point: the throttle dialog, the values read from `config.toml`, and
-/// the limits the engine enforces.
-const MAX_SPEED_LIMIT_KBPS: u64 = 4_194_303;
+/// Speed-limit cap in KB/s: ⌊10⁹ / 1024⌋, ≈953 MiB/s. The binding constraint
+/// is governor's pacing ceiling, not the `NonZeroU32` quota: librqbit's
+/// limiter replenishes one byte-permit per whole nanosecond at most, so
+/// ~1 GB/s is the fastest rate it can pace — a higher cap would display
+/// limits the limiter cannot enforce. (Near the cap, enforcement quantizes
+/// to 10⁹/k bytes/sec for integer k — coarser than configured, never a
+/// stall.) Applied by [`clamped_speed_limit`] to every entry point: the
+/// throttle dialog, the values read from `config.toml`, and the limits the
+/// engine enforces.
+const MAX_SPEED_LIMIT_KBPS: u64 = 976_562;
 
 /// Speed-limit floor in KB/s for nonzero limits. librqbit acquires limiter
 /// permits in whole 16 KiB chunks, and a per-second quota smaller than one
@@ -1512,6 +1516,10 @@ mod tests {
         let capped = clamped_speed_limit(u64::MAX);
         assert!(capped.checked_mul(1024).is_some());
         assert!(u32::try_from(capped.saturating_mul(1024)).is_ok());
+        // The cap must stay at or below governor's pacing ceiling: the
+        // limiter replenishes one byte-permit per whole nanosecond at most,
+        // so a quota above 1e9 bytes/sec is displayed but not enforced.
+        assert!(capped.saturating_mul(1024) <= 1_000_000_000);
     }
 
     #[tokio::test]

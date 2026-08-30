@@ -229,8 +229,8 @@ confirm_on_quit = true
 listen_port = 6881
 enable_dht = true
 enable_upnp = false           # opt in to open an external port via UPnP
-max_download_speed_kbps = 0   # KiB/s; 0 = unlimited (values 1-15 are raised to 16)
-max_upload_speed_kbps = 0     # KiB/s; 0 = unlimited
+max_download_speed_kbps = 0   # KiB/s; 0 = unlimited (nonzero values below 16 are raised to 16)
+max_upload_speed_kbps = 0     # KiB/s; 0 = unlimited (nonzero values below 16 are raised to 16)
 http_api_bind = "127.0.0.1:0" # localhost-only by default (0 = auto-assigned port)
 
 [ui]

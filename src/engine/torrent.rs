@@ -1234,6 +1234,10 @@ mod tests {
         let max = speed_limit_bps(u64::MAX).map(|v| v.get()).unwrap_or(0);
         assert!(max > 0);
         assert_eq!(u64::from(max), crate::clamped_speed_limit(u64::MAX) * 1024);
+        // And inside governor's pacing ceiling: replenishment is one
+        // byte-permit per whole nanosecond at most, so any quota above 1e9
+        // bytes/sec would be displayed but not enforced.
+        assert!(u64::from(max) <= 1_000_000_000);
     }
 
     #[test]

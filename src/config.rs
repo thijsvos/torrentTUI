@@ -53,7 +53,8 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub max_download_speed_kbps: u64,
     /// Upload cap in KB/s, `0` for unlimited. Same limiter as the download
-    /// cap; the two are independent buckets and never interact.
+    /// cap — including the 16 KiB/s floor for nonzero values; the two are
+    /// independent buckets and never interact.
     #[serde(default)]
     pub max_upload_speed_kbps: u64,
     /// Bind address for the embedded HTTP API that serves file-stream URLs to
