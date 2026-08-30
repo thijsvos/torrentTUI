@@ -62,6 +62,49 @@ impl PaletteState {
     }
 }
 
+/// Sort column for the search-results table. Distinct from the torrent
+/// table's `SortColumn`: the columns differ, and so does the model — each
+/// column has a *natural* direction it lands in when first selected
+/// (numeric columns biggest-first, title A→Z), and `sort_reversed` flips
+/// that, rather than reversal being a direction in itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ResultSortColumn {
+    Seeders,
+    Size,
+    Title,
+    Leechers,
+}
+
+impl ResultSortColumn {
+    pub fn next(self) -> Self {
+        match self {
+            ResultSortColumn::Seeders => ResultSortColumn::Size,
+            ResultSortColumn::Size => ResultSortColumn::Title,
+            ResultSortColumn::Title => ResultSortColumn::Leechers,
+            ResultSortColumn::Leechers => ResultSortColumn::Seeders,
+        }
+    }
+
+    /// Position of this column in the rendered results table (column 0 is
+    /// the ✓ added-mark). Indexes `ui/search.rs`'s header labels, so the two
+    /// must stay in the same order — the same contract `SortColumn` has with
+    /// `table.rs`.
+    pub fn column_index(self) -> usize {
+        match self {
+            ResultSortColumn::Title => 1,
+            ResultSortColumn::Size => 2,
+            ResultSortColumn::Seeders => 3,
+            ResultSortColumn::Leechers => 4,
+        }
+    }
+
+    /// The direction this column lands in when first selected: you sort by
+    /// seeders to find the best-seeded result, by title to read A→Z.
+    pub fn natural_descending(self) -> bool {
+        !matches!(self, ResultSortColumn::Title)
+    }
+}
+
 /// State for the indexer-search feature, grouped because it lives and dies
 /// together: it persists for the whole session (leaving the search views and
 /// coming back shows the last query and results untouched) and only firing a
@@ -89,6 +132,12 @@ pub struct SearchState {
     pub provider_errors: Vec<String>,
     pub selected: usize,
     pub table_state: TableState,
+    /// Results-table sort. Sticky for the session (a retry or a new query
+    /// keeps it), like the torrent table's sort.
+    pub sort_column: ResultSortColumn,
+    /// Flips the column's natural direction — `false` means "as
+    /// [`ResultSortColumn::natural_descending`] says", not "ascending".
+    pub sort_reversed: bool,
     /// Info hashes sent to `AddTorrent` this session, for the ✓ mark. Keyed
     /// by hash (not row) so the mark survives re-searching. The double-Enter
     /// guard blocks a re-send only while the torrent is actually present in
@@ -112,6 +161,8 @@ impl SearchState {
             provider_errors: Vec::new(),
             selected: 0,
             table_state,
+            sort_column: ResultSortColumn::Seeders,
+            sort_reversed: false,
             added: HashSet::new(),
         }
     }
@@ -821,11 +872,86 @@ impl App {
         self.search.results = outcome.results;
         self.search.provider_errors = outcome.provider_errors;
         self.search.searched_once = true;
+        // Fresh results honor the session's sticky sort, and the cursor
+        // starts at the top of the *sorted* list rather than following
+        // whatever the previous selection was.
+        self.resort_search_results();
         self.search.selected = 0;
         let mut table_state = TableState::default();
         table_state.select(Some(0));
         self.search.table_state = table_state;
         self.in_search_view()
+    }
+
+    /// Effective sort direction of the results table, for the header arrow:
+    /// `true` = descending (▼).
+    pub fn result_sort_descending(&self) -> bool {
+        self.search.sort_column.natural_descending() != self.search.sort_reversed
+    }
+
+    /// Sorting is a no-op while the spinner hides the table or there is
+    /// nothing to sort — the same condition as the registry rows'
+    /// `has_search_result` availability, so the raw keys agree with what the
+    /// palette offers. Without this, Tab/R during an in-flight retry would
+    /// silently mutate the sticky sort with zero visible feedback and the
+    /// landing results would arrive ordered by a column never visibly chosen.
+    fn result_sort_locked(&self) -> bool {
+        self.search.in_flight || self.search.results.is_empty()
+    }
+
+    /// `Tab` in the results view: next column, landing in that column's
+    /// natural direction (mirroring how selecting a column behaves in
+    /// desktop torrent clients), not carrying the previous reversal over.
+    pub fn cycle_result_sort(&mut self) {
+        if self.result_sort_locked() {
+            return;
+        }
+        self.search.sort_column = self.search.sort_column.next();
+        self.search.sort_reversed = false;
+        self.resort_search_results();
+    }
+
+    /// `R` in the results view: flip the current column's direction.
+    pub fn reverse_result_sort(&mut self) {
+        if self.result_sort_locked() {
+            return;
+        }
+        self.search.sort_reversed = !self.search.sort_reversed;
+        self.resort_search_results();
+    }
+
+    /// Re-sort the results in place, keeping the cursor on the result it was
+    /// on (found again by info hash — the row moves, the selection follows).
+    /// ≤ 500 rows and only runs on sort changes and outcome arrival, so no
+    /// cache like the torrent table's is warranted.
+    fn resort_search_results(&mut self) {
+        let anchor = self.selected_search_result().map(|r| r.info_hash.clone());
+        let col = self.search.sort_column;
+        let descending = self.result_sort_descending();
+        self.search.results.sort_by(|a, b| {
+            let ord = match col {
+                ResultSortColumn::Seeders => a.seeders.cmp(&b.seeders),
+                ResultSortColumn::Leechers => a.leechers.cmp(&b.leechers),
+                // Unknown sizes count as 0, sinking "?" rows to the bottom
+                // in the default (descending) direction.
+                ResultSortColumn::Size => a.size_bytes.unwrap_or(0).cmp(&b.size_bytes.unwrap_or(0)),
+                ResultSortColumn::Title => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+            };
+            let ord = if descending { ord.reverse() } else { ord };
+            // Tiebreak after the flip, so equal keys always read A→Z
+            // whichever direction the column sorts in.
+            ord.then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+        });
+        if let Some(hash) = anchor {
+            if let Some(pos) = self.search.results.iter().position(|r| r.info_hash == hash) {
+                self.search.selected = pos;
+            }
+        }
+        self.search.selected = self
+            .search
+            .selected
+            .min(self.search.results.len().saturating_sub(1));
+        self.search.table_state.select(Some(self.search.selected));
     }
 
     pub fn search_next(&mut self) {
@@ -1618,6 +1744,165 @@ mod tests {
             results,
             provider_errors: Vec::new(),
         }
+    }
+
+    /// Fully-specified result for the sort tests.
+    fn sortable(hash: &str, title: &str, size: Option<u64>, seeders: u64, l: u64) -> SearchResult {
+        SearchResult {
+            title: title.to_string(),
+            info_hash: hash.to_string(),
+            size_bytes: size,
+            seeders,
+            leechers: l,
+            source: crate::search::SourceSet {
+                apibay: true,
+                torrents_csv: false,
+            },
+        }
+    }
+
+    fn app_with_sortable_results() -> App {
+        let mut app = App::new();
+        app.search.input = "q".to_string();
+        let (_, generation) = app.fire_search().expect("fires");
+        app.apply_search_outcome(outcome(
+            generation,
+            vec![
+                sortable("h1", "banana", Some(10), 5, 9),
+                sortable("h2", "Apple", None, 50, 1),
+                sortable("h3", "cherry", Some(999), 20, 4),
+            ],
+        ));
+        app
+    }
+
+    #[test]
+    fn results_default_to_seeders_descending_and_tab_cycles_all_columns() {
+        let mut app = app_with_sortable_results();
+        assert_eq!(app.search.sort_column, ResultSortColumn::Seeders);
+        assert!(app.result_sort_descending());
+        let seeders: Vec<u64> = app.search.results.iter().map(|r| r.seeders).collect();
+        assert_eq!(seeders, vec![50, 20, 5]);
+
+        app.cycle_result_sort();
+        assert_eq!(app.search.sort_column, ResultSortColumn::Size);
+        app.cycle_result_sort();
+        assert_eq!(app.search.sort_column, ResultSortColumn::Title);
+        app.cycle_result_sort();
+        assert_eq!(app.search.sort_column, ResultSortColumn::Leechers);
+        app.cycle_result_sort();
+        assert_eq!(app.search.sort_column, ResultSortColumn::Seeders);
+    }
+
+    #[test]
+    fn size_sort_descends_by_default_with_unknown_sizes_last() {
+        let mut app = app_with_sortable_results();
+        app.cycle_result_sort(); // Seeders -> Size
+        let hashes: Vec<&str> = app
+            .search
+            .results
+            .iter()
+            .map(|r| r.info_hash.as_str())
+            .collect();
+        // 999, 10, then the unknown ("?") size at the bottom.
+        assert_eq!(hashes, vec!["h3", "h1", "h2"]);
+    }
+
+    #[test]
+    fn title_sort_is_case_insensitive_ascending_until_reversed() {
+        let mut app = app_with_sortable_results();
+        app.cycle_result_sort();
+        app.cycle_result_sort(); // -> Title, natural ascending
+        assert!(!app.result_sort_descending());
+        let titles: Vec<&str> = app
+            .search
+            .results
+            .iter()
+            .map(|r| r.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Apple", "banana", "cherry"]);
+
+        app.reverse_result_sort();
+        assert!(app.result_sort_descending());
+        let titles: Vec<&str> = app
+            .search
+            .results
+            .iter()
+            .map(|r| r.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["cherry", "banana", "Apple"]);
+    }
+
+    #[test]
+    fn reverse_flips_the_natural_direction_and_cycling_resets_it() {
+        let mut app = app_with_sortable_results();
+        app.reverse_result_sort(); // Seeders ascending now
+        assert!(!app.result_sort_descending());
+        let seeders: Vec<u64> = app.search.results.iter().map(|r| r.seeders).collect();
+        assert_eq!(seeders, vec![5, 20, 50]);
+        // Moving to another column lands in ITS natural direction, not the
+        // reversed state left behind.
+        app.cycle_result_sort();
+        assert!(app.result_sort_descending());
+    }
+
+    #[test]
+    fn sort_keys_are_inert_while_in_flight_or_without_results() {
+        // Matches the registry rows' `has_search_result` availability: while
+        // the spinner hides the table (or with nothing to sort) Tab/R must
+        // not silently mutate the sticky sort.
+        let mut app = app_with_sortable_results();
+        app.search.in_flight = true;
+        app.cycle_result_sort();
+        app.reverse_result_sort();
+        assert_eq!(app.search.sort_column, ResultSortColumn::Seeders);
+        assert!(!app.search.sort_reversed);
+
+        let mut empty = App::new();
+        empty.cycle_result_sort();
+        empty.reverse_result_sort();
+        assert_eq!(empty.search.sort_column, ResultSortColumn::Seeders);
+        assert!(!empty.search.sort_reversed);
+    }
+
+    #[test]
+    fn cursor_follows_the_selected_result_across_a_resort() {
+        let mut app = app_with_sortable_results();
+        // Select "banana" (h1): seeders order is h2, h3, h1 -> index 2.
+        app.search_next();
+        app.search_next();
+        assert_eq!(app.selected_search_result().unwrap().info_hash, "h1");
+        app.cycle_result_sort();
+        app.cycle_result_sort(); // Title asc: Apple, banana, cherry
+        assert_eq!(app.selected_search_result().unwrap().info_hash, "h1");
+        assert_eq!(app.search.selected, 1);
+        assert_eq!(app.search.table_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn a_new_outcome_honors_the_sticky_sort_and_resets_the_cursor() {
+        let mut app = app_with_sortable_results();
+        app.cycle_result_sort();
+        app.cycle_result_sort(); // Title asc, sticky
+        app.search_next();
+        app.search.input = "q2".to_string();
+        let (_, generation) = app.fire_search().expect("fires");
+        app.apply_search_outcome(outcome(
+            generation,
+            vec![
+                sortable("n1", "zebra", None, 1, 0),
+                sortable("n2", "aardvark", None, 2, 0),
+            ],
+        ));
+        let titles: Vec<&str> = app
+            .search
+            .results
+            .iter()
+            .map(|r| r.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["aardvark", "zebra"]);
+        assert_eq!(app.search.selected, 0);
+        assert_eq!(app.search.table_state.selected(), Some(0));
     }
 
     #[test]

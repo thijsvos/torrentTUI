@@ -988,6 +988,9 @@ async fn handle_search_results_mode(
         }
         KeyCode::Char('j') | KeyCode::Down => app.search_next(),
         KeyCode::Char('k') | KeyCode::Up => app.search_previous(),
+        KeyCode::Tab => app.cycle_result_sort(),
+        // `r` is taken by retry in this view, so reverse lives on `R`.
+        KeyCode::Char('R') => app.reverse_result_sort(),
         KeyCode::Char('r') => retry_search(app, search_tx, search_client),
         KeyCode::Enter => download_selected_result(app, cmd_tx).await,
         _ => {}
@@ -1196,6 +1199,8 @@ async fn execute_action(
         A::DownloadResult => download_selected_result(app, cmd_tx).await,
         A::EditQuery => app.mode = AppMode::Search,
         A::RetrySearch => retry_search(app, search_tx, search_client),
+        A::CycleResultSort => app.cycle_result_sort(),
+        A::ReverseResultSort => app.reverse_result_sort(),
         A::SearchBack => app.mode = AppMode::Normal,
     }
 }
@@ -1958,17 +1963,20 @@ mod tests {
         app.search.query = "q".to_string();
         app.search.results = vec![search_result_fixture()];
         assert!(app.open_palette());
-        // Anchor "Download the selected result" (alphabetically second with
-        // an empty query; present because no search is in flight).
-        handle_palette_mode(
-            &mut app,
-            ctrl(KeyCode::Char('j')),
-            &mut iw,
-            &tx,
-            &search_tx,
-            &mut client,
-        )
-        .await;
+        // Anchor "Download the selected result" (alphabetically third with
+        // an empty query, behind "Back…" and "Cycle result sort column";
+        // present because no search is in flight).
+        for _ in 0..2 {
+            handle_palette_mode(
+                &mut app,
+                ctrl(KeyCode::Char('j')),
+                &mut iw,
+                &tx,
+                &search_tx,
+                &mut client,
+            )
+            .await;
+        }
         let anchored = app.palette.anchor.expect("anchored");
         assert!(actions::tui_description(anchored).contains("Download"));
         // Background change: a retry starts, hiding DownloadResult.
@@ -2154,6 +2162,34 @@ mod tests {
             .as_deref()
             .is_some_and(|m| m.contains("disabled")));
         assert!(client.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_results_tab_cycles_sort_and_shift_r_reverses() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        app.search.results = vec![search_result_fixture()];
+        handle_search_results_mode(&mut app, key(KeyCode::Tab), &tx, &search_tx, &mut client).await;
+        assert_eq!(
+            app.search.sort_column,
+            crate::app::ResultSortColumn::Size,
+            "Tab moves off the Seeders default"
+        );
+        assert!(!app.search.sort_reversed);
+        handle_search_results_mode(
+            &mut app,
+            key(KeyCode::Char('R')),
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert!(app.search.sort_reversed, "R flips the direction");
+        // Sorting stays in the results view; nothing reaches the engine.
+        assert_eq!(app.mode, AppMode::SearchResults);
     }
 
     #[tokio::test]
