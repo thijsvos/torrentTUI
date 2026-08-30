@@ -53,17 +53,34 @@ use tracing_subscriber::EnvFilter;
 use types::{AppMode, DetailTab};
 use ui::input::{validate_magnet, validate_torrent_source, InputWidget};
 
-/// Speed-limit cap in KB/s (10 GB/s). Applied by [`clamped_speed_limit`] to
-/// every entry point: the throttle dialog, the values read from `config.toml`,
-/// and the limits the engine enforces.
-const MAX_SPEED_LIMIT_KBPS: u64 = 10_485_760;
+/// Speed-limit cap in KB/s: ⌊10⁹ / 1024⌋, ≈953 MiB/s. The binding constraint
+/// is governor's pacing ceiling, not the `NonZeroU32` quota: librqbit's
+/// limiter replenishes one byte-permit per whole nanosecond at most, so
+/// ~1 GB/s is the fastest rate it can pace — a higher cap would display
+/// limits the limiter cannot enforce. (Near the cap, enforcement quantizes
+/// to 10⁹/k bytes/sec for integer k — coarser than configured, never a
+/// stall.) Applied by [`clamped_speed_limit`] to every entry point: the
+/// throttle dialog, the values read from `config.toml`, and the limits the
+/// engine enforces.
+const MAX_SPEED_LIMIT_KBPS: u64 = 976_562;
 
-/// Clamp a user-supplied speed limit. The single choke point for the cap —
-/// the status bar multiplies by 1024 without saturating, and the engine casts
-/// to `i64`, so a value that skips this can overflow the display or invert the
-/// upload bucket and pause every torrent forever.
+/// Speed-limit floor in KB/s for nonzero limits. librqbit acquires limiter
+/// permits in whole 16 KiB chunks, and a per-second quota smaller than one
+/// chunk makes governor report the acquire as impossible — killing the peer
+/// task instead of pacing it.
+const MIN_SPEED_LIMIT_KBPS: u64 = 16;
+
+/// Clamp a user-supplied speed limit (`0` stays 0 = unlimited). The single
+/// choke point for the floor and the cap — the status bar multiplies by 1024
+/// without saturating, and the engine converts to the limiter's `NonZeroU32`
+/// bytes/sec quota, so a value that skips this can overflow the display or
+/// produce a quota the limiter cannot serve.
 pub(crate) fn clamped_speed_limit(kbps: u64) -> u64 {
-    kbps.min(MAX_SPEED_LIMIT_KBPS)
+    if kbps == 0 {
+        0
+    } else {
+        kbps.clamp(MIN_SPEED_LIMIT_KBPS, MAX_SPEED_LIMIT_KBPS)
+    }
 }
 
 /// Size at which the log is rotated on startup. The default filter is
@@ -670,17 +687,14 @@ fn open_search_input(app: &mut App) {
 async fn pause_toggle(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
     if app.has_marks() {
         let ids: Vec<usize> = app.marked_ids.iter().copied().collect();
-        // "Any user-paused → resume all" is the intuitive model. A
-        // throttle-paused torrent does not count: it reports Paused
-        // mid duty cycle while the user never asked for it, and
-        // treating it as paused flipped this whole batch to Resume
-        // whenever a speed limit was set (#47).
+        // "Any paused → resume all" is the intuitive model. Since speed
+        // limits moved into librqbit's rate limiter, Paused always means
+        // the user asked for it — the old throttle-pause ambiguity (#47)
+        // no longer exists.
         let any_paused = ids.iter().any(|id| {
-            app.torrents.iter().any(|t| {
-                t.id == *id
-                    && matches!(t.status, types::TorrentStatus::Paused)
-                    && !t.throttle_managed
-            })
+            app.torrents
+                .iter()
+                .any(|t| t.id == *id && matches!(t.status, types::TorrentStatus::Paused))
         });
         // Send the whole batch as one message — the 32-slot channel
         // would block on the 33rd send otherwise, and the engine's own
@@ -694,41 +708,31 @@ async fn pause_toggle(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
         app.clear_marks();
     } else if let Some(torrent) = app.selected_torrent() {
         let id = torrent.id;
-        // Resume only what the user paused. A torrent that is Paused
-        // while throttle-managed is mid duty cycle, and `p` there means
-        // "stop it properly", not "hand it back to the throttle".
-        if matches!(torrent.status, types::TorrentStatus::Paused) && torrent.throttle_managed {
-            send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
-        } else {
-            match torrent.status {
-                // Seeding and Complete are pausable too — librqbit
-                // handles a finished torrent fine, and the marked and
-                // `P` paths already pause them, so leaving them out
-                // here made `p` a dropped keypress on a seeding row.
-                types::TorrentStatus::Downloading
-                | types::TorrentStatus::Complete
-                | types::TorrentStatus::Seeding => {
-                    send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
-                }
-                types::TorrentStatus::Paused => {
-                    send_cmd(cmd_tx, EngineCommand::Resume(id), app).await;
-                }
-                types::TorrentStatus::FetchingMetadata => {
-                    app.set_info("Can't pause while fetching metadata".to_string());
-                }
-                _ => {}
+        match torrent.status {
+            // Seeding and Complete are pausable too — librqbit
+            // handles a finished torrent fine, and the marked and
+            // `P` paths already pause them, so leaving them out
+            // here made `p` a dropped keypress on a seeding row.
+            types::TorrentStatus::Downloading
+            | types::TorrentStatus::Complete
+            | types::TorrentStatus::Seeding => {
+                send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
             }
+            types::TorrentStatus::Paused => {
+                send_cmd(cmd_tx, EngineCommand::Resume(id), app).await;
+            }
+            types::TorrentStatus::FetchingMetadata => {
+                app.set_info("Can't pause while fetching metadata".to_string());
+            }
+            _ => {}
         }
     }
 }
 
 /// Pause or resume everything.
 async fn pause_all(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
-    // Same test as the `p` handler: only a *user* pause counts as
-    // paused. A throttle-managed torrent reports Paused mid duty
-    // cycle, and treating that as paused made `P` send ResumeAll when
-    // the user asked to pause everything. `.all()` on an empty
-    // iterator is also true, so an idle session needs the emptiness
+    // "Everything paused → resume all", like the `p` handler. `.all()` on
+    // an empty iterator is true, so an idle session needs the emptiness
     // guard or `P` resumes nothing at all.
     let pausable: Vec<&types::TorrentInfo> = app
         .torrents
@@ -746,7 +750,7 @@ async fn pause_all(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
     let all_paused = !pausable.is_empty()
         && pausable
             .iter()
-            .all(|t| matches!(t.status, types::TorrentStatus::Paused) && !t.throttle_managed);
+            .all(|t| matches!(t.status, types::TorrentStatus::Paused));
 
     let cmd = if all_paused {
         EngineCommand::ResumeAll
@@ -1296,11 +1300,9 @@ async fn handle_throttle_mode(
             app.throttle_input_buf.push(c);
         }
         KeyCode::Enter => {
-            let value = app
-                .throttle_input_buf
-                .parse::<u64>()
-                .unwrap_or(0)
-                .min(MAX_SPEED_LIMIT_KBPS);
+            // Clamp exactly like the engine will, so the dialog, status bar
+            // and enforced limit all agree (including the 16 KB/s floor).
+            let value = clamped_speed_limit(app.throttle_input_buf.parse::<u64>().unwrap_or(0));
             if app.throttle_step == 0 {
                 app.throttle_download_value = value;
                 app.throttle_step = 1;
@@ -1499,46 +1501,63 @@ mod tests {
 
     #[test]
     fn clamped_speed_limit_bounds_every_entry_point() {
-        // Calls the production function rather than re-implementing `.min()`,
-        // so deleting the clamp fails here. The old version of this test
-        // asserted `u64::MAX.min(CAP) == CAP` and could not detect #49 at all.
+        // Calls the production function rather than re-implementing the
+        // clamp, so deleting either bound fails here.
         assert_eq!(clamped_speed_limit(u64::MAX), MAX_SPEED_LIMIT_KBPS);
         assert_eq!(clamped_speed_limit(0), 0);
         assert_eq!(clamped_speed_limit(1024), 1024);
-        // The two conversions that used to overflow: the status bar's `* 1024`
-        // and the engine's cast to i64 for the token bucket.
+        // Nonzero values below one 16 KiB chunk/sec clamp *up*: librqbit's
+        // limiter cannot serve a quota smaller than one chunk.
+        assert_eq!(clamped_speed_limit(1), MIN_SPEED_LIMIT_KBPS);
+        assert_eq!(clamped_speed_limit(15), MIN_SPEED_LIMIT_KBPS);
+        assert_eq!(clamped_speed_limit(16), 16);
+        // The conversions downstream of the cap: the status bar's `* 1024`
+        // and the engine's NonZeroU32 bytes/sec quota for the rate limiter.
         let capped = clamped_speed_limit(u64::MAX);
         assert!(capped.checked_mul(1024).is_some());
-        assert!(i64::try_from(capped.saturating_mul(1024)).is_ok());
+        assert!(u32::try_from(capped.saturating_mul(1024)).is_ok());
+        // The cap must stay at or below governor's pacing ceiling: the
+        // limiter replenishes one byte-permit per whole nanosecond at most,
+        // so a quota above 1e9 bytes/sec is displayed but not enforced.
+        assert!(capped.saturating_mul(1024) <= 1_000_000_000);
     }
 
     #[tokio::test]
-    async fn pause_all_pauses_when_a_throttled_torrent_looks_paused() {
-        // A throttle-managed torrent reports Paused mid duty cycle. Counting
-        // that as "paused" made `P` send ResumeAll when the user asked to
-        // pause everything.
+    async fn throttle_dialog_sends_clamped_limits() {
+        // The dialog clamps through `clamped_speed_limit`, so the engine, the
+        // status bar and the confirmation message can never disagree — the
+        // floor raises a 1 KB/s entry to 16, and an over-cap entry (the buf
+        // takes up to 8 digits, well past the ~4.2M cap) comes back capped.
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        open_throttle(&mut app);
+        handle_throttle_mode(&mut app, key(KeyCode::Char('1')), &tx).await;
+        handle_throttle_mode(&mut app, key(KeyCode::Enter), &tx).await;
+        for c in "99999999".chars() {
+            handle_throttle_mode(&mut app, key(KeyCode::Char(c)), &tx).await;
+        }
+        handle_throttle_mode(&mut app, key(KeyCode::Enter), &tx).await;
+        match rx.try_recv().expect("a command should have been sent") {
+            EngineCommand::SetSpeedLimits {
+                download_kbps,
+                upload_kbps,
+            } => {
+                assert_eq!(download_kbps, MIN_SPEED_LIMIT_KBPS);
+                assert_eq!(upload_kbps, MAX_SPEED_LIMIT_KBPS);
+            }
+            other => panic!("expected SetSpeedLimits, got {other:?}"),
+        }
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn pause_all_resumes_when_everything_is_paused() {
         let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
         let mut app = App::new();
         let mut iw = InputWidget::new();
         app.handle_state_push(vec![
-            torrent(0, types::TorrentStatus::Downloading, true),
-            torrent(1, types::TorrentStatus::Paused, true),
-        ]);
-        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('P')), &tx).await;
-        assert!(matches!(
-            rx.try_recv().expect("a command"),
-            EngineCommand::PauseAll
-        ));
-    }
-
-    #[tokio::test]
-    async fn pause_all_resumes_only_when_everything_is_user_paused() {
-        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
-        let mut app = App::new();
-        let mut iw = InputWidget::new();
-        app.handle_state_push(vec![
-            torrent(0, types::TorrentStatus::Paused, false),
-            torrent(1, types::TorrentStatus::Paused, false),
+            torrent(0, types::TorrentStatus::Paused),
+            torrent(1, types::TorrentStatus::Paused),
         ]);
         handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('P')), &tx).await;
         assert!(matches!(
@@ -1573,7 +1592,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
             let mut app = App::new();
             let mut iw = InputWidget::new();
-            app.handle_state_push(vec![torrent(0, status.clone(), false)]);
+            app.handle_state_push(vec![torrent(0, status.clone())]);
             handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
             assert!(
                 matches!(rx.try_recv().expect("a command"), EngineCommand::Pause(0)),
@@ -1709,7 +1728,7 @@ mod tests {
         assert_eq!(app.filter_text, ""); // Esc clears the filter
     }
 
-    fn torrent(id: usize, status: types::TorrentStatus, managed: bool) -> types::TorrentInfo {
+    fn torrent(id: usize, status: types::TorrentStatus) -> types::TorrentInfo {
         types::TorrentInfo {
             id,
             name: format!("t{id}"),
@@ -1728,40 +1747,18 @@ mod tests {
             trackers: Vec::new(),
             piece_length: None,
             content_path: None,
-            throttle_managed: managed,
         }
     }
 
     #[tokio::test]
-    async fn bulk_pause_under_a_speed_limit_pauses_rather_than_resumes() {
-        // #47: throttle-managed torrents used to count as "paused", so `p` on a
-        // set of actively downloading torrents sent ResumeMany and nothing
-        // appeared to happen. Being managed must not imply paused.
+    async fn bulk_pause_resumes_when_any_marked_torrent_is_paused() {
+        // "Any paused → resume all" over the marked set.
         let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
         let mut app = App::new();
         let mut iw = InputWidget::new();
         app.handle_state_push(vec![
-            torrent(0, types::TorrentStatus::Downloading, true),
-            torrent(1, types::TorrentStatus::Downloading, true),
-        ]);
-        app.marked_ids.insert(0);
-        app.marked_ids.insert(1);
-        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
-        match rx.try_recv().expect("a command should have been sent") {
-            EngineCommand::PauseMany(ids) => assert_eq!(ids.len(), 2),
-            other => panic!("expected PauseMany, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn bulk_pause_resumes_when_something_is_genuinely_user_paused() {
-        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
-        let mut app = App::new();
-        let mut iw = InputWidget::new();
-        app.handle_state_push(vec![
-            torrent(0, types::TorrentStatus::Downloading, true),
-            // User-paused: a real pause clears throttle management.
-            torrent(1, types::TorrentStatus::Paused, false),
+            torrent(0, types::TorrentStatus::Downloading),
+            torrent(1, types::TorrentStatus::Paused),
         ]);
         app.marked_ids.insert(0);
         app.marked_ids.insert(1);
@@ -1773,22 +1770,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_pause_resumes_only_a_user_paused_torrent() {
-        // Paused + managed is mid duty cycle: `p` there means "stop it
-        // properly", not "hand it back to the throttle".
+    async fn p_resumes_a_paused_torrent() {
+        // Paused always means user-paused now that speed limits live in
+        // librqbit's rate limiter, so `p` on a Paused row is always Resume.
         let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
         let mut app = App::new();
         let mut iw = InputWidget::new();
-        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Paused, true)]);
-        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
-        assert!(matches!(
-            rx.try_recv().expect("a command"),
-            EngineCommand::Pause(0)
-        ));
-
-        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
-        let mut app = App::new();
-        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Paused, false)]);
+        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Paused)]);
         handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
         assert!(matches!(
             rx.try_recv().expect("a command"),
@@ -1868,7 +1856,7 @@ mod tests {
         let mut client = None;
         let mut iw = InputWidget::new();
         let mut app = App::new();
-        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Downloading, false)]);
+        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Downloading)]);
         assert!(app.open_palette());
         for c in "pause all".chars() {
             handle_palette_mode(
@@ -2012,7 +2000,7 @@ mod tests {
         let mut client = None;
         let mut iw = InputWidget::new();
         let mut app = App::new();
-        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Downloading, false)]);
+        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Downloading)]);
         app.mode = AppMode::Detail;
         assert!(app.open_palette());
         for c in "cycle detail".chars() {
@@ -2208,7 +2196,7 @@ mod tests {
         // Simulate the engine's state push confirming the add. Uppercase hash
         // exercises the case-insensitive presence check (search hashes are
         // normalized lowercase, the engine reports librqbit's formatting).
-        let mut t = torrent(0, types::TorrentStatus::Downloading, false);
+        let mut t = torrent(0, types::TorrentStatus::Downloading);
         t.info_hash = "88066B90278F2DE655EE2DD44E784C340B54E45C".to_string();
         app.handle_state_push(vec![t]);
         handle_search_results_mode(&mut app, key(KeyCode::Enter), &tx, &search_tx, &mut client)

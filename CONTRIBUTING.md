@@ -42,7 +42,7 @@ If you touch the engine, smoke-test against a public-domain torrent (e.g. one of
 ## Areas that especially welcome help
 
 - Cross-platform polish: Windows-specific terminal quirks, macOS notification-permission handling.
-- Test coverage on `engine/torrent.rs` (the throttle algorithm in particular).
+- Test coverage on `engine/torrent.rs` (the `run_engine` command loop in particular).
 - Performance profiling on libraries with thousands of peers.
 - Translations / accessibility (currently English-only, no high-contrast mode).
 

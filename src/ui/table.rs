@@ -81,8 +81,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                 _ => render_progress_bar(percent, 15),
             };
 
-            let (status_text, status_style) =
-                status_cell_style(&torrent.status, torrent.throttle_managed);
+            let (status_text, status_style) = status_cell_style(&torrent.status);
 
             let progress_style = match torrent.status {
                 TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
@@ -150,14 +149,11 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-/// Map a torrent's status (and the throttle-managed override) to the cell text
-/// and style. Being under a speed limit takes precedence over the underlying
-/// engine state, so a torrent mid duty cycle reads as "Throttled" rather than
-/// blinking between Downloading and Paused every tick.
-pub fn status_cell_style(status: &TorrentStatus, throttle_managed: bool) -> (String, Style) {
-    if throttle_managed {
-        return ("Throttled".to_string(), Style::default().fg(Color::Cyan));
-    }
+/// Map a torrent's status to the cell text and style. Speed limits are
+/// enforced inside librqbit's rate limiter, so there is no "Throttled"
+/// pseudo-status any more — a limited torrent simply shows Downloading (or
+/// Seeding) at a capped speed.
+pub fn status_cell_style(status: &TorrentStatus) -> (String, Style) {
     let style = match status {
         TorrentStatus::Downloading => Style::default().fg(Color::Blue),
         TorrentStatus::Complete | TorrentStatus::Seeding => Style::default().fg(Color::Green),
@@ -173,28 +169,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn throttle_managed_overrides_status() {
-        let (text, _) = status_cell_style(&TorrentStatus::Downloading, true);
-        assert_eq!(text, "Throttled");
-    }
-
-    #[test]
     fn downloading_is_blue() {
-        let (text, style) = status_cell_style(&TorrentStatus::Downloading, false);
+        let (text, style) = status_cell_style(&TorrentStatus::Downloading);
         assert_eq!(text, "Downloading");
         assert_eq!(style, Style::default().fg(Color::Blue));
     }
 
     #[test]
     fn complete_and_seeding_share_color() {
-        let (_, c) = status_cell_style(&TorrentStatus::Complete, false);
-        let (_, s) = status_cell_style(&TorrentStatus::Seeding, false);
+        let (_, c) = status_cell_style(&TorrentStatus::Complete);
+        let (_, s) = status_cell_style(&TorrentStatus::Seeding);
         assert_eq!(c, s);
     }
 
     #[test]
     fn error_text_includes_message() {
-        let (text, _) = status_cell_style(&TorrentStatus::Error("disk full".to_string()), false);
+        let (text, _) = status_cell_style(&TorrentStatus::Error("disk full".to_string()));
         assert!(text.contains("disk full"));
     }
 }
