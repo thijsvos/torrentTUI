@@ -372,12 +372,11 @@ OS file lock, which the kernel releases when the process dies.
 
 ### Known limits
 
-- The detaching process cannot confirm that the background one *started*
-  successfully — it has to release the session for the new process to take it.
-  If something goes wrong the failure is recorded, and `torrenttui --status` and
-  the next launch will report it.
-- Adding a magnet blocks the engine until its metadata resolves, so a stop
-  issued in that window takes up to five seconds rather than being instant.
+- Detaching confirms that the background process **started**, not that its
+  session came up. It cannot: the parent has to keep the lock until it exits, so
+  it can never watch the child take it. If the session then fails to start —
+  say a fail-closed blocklist — that is recorded, and `torrenttui --status` and
+  the next launch report it.
 - `[privacy]` settings are applied when a session starts. A background session
   keeps the posture it started with even if you edit `config.toml` afterwards —
   `--status` shows what it actually applied.
