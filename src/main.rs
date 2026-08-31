@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
         instance::announce_handoff(&session_dir, nonce);
     }
     let is_handoff = handoff.is_some();
-    let mut takeover_of: Option<u32> = None;
+    let mut takeover_of: Option<instance::DaemonRecord> = None;
     match instance::decide(&cli.flags(is_handoff), &instance::probe(&session_dir)) {
         instance::Startup::Report(msg) => {
             println!("{msg}");
@@ -663,12 +663,13 @@ fn hand_off_to_running_session(session_dir: &Path, source: &str) -> Result<()> {
 ///
 /// Honest about its cost — this is a restart, not an attach. Torrents stop and
 /// re-announce, but fastresume means nothing is re-hashed.
-fn take_over_background_session(session_dir: &Path) -> Result<Option<u32>> {
-    let pid = instance::probe(session_dir).record().map(|r| r.pid);
+fn take_over_background_session(session_dir: &Path) -> Result<Option<instance::DaemonRecord>> {
+    let record = instance::probe(session_dir).record().cloned();
+    let pid = record.as_ref().map(|r| r.pid);
     println!("Taking over the background session…");
     instance::send_request(session_dir, &instance::Request::Stop)?;
     if instance::wait_for_release(session_dir, RELEASE_WAIT) {
-        return Ok(pid);
+        return Ok(record);
     }
     match pid {
         Some(pid) => anyhow::bail!(
@@ -816,7 +817,7 @@ async fn run_app(
     cli: Cli,
     config: config::Config,
     config_warning: Option<String>,
-    takeover_of: Option<u32>,
+    takeover_of: Option<instance::DaemonRecord>,
     session_dir: &Path,
     record: instance::DaemonRecord,
 ) -> Result<AppExit> {
@@ -876,10 +877,39 @@ async fn run_app(
     // in a background session.
     let keeper = spawn_session_keeper(session_dir.to_path_buf(), record, cmd_tx.clone(), None);
 
-    if let Some(pid) = takeover_of {
-        app.set_info(format!(
-            "Took over the background session (stopped pid {pid})"
-        ));
+    if let Some(ref record) = takeover_of {
+        // `[privacy]` is applied once, when a session starts, so a background
+        // session keeps the posture it started with however the config was
+        // edited since. Someone who added `bind_interface` believing they were
+        // now covered has been seeding unbound the whole time — say so rather
+        // than let the header badge imply otherwise. Same for the download
+        // directory, where the free-space readout and `o` would otherwise point
+        // somewhere the data is not.
+        let want_privacy = config.privacy.summary();
+        let mut drift = Vec::new();
+        if record.privacy != want_privacy {
+            drift.push(format!(
+                "privacy was {} (config now says {})",
+                record.privacy.as_deref().unwrap_or("off"),
+                want_privacy.as_deref().unwrap_or("off")
+            ));
+        }
+        if !record.download_dir.is_empty() && record.download_dir != config.general.download_dir {
+            drift.push(format!("downloads went to {}", record.download_dir));
+        }
+        if drift.is_empty() {
+            app.set_info(format!(
+                "Took over the background session (stopped pid {})",
+                record.pid
+            ));
+        } else {
+            app.set_error(format!(
+                "\u{26a0} Took over the background session (pid {}) \u{2014} {}. \
+                 The new session uses your current config.",
+                record.pid,
+                drift.join("; ")
+            ));
+        }
     }
 
     if let Some(ref source) = cli.torrent_source {

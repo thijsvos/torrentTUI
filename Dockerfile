@@ -27,7 +27,10 @@ EXPOSE 6881-6890
 
 # Download directory
 VOLUME /downloads
-# Config and session persistence
+# Config *and* session state: torrents persist across container restarts only
+# because the session lives under the config directory (`.../torrenttui/session`).
+# It used to sit in librqbit's own shared data directory, outside this volume,
+# so this mount silently persisted nothing but config.
 VOLUME /home/torrenttui/.config/torrenttui
 
 RUN mkdir -p /downloads && chown torrenttui:torrenttui /downloads

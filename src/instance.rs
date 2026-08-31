@@ -114,6 +114,37 @@ const RECORD_SCHEMA: u32 = 1;
 /// 5 s write interval so a paused laptop or a busy box is not declared dead.
 const HEARTBEAT_STALE_SECS: u64 = 30;
 
+/// Whether a process with this id is still alive.
+///
+/// The heartbeat alone cannot tell "the lock is lying" from "the owner was just
+/// `SIGKILL`ed": both leave a free lock next to a fresh record. Only the second
+/// is common, and treating it as a live session made every hard kill block the
+/// next launch for the whole staleness window.
+///
+/// On unix `kill(pid, 0)` sends no signal and only reports reachability, so it
+/// answers exactly that question. Windows has no equally cheap equivalent
+/// without pulling in a system-bindings crate, so there the heartbeat stands on
+/// its own — the cost is a bounded wait after a hard kill, never a lost
+/// session.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        // Sends no signal; only reports reachability. ESRCH means no such
+        // process; EPERM means it exists but belongs to someone else, which
+        // still counts as alive.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// How the owning process is running. Decides whether a `stop` request is
 /// honoured — a foreground window must never be closed by a background
 /// request — and whether a second launch may take the session over.
@@ -420,7 +451,7 @@ pub fn acquire(session_dir: &Path) -> Result<Result<SessionGuard, Holder>> {
         Ok(()) => {
             // The lock is ours, but it may be lying — see `Holder::Contested`.
             if let Some(record) = read_record(session_dir) {
-                if record.heartbeat_fresh_at(unix_now()) {
+                if record.heartbeat_fresh_at(unix_now()) && pid_is_alive(record.pid) {
                     let _ = file.unlock();
                     return Ok(Err(Holder::Contested(record)));
                 }
@@ -457,7 +488,9 @@ pub fn probe(session_dir: &Path) -> Holder {
         Ok(()) => {
             let _ = file.unlock();
             match read_record(session_dir) {
-                Some(r) if r.heartbeat_fresh_at(unix_now()) => Holder::Contested(r),
+                Some(r) if r.heartbeat_fresh_at(unix_now()) && pid_is_alive(r.pid) => {
+                    Holder::Contested(r)
+                }
                 _ => Holder::Free,
             }
         }
@@ -1071,6 +1104,24 @@ mod tests {
         }
         // And having refused, we must not have kept the lock.
         assert!(matches!(probe(&sd), Holder::Contested(_)));
+    }
+
+    #[test]
+    fn a_dead_owner_does_not_contest_a_free_lock() {
+        // A session killed with SIGKILL leaves a fresh heartbeat behind. Before
+        // the liveness check that blocked the next launch for the whole
+        // staleness window, which is the common case, not the rare one.
+        let dir = TempDir::new().unwrap();
+        let sd = session_dir(dir.path());
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(lock_path(&sd), b"").unwrap();
+        let mut dead = record(Mode::Headless);
+        // pid 0 is never a real process, and `pid_is_alive` rejects it outright.
+        dead.pid = 0;
+        write_record(&sd, &dead).unwrap();
+
+        assert_eq!(probe(&sd), Holder::Free);
+        assert!(acquire(&sd).unwrap().is_ok());
     }
 
     #[test]
