@@ -121,11 +121,8 @@ const HEARTBEAT_STALE_SECS: u64 = 30;
 /// is common, and treating it as a live session made every hard kill block the
 /// next launch for the whole staleness window.
 ///
-/// On unix `kill(pid, 0)` sends no signal and only reports reachability, so it
-/// answers exactly that question. Windows has no equally cheap equivalent
-/// without pulling in a system-bindings crate, so there the heartbeat stands on
-/// its own — the cost is a bounded wait after a hard kill, never a lost
-/// session.
+/// `kill(pid, 0)` on unix and `OpenProcess` + `GetExitCodeProcess` on Windows.
+/// Both are cheap queries that send nothing and change nothing.
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -138,7 +135,34 @@ fn pid_is_alive(pid: u32) -> bool {
         let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: `OpenProcess` is a plain query; the handle is closed on every
+        // path out, and `code` is a live local for the duration of the call.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                // No such process — or one we may not query, which for our
+                // purposes is indistinguishable and errs toward "gone".
+                return false;
+            }
+            let mut code: u32 = 0;
+            let queried = GetExitCodeProcess(handle, &mut code) != 0;
+            CloseHandle(handle);
+            // A handle can outlive the process it names (another process may
+            // still hold one), so the exit code is what actually answers the
+            // question. STILL_ACTIVE is 259.
+            queried && code == 259
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
@@ -1120,27 +1144,24 @@ mod tests {
         dead.pid = 0;
         write_record(&sd, &dead).unwrap();
 
-        // Asserted per platform because the guarantee genuinely differs, and a
-        // test that hid that would claim coverage it does not have.
-        #[cfg(unix)]
-        {
-            // `kill(pid, 0)` reports the owner is gone, so the free lock is
-            // believed immediately.
-            assert_eq!(probe(&sd), Holder::Free);
-            assert!(acquire(&sd).unwrap().is_ok());
-        }
-        #[cfg(not(unix))]
-        {
-            // No cheap liveness check there, so the heartbeat stands alone and
-            // a hard-killed session reads as live until it goes stale. The cost
-            // is a bounded wait, never a lost session.
-            assert!(matches!(probe(&sd), Holder::Contested(_)));
-            let mut stale = dead;
-            stale.heartbeat = unix_now() - (HEARTBEAT_STALE_SECS + 5);
-            write_record(&sd, &stale).unwrap();
-            assert_eq!(probe(&sd), Holder::Free);
-            assert!(acquire(&sd).unwrap().is_ok());
-        }
+        // Same guarantee on every platform: the owner is gone, so the free
+        // lock is believed immediately rather than after the heartbeat window.
+        assert_eq!(probe(&sd), Holder::Free);
+        assert!(acquire(&sd).unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_live_pid_still_contests_a_free_lock() {
+        // The other half: the heartbeat check must keep working where it is
+        // actually needed — a filesystem whose locking is unreliable, where a
+        // live owner sits behind a lock that reads as free.
+        let dir = TempDir::new().unwrap();
+        let sd = session_dir(dir.path());
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(lock_path(&sd), b"").unwrap();
+        // `record()` carries this process's pid, which is definitionally alive.
+        write_record(&sd, &record(Mode::Headless)).unwrap();
+        assert!(matches!(probe(&sd), Holder::Contested(_)));
     }
 
     #[test]
