@@ -1116,12 +1116,31 @@ mod tests {
         fs::create_dir_all(&sd).unwrap();
         fs::write(lock_path(&sd), b"").unwrap();
         let mut dead = record(Mode::Headless);
-        // pid 0 is never a real process, and `pid_is_alive` rejects it outright.
+        // pid 0 is never a live user process on any platform we ship.
         dead.pid = 0;
         write_record(&sd, &dead).unwrap();
 
-        assert_eq!(probe(&sd), Holder::Free);
-        assert!(acquire(&sd).unwrap().is_ok());
+        // Asserted per platform because the guarantee genuinely differs, and a
+        // test that hid that would claim coverage it does not have.
+        #[cfg(unix)]
+        {
+            // `kill(pid, 0)` reports the owner is gone, so the free lock is
+            // believed immediately.
+            assert_eq!(probe(&sd), Holder::Free);
+            assert!(acquire(&sd).unwrap().is_ok());
+        }
+        #[cfg(not(unix))]
+        {
+            // No cheap liveness check there, so the heartbeat stands alone and
+            // a hard-killed session reads as live until it goes stale. The cost
+            // is a bounded wait, never a lost session.
+            assert!(matches!(probe(&sd), Holder::Contested(_)));
+            let mut stale = dead;
+            stale.heartbeat = unix_now() - (HEARTBEAT_STALE_SECS + 5);
+            write_record(&sd, &stale).unwrap();
+            assert_eq!(probe(&sd), Holder::Free);
+            assert!(acquire(&sd).unwrap().is_ok());
+        }
     }
 
     #[test]
