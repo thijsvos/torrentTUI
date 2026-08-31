@@ -75,8 +75,43 @@ fn pick_listen_port(start: u16) -> u16 {
     // or wraps to an empty range (release).
     let end = start.saturating_add(PORT_RANGE_SIZE);
     (start..end)
-        .find(|&port| std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok())
+        .find(|&port| port_is_bindable(port))
         .unwrap_or(start)
+}
+
+/// Whether librqbit would be able to bind this port, predicted the same way it
+/// actually binds.
+///
+/// The subtlety is `SO_REUSEADDR`, which librqbit sets on its real listener. A
+/// plain `TcpListener::bind` does not, so on unix the probe refused any port
+/// still holding a `TIME_WAIT` connection from a previous run — and since a
+/// busy session leaves plenty of those, handing the session between processes
+/// walked the port up 6881 → 6882 → 6883 on each cycle. That silently breaks a
+/// router port-forward and the `-p 6881:6881` in the README's Docker command,
+/// with no error anywhere.
+///
+/// Windows is deliberately left alone: there `SO_REUSEADDR` permits binding a
+/// port another process is *actively listening on*, so setting it would make
+/// the probe succeed always and stop detecting a genuine conflict.
+fn port_is_bindable(port: u16) -> bool {
+    #[cfg(not(windows))]
+    {
+        use socket2::{Domain, Socket, Type};
+        let Ok(socket) = Socket::new(Domain::IPV6, Type::STREAM, None) else {
+            return false;
+        };
+        // Dual-stack, matching librqbit's listener.
+        let _ = socket.set_only_v6(false);
+        if socket.set_reuse_address(true).is_err() {
+            return false;
+        }
+        let addr: std::net::SocketAddr = (Ipv6Addr::UNSPECIFIED, port).into();
+        socket.bind(&addr.into()).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok()
+    }
 }
 
 /// Maximum size of a `.torrent` file accepted on disk. Anything larger is
@@ -1918,6 +1953,17 @@ mod tests {
         let picked = pick_listen_port(port);
         assert_ne!(picked, port);
         assert!((port..port.saturating_add(PORT_RANGE_SIZE)).contains(&picked));
+    }
+
+    #[test]
+    fn a_live_listener_still_blocks_the_port() {
+        // The reuse-address probe must not become permissive: it exists to
+        // ignore TIME_WAIT, not to hand out a port somebody is serving on.
+        let taken = std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        assert!(!port_is_bindable(port));
+        drop(taken);
+        assert!(port_is_bindable(port));
     }
 
     #[test]

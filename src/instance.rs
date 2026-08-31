@@ -114,6 +114,61 @@ const RECORD_SCHEMA: u32 = 1;
 /// 5 s write interval so a paused laptop or a busy box is not declared dead.
 const HEARTBEAT_STALE_SECS: u64 = 30;
 
+/// Whether a process with this id is still alive.
+///
+/// The heartbeat alone cannot tell "the lock is lying" from "the owner was just
+/// `SIGKILL`ed": both leave a free lock next to a fresh record. Only the second
+/// is common, and treating it as a live session made every hard kill block the
+/// next launch for the whole staleness window.
+///
+/// `kill(pid, 0)` on unix and `OpenProcess` + `GetExitCodeProcess` on Windows.
+/// Both are cheap queries that send nothing and change nothing.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        // Sends no signal; only reports reachability. ESRCH means no such
+        // process; EPERM means it exists but belongs to someone else, which
+        // still counts as alive.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: `OpenProcess` is a plain query; the handle is closed on every
+        // path out, and `code` is a live local for the duration of the call.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                // No such process — or one we may not query, which for our
+                // purposes is indistinguishable and errs toward "gone".
+                return false;
+            }
+            let mut code: u32 = 0;
+            let queried = GetExitCodeProcess(handle, &mut code) != 0;
+            CloseHandle(handle);
+            // A handle can outlive the process it names (another process may
+            // still hold one), so the exit code is what actually answers the
+            // question. STILL_ACTIVE is 259.
+            queried && code == 259
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// How the owning process is running. Decides whether a `stop` request is
 /// honoured — a foreground window must never be closed by a background
 /// request — and whether a second launch may take the session over.
@@ -420,7 +475,7 @@ pub fn acquire(session_dir: &Path) -> Result<Result<SessionGuard, Holder>> {
         Ok(()) => {
             // The lock is ours, but it may be lying — see `Holder::Contested`.
             if let Some(record) = read_record(session_dir) {
-                if record.heartbeat_fresh_at(unix_now()) {
+                if record.heartbeat_fresh_at(unix_now()) && pid_is_alive(record.pid) {
                     let _ = file.unlock();
                     return Ok(Err(Holder::Contested(record)));
                 }
@@ -457,7 +512,9 @@ pub fn probe(session_dir: &Path) -> Holder {
         Ok(()) => {
             let _ = file.unlock();
             match read_record(session_dir) {
-                Some(r) if r.heartbeat_fresh_at(unix_now()) => Holder::Contested(r),
+                Some(r) if r.heartbeat_fresh_at(unix_now()) && pid_is_alive(r.pid) => {
+                    Holder::Contested(r)
+                }
                 _ => Holder::Free,
             }
         }
@@ -1070,6 +1127,40 @@ mod tests {
             other => panic!("expected Contested, got {:?}", other),
         }
         // And having refused, we must not have kept the lock.
+        assert!(matches!(probe(&sd), Holder::Contested(_)));
+    }
+
+    #[test]
+    fn a_dead_owner_does_not_contest_a_free_lock() {
+        // A session killed with SIGKILL leaves a fresh heartbeat behind. Before
+        // the liveness check that blocked the next launch for the whole
+        // staleness window, which is the common case, not the rare one.
+        let dir = TempDir::new().unwrap();
+        let sd = session_dir(dir.path());
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(lock_path(&sd), b"").unwrap();
+        let mut dead = record(Mode::Headless);
+        // pid 0 is never a live user process on any platform we ship.
+        dead.pid = 0;
+        write_record(&sd, &dead).unwrap();
+
+        // Same guarantee on every platform: the owner is gone, so the free
+        // lock is believed immediately rather than after the heartbeat window.
+        assert_eq!(probe(&sd), Holder::Free);
+        assert!(acquire(&sd).unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_live_pid_still_contests_a_free_lock() {
+        // The other half: the heartbeat check must keep working where it is
+        // actually needed — a filesystem whose locking is unreliable, where a
+        // live owner sits behind a lock that reads as free.
+        let dir = TempDir::new().unwrap();
+        let sd = session_dir(dir.path());
+        fs::create_dir_all(&sd).unwrap();
+        fs::write(lock_path(&sd), b"").unwrap();
+        // `record()` carries this process's pid, which is definitionally alive.
+        write_record(&sd, &record(Mode::Headless)).unwrap();
         assert!(matches!(probe(&sd), Holder::Contested(_)));
     }
 

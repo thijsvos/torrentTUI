@@ -49,6 +49,12 @@ notify-rust = "4"
 # same crate keeps the traversal semantics (depth limit, no symlink following,
 # files only) identical to `librqbit::watch`.
 walkdir = "2"
+# Socket options for the listen-port probe. librqbit binds its real listener
+# with SO_REUSEADDR, so a probe without it is stricter than the bind it is
+# predicting and walks past ports librqbit could have used. Already in the
+# lockfile via tokio — no new crate, same argument as `url` below.
+socket2 = "0.6"
+
 # Terminal column accounting. Torrent names are attacker-controlled, and a
 # CJK/emoji name counted by `char` occupies twice its width, shoving the
 # adjacent columns off screen.
@@ -67,6 +73,21 @@ percent-encoding = "2"
 # magnet the two parsers disagree on) and to build correct `file://` blocklist
 # URLs. Already in the graph transitively via librqbit/reqwest — no new crate.
 url = "2"
+
+# Liveness check for the pid in the daemon record. Without it a session killed
+# with SIGKILL leaves a record whose heartbeat is still fresh, and the next
+# launch refuses to start for the whole staleness window — a crash is far more
+# common than the unreliable-locking case the heartbeat guards against.
+# Already in the lockfile via tokio, so this adds no crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Same job on Windows: `OpenProcess` + `GetExitCodeProcess` is the cheapest way
+# to ask whether a pid is still running. Without it a session killed from Task
+# Manager — the normal way to kill things on Windows — blocked the next launch
+# for the whole heartbeat window. Already in the lockfile via tokio.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

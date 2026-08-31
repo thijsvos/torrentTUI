@@ -4454,6 +4454,7 @@ dependencies = [
  "dirs",
  "fs4",
  "futures",
+ "libc",
  "librqbit",
  "librqbit-dualstack-sockets",
  "notify-rust",
@@ -4462,6 +4463,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "tokio",
  "toml",
@@ -4470,6 +4472,7 @@ dependencies = [
  "unicode-width",
  "url",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -67,6 +67,18 @@ jobs:
       - name: Run tests
         run: cargo test --all
 
+      # The session lock, the control channel and the background session need
+      # two real processes contending for one lock, so no unit test reaches
+      # them — and they are exactly where the platforms differ (`flock` is
+      # advisory, `LockFileEx` is mandatory). Cheap to run, and it caught a
+      # stale-lock bug that every unit test passed straight through.
+      - name: Build binary for the session end-to-end check
+        run: cargo build
+
+      - name: Session end-to-end check
+        run: python3 scripts/e2e_session.py target/debug/torrenttui
+        shell: bash
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest

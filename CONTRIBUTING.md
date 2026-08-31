@@ -30,11 +30,19 @@ is a third CI job that a dependency bump can trip; if an advisory ever needs
 to be ignored deliberately, record it in `.cargo/audit.toml` with the
 rationale and the condition for removing it.
 
-If you touch instance locking or detach, verify on all three platforms and check the
-parts `cargo test` cannot: the lock semantics differ (`flock` is advisory on unix,
-`LockFileEx` is mandatory on Windows), and `process_group` / `creation_flags` are
-write-only on `Command`, so "the background process survives closing the terminal" is
-only ever proven by actually closing one.
+If you touch instance locking, the control channel or detach, run the session
+end-to-end check as well — it needs two real processes contending for one lock, so no
+unit test reaches those paths, and CI runs it on all three platforms:
+
+```bash
+cargo build && python3 scripts/e2e_session.py target/debug/torrenttui
+```
+
+Two things even that cannot cover, both of which need a human at a terminal: pressing
+`Ctrl+D` and confirming the detach dialog, and **closing the terminal window** to prove
+the background process survives it. `process_group` / `creation_flags` are write-only on
+`Command` — there is no getter — so that second one is only ever proven by actually
+closing a window.
 
 If you touch the engine, smoke-test against a public-domain torrent (e.g. one of [archive.org's](https://archive.org/) `.torrent` files) before submitting.
 
