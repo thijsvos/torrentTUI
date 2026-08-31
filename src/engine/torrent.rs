@@ -1150,7 +1150,10 @@ pub async fn run_engine(
     msg_tx: mpsc::Sender<String>,
     info_tx: mpsc::Sender<EngineInfo>,
 ) -> Result<()> {
-    let engine = TorrentEngine::new(&config).await?;
+    // `Arc` so `AddTorrent` can be handled off the command loop — see the
+    // AddTorrent arm. Every `engine.method()` below still resolves through
+    // `Deref`, so nothing else changes.
+    let engine = std::sync::Arc::new(TorrentEngine::new(&config).await?);
 
     // Report the applied privacy posture once, right after the session that
     // embodies it exists — the header badge renders from this, never from
@@ -1317,6 +1320,10 @@ pub async fn run_engine(
     let mut cmd_rx = cmd_rx;
 
     let mut finished_set: HashSet<usize> = HashSet::new();
+    // Adds run in their own task now, so the one piece of loop state they need
+    // to touch — the set that suppresses duplicate completion notices — comes
+    // back over a channel instead of being mutated across the task boundary.
+    let (finished_tx, mut finished_rx) = mpsc::channel::<usize>(32);
 
     // Tracks which torrent the UI is showing in Detail mode. When None, the
     // per-tick snapshot skips files/peers/trackers entirely.
@@ -1411,27 +1418,45 @@ pub async fn run_engine(
                         } else {
                             source
                         };
-                        match engine.add_torrent(&source).await {
-                            Ok((id, handle, already_managed)) => {
-                                let stats = handle.stats();
-                                let raw = handle.name().unwrap_or_else(|| "Unknown".to_string());
-                                let name = sanitize_display(&raw);
-                                if already_managed || stats.finished {
-                                    let _ = msg_tx
-                                        .send(format!("\"{}\" already downloaded", name))
-                                        .await;
-                                    if stats.finished {
-                                        finished_set.insert(id);
+                        // Off the command loop, deliberately. For a magnet,
+                        // `add_torrent` does not return until librqbit has
+                        // resolved its metadata from the swarm — seconds
+                        // normally, forever for a magnet nobody is seeding.
+                        // Awaiting that here froze the whole engine: no state
+                        // pushes, no pause/delete, and — once a session could
+                        // outlive its terminal — no way to answer `Shutdown`,
+                        // so a background session became unstoppable until the
+                        // magnet gave up.
+                        let engine = engine.clone();
+                        let msg_tx = msg_tx.clone();
+                        let finished_tx = finished_tx.clone();
+                        tokio::spawn(async move {
+                            match engine.add_torrent(&source).await {
+                                Ok((id, handle, already_managed)) => {
+                                    let stats = handle.stats();
+                                    let raw =
+                                        handle.name().unwrap_or_else(|| "Unknown".to_string());
+                                    let name = sanitize_display(&raw);
+                                    if already_managed || stats.finished {
+                                        let _ = msg_tx
+                                            .send(format!("\"{}\" already downloaded", name))
+                                            .await;
+                                        if stats.finished {
+                                            // Suppresses a duplicate completion
+                                            // notice back in the loop.
+                                            let _ = finished_tx.send(id).await;
+                                        }
+                                    } else {
+                                        tracing::info!("Added torrent {}", id);
                                     }
-                                } else {
-                                    tracing::info!("Added torrent {}", id);
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        msg_tx.send(format!("Failed to add torrent: {}", e)).await;
+                                    tracing::error!("Failed to add torrent: {}", e);
                                 }
                             }
-                            Err(e) => {
-                                let _ = msg_tx.send(format!("Failed to add torrent: {}", e)).await;
-                                tracing::error!("Failed to add torrent: {}", e);
-                            }
-                        }
+                        });
                     }
                     Some(EngineCommand::Pause(id)) => {
                         if let Some(handle) = engine.get_handle(id) {
@@ -1607,6 +1632,9 @@ pub async fn run_engine(
                     }
                 }
                 push_state(&engine, &state_tx, &msg_tx, &mut finished_set, enable_notifications, detail_torrent_id).await;
+            }
+            Some(id) = finished_rx.recv() => {
+                finished_set.insert(id);
             }
             _ = state_tick.tick() => {
                 push_state(&engine, &state_tx, &msg_tx, &mut finished_set, enable_notifications, detail_torrent_id).await;

@@ -82,6 +82,14 @@ const RECORD_FILE: &str = "daemon.json";
 /// Control-request directory.
 const CONTROL_DIR: &str = "control";
 
+/// Written by a detached child to say "I started". See [`announce_handoff`].
+const HANDOFF_FILE: &str = "handoff.json";
+
+/// Environment variable carrying the hand-off token to the child. An env var
+/// rather than a flag: it is an implementation detail between two copies of the
+/// same binary, not part of the CLI anyone should type.
+pub const HANDOFF_ENV: &str = "TORRENTTUI_HANDOFF";
+
 /// Request file asking a headless owner to shut down.
 const STOP_REQUEST: &str = "stop";
 
@@ -530,6 +538,52 @@ pub fn wait_for_release(session_dir: &Path, budget: std::time::Duration) -> bool
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
+// The detach hand-off marker
+
+/// Announce that this process started, for the parent that spawned it.
+///
+/// The parent cannot watch the *lock* to see the child arrive — it still holds
+/// the lock itself, and must keep holding it until it exits so the two never
+/// overlap on the same session files. So the child leaves a note instead, as
+/// early as it can, and the parent waits for it before reporting success.
+///
+/// This proves the child ran its own code: the binary existed, was executable,
+/// and got as far as reading its arguments. It does **not** prove the session
+/// came up — for that, a failure is recorded in `daemon.json` once the child
+/// owns the lock, and `--status` reports it.
+pub fn announce_handoff(session_dir: &Path, nonce: &str) {
+    let _ = fs::create_dir_all(session_dir);
+    // Best effort throughout: failing to announce costs the parent an accurate
+    // message, never the hand-off itself.
+    let _ = fs::write(session_dir.join(HANDOFF_FILE), nonce.as_bytes());
+}
+
+/// Remove any previous marker, so a stale one cannot be mistaken for this
+/// hand-off. Called by the parent immediately before spawning.
+pub fn clear_handoff(session_dir: &Path) {
+    let _ = fs::remove_file(session_dir.join(HANDOFF_FILE));
+}
+
+/// Wait for the child to announce itself with *our* token.
+///
+/// The token matters: a third process could take the lock in the same window,
+/// and "something is running" is not the same claim as "the process I started
+/// is running".
+pub fn wait_for_handoff(session_dir: &Path, nonce: &str, budget: std::time::Duration) -> bool {
+    let path = session_dir.join(HANDOFF_FILE);
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if fs::read_to_string(&path).is_ok_and(|body| body.trim() == nonce) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Spawning the background copy
 
 /// Build the argv for the detached background process. Split from the spawn the
@@ -538,12 +592,17 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100)
 ///
 /// `--download-dir` is forwarded already tilde-expanded: the child inherits no
 /// shell, and `main` has resolved the override before this point.
-pub fn build_headless_command(exe: &Path, download_dir: Option<&str>) -> std::process::Command {
+pub fn build_headless_command(
+    exe: &Path,
+    download_dir: Option<&str>,
+    nonce: &str,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--headless");
     if let Some(dir) = download_dir {
         cmd.arg("--download-dir").arg(dir);
     }
+    cmd.env(HANDOFF_ENV, nonce);
     cmd
 }
 
@@ -553,9 +612,9 @@ pub fn build_headless_command(exe: &Path, download_dir: Option<&str>) -> std::pr
 /// `Command::spawn` leaves the child in the terminal's foreground process
 /// group, so closing the window delivers `SIGHUP` and kills exactly the process
 /// the user asked to keep running.
-pub fn spawn_headless_child(download_dir: Option<&str>) -> Result<u32> {
+pub fn spawn_headless_child(download_dir: Option<&str>, nonce: &str) -> Result<u32> {
     let exe = std::env::current_exe().context("locating the torrenttui binary")?;
-    let mut cmd = build_headless_command(&exe, download_dir);
+    let mut cmd = build_headless_command(&exe, download_dir, nonce);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -600,6 +659,10 @@ pub struct Flags {
     pub stop: bool,
     pub status: bool,
     pub torrent_source: Option<String>,
+    /// This process was spawned by a detaching parent (see [`HANDOFF_ENV`]).
+    /// The parent still owns the session and releases it by exiting, so this
+    /// child must *wait* for the lock rather than refuse it.
+    pub handoff: bool,
 }
 
 /// What `main` should do, given the flags and who owns the session.
@@ -661,6 +724,11 @@ pub fn decide(flags: &Flags, holder: &Holder) -> Startup {
     if flags.headless {
         return match holder {
             Holder::Free => Startup::RunHeadless,
+            // Spawned by a detach. The parent is still holding the lock — it
+            // must, until it exits, so the two never overlap on the same
+            // session files — and will drop it by dying. Refusing here is what
+            // made detach a race the child could lose.
+            _ if flags.handoff => Startup::RunHeadless,
             other => Startup::Refuse(already_running(other)),
         };
     }
@@ -1156,6 +1224,22 @@ mod tests {
     }
 
     #[test]
+    fn a_handoff_child_waits_for_the_lock_instead_of_refusing() {
+        // The regression this guards: a detaching parent holds the lock until
+        // it exits, so its child always sees the session as owned. Refusing
+        // there kills the background session the user just asked for, and only
+        // *sometimes* — whichever of the two won the race.
+        let flags = Flags {
+            headless: true,
+            handoff: true,
+            ..Default::default()
+        };
+        for holder in [held(Mode::Tui), held(Mode::Headless), Holder::Held(None)] {
+            assert_eq!(decide(&flags, &holder), Startup::RunHeadless, "{holder:?}");
+        }
+    }
+
+    #[test]
     fn headless_never_joins_an_existing_session() {
         let flags = Flags {
             headless: true,
@@ -1176,6 +1260,7 @@ mod tests {
             // Even alongside inputs that would otherwise do something.
             stop: true,
             headless: true,
+            handoff: true,
             torrent_source: Some("magnet:?xt=urn:btih:aa".to_string()),
         };
         for holder in [Holder::Free, held(Mode::Tui), held(Mode::Headless)] {
@@ -1376,7 +1461,7 @@ mod tests {
 
     #[test]
     fn headless_command_carries_the_flag_and_the_resolved_download_dir() {
-        let cmd = build_headless_command(Path::new("/usr/local/bin/torrenttui"), Some("/dl"));
+        let cmd = build_headless_command(Path::new("/usr/local/bin/torrenttui"), Some("/dl"), "n1");
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1388,12 +1473,60 @@ mod tests {
         assert_eq!(args, vec!["--headless", "--download-dir", "/dl"]);
 
         // No override: the child reads the same config we did.
-        let cmd = build_headless_command(Path::new("torrenttui"), None);
+        let cmd = build_headless_command(Path::new("torrenttui"), None, "n1");
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, vec!["--headless"]);
+    }
+
+    #[test]
+    fn handoff_marker_is_matched_by_token_not_mere_presence() {
+        let dir = TempDir::new().unwrap();
+        let sd = session_dir(dir.path());
+        let instant = std::time::Duration::from_millis(0);
+
+        assert!(!wait_for_handoff(&sd, "mine", instant));
+        announce_handoff(&sd, "mine");
+        assert!(wait_for_handoff(&sd, "mine", instant));
+        // A third process taking the lock in the same window is not the child
+        // we spawned, so its marker must not satisfy our wait.
+        announce_handoff(&sd, "someone-else");
+        assert!(!wait_for_handoff(&sd, "mine", instant));
+    }
+
+    #[test]
+    fn clearing_the_marker_prevents_a_stale_one_from_confirming() {
+        let dir = TempDir::new().unwrap();
+        let sd = session_dir(dir.path());
+        announce_handoff(&sd, "old");
+        clear_handoff(&sd);
+        assert!(!wait_for_handoff(
+            &sd,
+            "old",
+            std::time::Duration::from_millis(0)
+        ));
+        // Clearing a marker that is not there is not an error.
+        clear_handoff(&sd);
+    }
+
+    #[test]
+    fn the_handoff_token_reaches_the_child_through_the_environment() {
+        let cmd = build_headless_command(Path::new("torrenttui"), None, "tok123");
+        let env: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            env.contains(&(HANDOFF_ENV.to_string(), Some("tok123".to_string()))),
+            "{env:?}"
+        );
     }
 
     // NOTE: nothing here can assert the *detach* flags. `process_group` and

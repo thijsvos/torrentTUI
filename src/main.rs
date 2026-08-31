@@ -117,12 +117,13 @@ struct Cli {
 }
 
 impl Cli {
-    fn flags(&self) -> instance::Flags {
+    fn flags(&self, handoff: bool) -> instance::Flags {
         instance::Flags {
             headless: self.headless,
             stop: self.stop,
             status: self.status,
             torrent_source: self.torrent_source.clone(),
+            handoff,
         }
     }
 }
@@ -145,6 +146,17 @@ const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 /// already established that we expect it to be free, so this only absorbs the
 /// tail of a take-over or a lost race.
 const ACQUIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a detached child waits for its parent to release the session. The
+/// parent only has to finish tearing down its terminal and exit, but it may be
+/// flushing a large session, so this is generous — losing the wait means the
+/// user's downloads silently stop.
+const HANDOFF_ACQUIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a detaching process waits for its child to say it started. Only
+/// covers process launch, so it can be short — the child writes its marker
+/// before doing any real work.
+const HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -181,8 +193,16 @@ async fn main() -> Result<()> {
     // file on a write error.
     let config_dir = config::Config::config_dir();
     let session_dir = instance::session_dir(&config_dir);
+    // Spawned by a detach: tell the parent we are alive before it stops waiting.
+    // It cannot learn this from the lock — it still holds that, and must until
+    // it exits — so the marker is the only channel available.
+    let handoff = std::env::var(instance::HANDOFF_ENV).ok();
+    if let Some(ref nonce) = handoff {
+        instance::announce_handoff(&session_dir, nonce);
+    }
+    let is_handoff = handoff.is_some();
     let mut takeover_of: Option<u32> = None;
-    match instance::decide(&cli.flags(), &instance::probe(&session_dir)) {
+    match instance::decide(&cli.flags(is_handoff), &instance::probe(&session_dir)) {
         instance::Startup::Report(msg) => {
             println!("{msg}");
             return Ok(());
@@ -278,7 +298,12 @@ async fn main() -> Result<()> {
     } else {
         instance::Mode::Tui
     };
-    let guard = match instance::acquire_waiting(&session_dir, ACQUIRE_WAIT)? {
+    let acquire_wait = if is_handoff {
+        HANDOFF_ACQUIRE_WAIT
+    } else {
+        ACQUIRE_WAIT
+    };
+    let guard = match instance::acquire_waiting(&session_dir, acquire_wait)? {
         Ok(guard) => guard,
         Err(holder) => {
             eprintln!("{}", instance::format_status(&holder));
@@ -348,10 +373,26 @@ async fn main() -> Result<()> {
     // finished their flushes. The barrier is the kernel's, not our ordering's.
     let detaching = matches!(result, Ok(AppExit::Detach));
     if detaching {
-        match instance::spawn_headless_child(cli_download_dir.as_deref()) {
-            Ok(pid) => {
+        let nonce = instance::nonce();
+        // No stale marker can be mistaken for this hand-off.
+        instance::clear_handoff(&session_dir);
+        match instance::spawn_headless_child(cli_download_dir.as_deref(), &nonce) {
+            Ok(pid) if instance::wait_for_handoff(&session_dir, &nonce, HANDOFF_WAIT) => {
                 println!("Running in the background (pid {pid}). Downloads and seeding continue.");
                 println!("Reattach with `torrenttui`, stop with `torrenttui --stop`.");
+            }
+            // It launched but never reported in, so we genuinely do not know
+            // whether it is running. Say exactly that rather than guessing
+            // either way — the window is gone and this line is all the user
+            // gets.
+            Ok(pid) => {
+                eprintln!(
+                    "Started a background process (pid {pid}) but it did not report in within {}s.",
+                    HANDOFF_WAIT.as_secs()
+                );
+                eprintln!(
+                    "Check `torrenttui --status`; if nothing is running, `torrenttui` starts again."
+                );
             }
             Err(e) => {
                 // The window is already gone, so this is the user's only
