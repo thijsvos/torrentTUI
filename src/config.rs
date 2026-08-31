@@ -175,6 +175,29 @@ impl PrivacyConfig {
         non_empty(&self.bind_interface)
     }
 
+    /// A one-line summary of the privacy posture, for the daemon record.
+    /// `None` when nothing is configured.
+    ///
+    /// This deliberately records the config *as it was when the session
+    /// started*, because that is what the session actually applied —
+    /// `[privacy]` is read once at session creation. A background session
+    /// therefore keeps this posture even after `config.toml` is edited, and a
+    /// later launch can say so instead of implying the edit took effect.
+    /// The proxy URL is summarized, never echoed: it can carry credentials.
+    pub fn summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.proxy_url().is_some() {
+            parts.push("proxy".to_string());
+        }
+        if let Some(iface) = self.bind_interface() {
+            parts.push(iface.to_string());
+        }
+        if non_empty(&self.blocklist_url).is_some() {
+            parts.push("blocklist".to_string());
+        }
+        (!parts.is_empty()).then(|| parts.join("+"))
+    }
+
     /// The blocklist source normalized to a URL: `http(s)://` and `file://`
     /// pass through, anything else is treated as a filesystem path —
     /// `~`-expanded, made absolute, and turned into a `file://` URL via

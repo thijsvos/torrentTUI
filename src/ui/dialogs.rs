@@ -119,3 +119,127 @@ pub fn render_quit_dialog(f: &mut Frame, area: Rect) {
     );
     f.render_widget(dialog, popup);
 }
+
+/// Confirm handing the session to a background process.
+///
+/// The word **seeding** is load-bearing, not padding: it is the difference
+/// between an informed choice and the silent-seeding failure the project's
+/// privacy posture exists to prevent. So are the two commands — a user who is
+/// told a process will outlive their window must be told how to end it in the
+/// same breath.
+///
+/// `torrent_count` is stated because "N torrents" is what makes the consequence
+/// concrete, and `streaming` warns that an open player will stop: the HTTP API
+/// belongs to this process, and the background copy binds a fresh port with a
+/// fresh per-run password.
+pub fn render_detach_dialog(f: &mut Frame, area: Rect, torrent_count: usize, streaming: bool) {
+    let mut popup = centered_rect(58, 40, area);
+    // Percentage height collapses to a handful of rows on an 80x24 terminal,
+    // which would clip the two commands — the part the user most needs.
+    let needed = if streaming { 12 } else { 11 };
+    popup.height = popup.height.max(needed).min(area.height);
+    popup.width = popup.width.max(46.min(area.width));
+    f.render_widget(Clear, popup);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Keep downloading after TorrentTUI closes?",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  {} torrent{} will keep downloading AND",
+                torrent_count,
+                if torrent_count == 1 { "" } else { "s" }
+            ),
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  seeding in the background until you stop it.",
+            dim,
+        )),
+    ];
+
+    if streaming {
+        text.push(Line::from(Span::styled(
+            "  An open stream will stop playing.",
+            dim,
+        )));
+    }
+
+    text.extend([
+        Line::from(""),
+        Line::from(Span::styled("  Reattach:  torrenttui", dim)),
+        Line::from(Span::styled("  Stop:      torrenttui --stop", dim)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  [Y]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("es   "),
+            Span::styled(
+                "[N]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("o"),
+        ]),
+    ]);
+
+    let dialog = Paragraph::new(text).block(
+        Block::default()
+            .title(" Detach to Background ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    f.render_widget(dialog, popup);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn screen(width: u16, height: u16, streaming: bool) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| render_detach_dialog(f, f.area(), 3, streaming))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn detach_dialog_states_the_consequence_and_the_way_out() {
+        let text = screen(100, 30, false);
+        assert!(text.contains("Detach"), "{text}");
+        // The three things a user must not have to guess.
+        assert!(text.contains("seeding"), "{text}");
+        assert!(text.contains("torrenttui --stop"), "{text}");
+        assert!(text.contains("3 torrents"), "{text}");
+    }
+
+    #[test]
+    fn detach_dialog_warns_about_an_open_stream() {
+        assert!(screen(100, 30, true).contains("stream"));
+        assert!(!screen(100, 30, false).contains("stream"));
+    }
+
+    #[test]
+    fn detach_dialog_does_not_panic_on_a_tiny_terminal() {
+        // Mirrors the help overlay's 10x4 guard: the layout must clamp rather
+        // than index past the area.
+        let _ = screen(10, 4, true);
+        let _ = screen(1, 1, false);
+    }
+}

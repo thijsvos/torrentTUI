@@ -191,6 +191,9 @@ pub struct App {
     pub info_timer: Option<std::time::Instant>,
     pub spinner_tick: usize,
     pub should_quit: bool,
+    /// Set with `should_quit` when the user confirmed a detach, so `main` knows
+    /// to hand the session to a background process instead of ending it.
+    pub detach_requested: bool,
     pub filter_text: String,
     /// Counts `rebuild_sort_cache` runs so tests can pin batching claims —
     /// e.g. that one paste re-sorts once, not once per character.
@@ -297,6 +300,7 @@ impl App {
             info_timer: None,
             spinner_tick: 0,
             should_quit: false,
+            detach_requested: false,
             filter_text: String::new(),
             #[cfg(test)]
             sort_rebuilds: 0,

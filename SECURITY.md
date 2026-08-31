@@ -22,6 +22,11 @@ You can expect an acknowledgement within 7 days. Once a fix is available, a coor
 - Injection vectors in desktop notifications (e.g. Pango markup on Linux libnotify)
 - Misuse of the embedded HTTP streaming API (`network.http_api_bind`) — e.g. unintended exposure when bound to a non-loopback interface, or any route returning content the user did not consent to share
 
+The control directory used to hand magnets to a running session
+(`<session dir>/control/`) is created `0700` on unix. A local user who can write
+there can add torrents to, or stop, your session — the same class of access
+`config.toml` already grants, and covered by the local-attacker exclusion below.
+
 ## Out of Scope
 
 - Vulnerabilities in `librqbit`, `rustls`, or other third-party crates — please report those upstream. We watch RUSTSEC and patch transitive dependencies in regular releases.

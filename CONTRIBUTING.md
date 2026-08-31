@@ -30,6 +30,12 @@ is a third CI job that a dependency bump can trip; if an advisory ever needs
 to be ignored deliberately, record it in `.cargo/audit.toml` with the
 rationale and the condition for removing it.
 
+If you touch instance locking or detach, verify on all three platforms and check the
+parts `cargo test` cannot: the lock semantics differ (`flock` is advisory on unix,
+`LockFileEx` is mandatory on Windows), and `process_group` / `creation_flags` are
+write-only on `Command`, so "the background process survives closing the terminal" is
+only ever proven by actually closing one.
+
 If you touch the engine, smoke-test against a public-domain torrent (e.g. one of [archive.org's](https://archive.org/) `.torrent` files) before submitting.
 
 ## Pull-request guidelines

@@ -33,7 +33,7 @@ use librqbit_dualstack_sockets::{BindOpts, TcpListener};
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -191,6 +191,8 @@ pub struct TorrentEngine {
     /// What `run_engine` reports to the UI at startup; `None` when no
     /// privacy feature is configured.
     privacy_status: Option<PrivacyStatus>,
+    /// One-off note from `migrate_session_dir`, surfaced once at startup.
+    migration_note: Option<String>,
 }
 
 /// The network shape derived from config — the privacy-critical decisions,
@@ -258,10 +260,79 @@ impl NetworkPlan {
     }
 }
 
+/// Move librqbit's session state under our own directory, once.
+///
+/// `folder: None` resolves to `ProjectDirs::from("com", "rqbit", "session")` —
+/// a namespace shared with upstream `rqbit` and every other librqbit
+/// application, derived from `XDG_DATA_HOME` while our config follows
+/// `XDG_CONFIG_HOME`. Two consequences made that untenable once the session
+/// grew an ownership lock: the lock would guard a *different* directory than
+/// the one it protects (so `XDG_CONFIG_HOME=… torrenttui` walks straight past
+/// it), and the README's Docker instructions mount the config directory
+/// claiming it persists sessions, which it never did.
+///
+/// Copies rather than moves, deliberately. A failed migration then costs
+/// nothing — the old state is still there and a user who downgrades still has
+/// their torrents — and the cost is one duplicated set of small files.
+/// Returns a note for the status bar when anything was migrated.
+fn migrate_session_dir(new_dir: &Path) -> Option<String> {
+    // Already migrated (or a fresh install that has already run once).
+    if new_dir.join("session.json").exists() {
+        return None;
+    }
+    let old_dir = SessionPersistenceConfig::default_json_persistence_folder().ok()?;
+    if old_dir == new_dir || !old_dir.join("session.json").exists() {
+        return None;
+    }
+    if let Err(e) = std::fs::create_dir_all(new_dir) {
+        tracing::warn!("could not create session directory for migration: {e:#}");
+        return None;
+    }
+
+    let mut copied = 0usize;
+    let entries = match std::fs::read_dir(&old_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!("could not read {} for migration: {e:#}", old_dir.display());
+            return None;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        match std::fs::copy(&path, new_dir.join(entry.file_name())) {
+            Ok(_) => copied += 1,
+            // Best effort: a file we cannot copy means that torrent re-checks,
+            // not that the app should refuse to start.
+            Err(e) => tracing::warn!("could not migrate {}: {e:#}", path.display()),
+        }
+    }
+    if copied == 0 {
+        return None;
+    }
+    tracing::info!(
+        "migrated {} session file(s) from {} to {}",
+        copied,
+        old_dir.display(),
+        new_dir.display()
+    );
+    Some(format!(
+        "Moved session state into {} (the old copy in {} is untouched)",
+        new_dir.display(),
+        old_dir.display()
+    ))
+}
+
 /// Build `SessionOptions` from a `NetworkPlan` and rate limits. The
 /// `pick_listen_port` probe (which binds a socket) is only run when the plan
 /// asks for a listener, so proxy mode touches no ports.
-fn build_session_opts(plan: &NetworkPlan, ratelimits: LimitsConfig) -> SessionOptions {
+fn build_session_opts(
+    plan: &NetworkPlan,
+    ratelimits: LimitsConfig,
+    session_dir: PathBuf,
+) -> SessionOptions {
     let listen = plan.listen_port.map(|port| ListenerOptions {
         listen_addr: (Ipv6Addr::UNSPECIFIED, pick_listen_port(port)).into(),
         enable_upnp_port_forwarding: plan.upnp,
@@ -270,7 +341,12 @@ fn build_session_opts(plan: &NetworkPlan, ratelimits: LimitsConfig) -> SessionOp
     SessionOptions {
         dht: plan.dht.then(DhtSessionConfig::default),
         fastresume: true,
-        persistence: Some(SessionPersistenceConfig::Json { folder: None }),
+        // Explicit, not `None`: see `migrate_session_dir`. The ownership lock
+        // lives in this same directory, so the lock and the state it guards can
+        // never drift apart.
+        persistence: Some(SessionPersistenceConfig::Json {
+            folder: Some(session_dir),
+        }),
         listen,
         disable_local_service_discovery: plan.disable_lsd,
         connect: plan.proxy_url.clone().map(|url| ConnectionOptions {
@@ -296,6 +372,9 @@ impl TorrentEngine {
         let download_dir = PathBuf::from(&config.general.download_dir);
         std::fs::create_dir_all(&download_dir)?;
 
+        let session_dir = crate::instance::session_dir(&Config::config_dir());
+        let migration_note = migrate_session_dir(&session_dir);
+
         let plan = NetworkPlan::from_config(config)?;
         let proxy_active = plan.proxied();
         let opts = build_session_opts(
@@ -304,6 +383,7 @@ impl TorrentEngine {
                 download_bps: speed_limit_bps(config.network.max_download_speed_kbps),
                 upload_bps: speed_limit_bps(config.network.max_upload_speed_kbps),
             },
+            session_dir,
         );
 
         let session = Session::new_with_opts(download_dir, opts)
@@ -329,6 +409,7 @@ impl TorrentEngine {
 
         Ok(Self {
             session,
+            migration_note,
             proxy_active,
             privacy_status,
         })
@@ -1080,6 +1161,12 @@ pub async fn run_engine(
         }
     }
 
+    if let Some(note) = engine.migration_note.clone() {
+        if let Err(e) = msg_tx.send(note).await {
+            tracing::warn!("migration note send dropped (UI gone?): {}", e);
+        }
+    }
+
     // Warn about restored torrents that carry udp:// trackers under a proxy.
     // librqbit restores persisted torrents inside `Session::new_with_opts`,
     // before the app can strip anything, and its UDP tracker client announces
@@ -1540,6 +1627,23 @@ pub async fn run_engine(
         tracing::info!("HTTP API task stopped on shutdown");
     }
 
+    // Tear the session down explicitly rather than letting the `Arc` drop do
+    // it. It cannot: librqbit's accept loops are spawned holding their own
+    // `Session` clones, and the only thing that cancels them is the drop guard
+    // inside `Session` itself — which can never run while those tasks hold a
+    // reference. Returning from here therefore leaves the listener, the DHT
+    // socket and every peer connection alive until the process exits.
+    //
+    // `stop()` breaks the cycle: it pauses every torrent (which is what forces
+    // their state to be persisted) and cancels the session token. It sleeps
+    // ~1 s internally, which fits inside the 5 s cap main.rs puts on shutdown.
+    //
+    // Until detach existed this was invisible — the process exited immediately
+    // afterwards. It is a correctness fix for the plain quit path too: a quit
+    // used to race persistence rather than wait for it.
+    engine.session().stop().await;
+    tracing::info!("Session stopped");
+
     Ok(())
 }
 
@@ -1647,7 +1751,11 @@ mod tests {
         assert_eq!(plan.proxy_url.as_deref(), Some("socks5://127.0.0.1:1080"));
 
         // And the SessionOptions built from it agree.
-        let opts = build_session_opts(&plan, LimitsConfig::default());
+        let opts = build_session_opts(
+            &plan,
+            LimitsConfig::default(),
+            PathBuf::from("/tmp/tt-test-session"),
+        );
         assert!(opts.dht.is_none());
         assert!(opts.listen.is_none());
         assert!(opts.disable_local_service_discovery);
@@ -1664,7 +1772,11 @@ mod tests {
         assert!(plan.listen_port.is_some());
         assert!(!plan.disable_lsd);
         assert!(plan.proxy_url.is_none());
-        let opts = build_session_opts(&plan, LimitsConfig::default());
+        let opts = build_session_opts(
+            &plan,
+            LimitsConfig::default(),
+            PathBuf::from("/tmp/tt-test-session"),
+        );
         assert!(opts.dht.is_some());
         assert!(opts.listen.is_some());
         assert!(opts.connect.is_none());
@@ -1686,7 +1798,11 @@ mod tests {
         let plan = NetworkPlan::from_config(&cfg).unwrap();
         assert_eq!(plan.bind_interface.as_deref(), Some("wg0"));
         assert!(plan.blocklist_url.is_some());
-        let opts = build_session_opts(&plan, LimitsConfig::default());
+        let opts = build_session_opts(
+            &plan,
+            LimitsConfig::default(),
+            PathBuf::from("/tmp/tt-test-session"),
+        );
         assert_eq!(opts.bind_device_name.as_deref(), Some("wg0"));
         assert!(opts.blocklist_url.is_some());
     }
