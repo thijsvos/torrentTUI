@@ -37,6 +37,7 @@ pub enum ActionId {
     MarkAll,
     ClearMarks,
     ToggleHelp,
+    Detach,
     Quit,
     // Detail view
     CycleTab,
@@ -347,6 +348,23 @@ pub const ACTIONS: &[ActionInfo] = &[
         hint_when_empty: true,
         in_palette: true,
         available: always,
+    },
+    ActionInfo {
+        id: Some(ActionId::Detach),
+        scope: Scope::Normal,
+        section: Section::Main,
+        keys: "`Ctrl+D`",
+        description: "Detach: keep downloading in the background and close the TUI",
+        short: Some("Detach to the background"),
+        // Deliberately not in the status-bar hint line: the Normal line is
+        // already near the width of an 80-column terminal, and the palette,
+        // the `?` overlay and the README all carry it.
+        hint: None,
+        hint_when_empty: false,
+        in_palette: true,
+        // Detaching an empty session would leave a background process with
+        // nothing to do — the kind of surprise the explicitness rule forbids.
+        available: has_torrents,
     },
     ActionInfo {
         id: Some(ActionId::Quit),

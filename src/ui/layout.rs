@@ -118,6 +118,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         AppMode::Help => "j/k:scroll  Esc/?:close".to_string(),
         AppMode::ConfirmDelete => "k:keep files  d:delete files  c:cancel".to_string(),
         AppMode::ConfirmQuit => "y:quit  n:cancel".to_string(),
+        AppMode::ConfirmDetach => "y:detach  n:cancel".to_string(),
         AppMode::Filter => "Enter:apply  Esc:clear & close".to_string(),
         AppMode::ThrottleInput => "Enter:confirm  Esc:cancel".to_string(),
         AppMode::Search => "Enter:search  Esc:back".to_string(),

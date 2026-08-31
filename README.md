@@ -16,7 +16,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 
 ## Contents
 
-- [Features](#features) · [Installation](#installation) · [Usage](#usage) · [Keybindings](#keybindings) · [Configuration](#configuration) · [Privacy](#privacy) · [Docker](#docker) · [Contributing](#contributing) · [License](#license)
+- [Features](#features) · [Installation](#installation) · [Usage](#usage) · [Keybindings](#keybindings) · [Configuration](#configuration) · [Background sessions](#background-sessions) · [Privacy](#privacy) · [Docker](#docker) · [Contributing](#contributing) · [License](#license)
 
 ## Features
 
@@ -32,6 +32,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 - **Reveal in file manager** — press `o` to open the selected torrent's data in Finder, Explorer, or your Linux file manager
 - **Detail view** — inspect torrent info, individual file progress, and peer details
 - **Session persistence** — torrents survive restarts via librqbit's built-in fastresume
+- **Background sessions** — press `Ctrl+D` to detach: downloads and seeding keep running in a process you started on purpose. Nothing survives a plain `q`. Run `torrenttui` again to take the session back; `torrenttui --stop` ends it
 - **Disk space monitoring** — free space indicator with low-space warnings
 - **Completion notifications** — status bar message, plus a desktop notification on Linux/Windows or a system sound on macOS
 - **Mouse support** — click to select torrents in the list
@@ -80,6 +81,9 @@ torrenttui [OPTIONS] [TORRENT_SOURCE]
 |--------|-------------|
 | `<TORRENT_SOURCE>` | Magnet link or `.torrent` file path to add on startup (positional) |
 | `-d`, `--download-dir <PATH>` | Override download directory (otherwise read from config) |
+| `--headless` | Run the engine with no terminal (a server, or a detached session) |
+| `--status` | Report whether a session is running, and exit |
+| `--stop` | Stop a running background session and exit |
 | `-h`, `--help` | Print help |
 | `-V`, `--version` | Print version |
 
@@ -97,6 +101,14 @@ torrenttui path/to/file.torrent
 
 # Override download directory
 torrenttui -d /path/to/downloads
+
+# Add a magnet to the session that is already running, from any shell
+torrenttui "magnet:?xt=urn:btih:..."
+
+# Background session (see Background sessions below)
+torrenttui --headless
+torrenttui --status
+torrenttui --stop
 ```
 
 ## Keybindings
@@ -121,6 +133,7 @@ torrenttui -d /path/to/downloads
 | `V` | Clear all marks |
 | `Esc` | Clear marks (or close current dialog) |
 | `?` | Toggle help |
+| `Ctrl+D` | Detach: keep downloading in the background and close the TUI |
 | `q` | Quit |
 | `Ctrl+C` | Quit (double press to force) |
 
@@ -283,12 +296,99 @@ lives inside the watch folder.
 
 By default only `torrenttui=warn` is logged to `~/.config/torrenttui/torrenttui.log`. Set `RUST_LOG` to bump verbosity (e.g. `RUST_LOG=torrenttui=debug,librqbit=info`).
 
+## Background sessions
+
+TorrentTUI normally lives and dies with your terminal: `q` and `Ctrl+C` stop the
+engine. That is the default on purpose. But a 4 GB download is 40 minutes of a
+window you cannot close, so there is one explicit way out.
+
+**Detach.** Press `Ctrl+D`. It always asks first — regardless of
+`confirm_on_quit` — and tells you what will keep running and how to stop it. Say
+yes and the TUI closes while a background process keeps downloading *and
+seeding*.
+
+```bash
+torrenttui --status   # is anything running? (starts nothing, writes nothing)
+torrenttui            # take the session back and open the TUI
+torrenttui --stop     # end the background session
+```
+
+**Take-over is a restart, not an attach.** Running `torrenttui` while a
+background session holds the torrents asks it to stop, waits for it, and starts
+the TUI with the same torrents. Transfers pause for a few seconds and trackers
+see a reconnect; fastresume means nothing is re-hashed.
+
+**Only one instance can own the session.** A second `torrenttui` refuses and
+names the pid of the first. This is not tidiness: librqbit's session state is
+guarded only inside a single process, so two instances writing the same
+`session.json` and the same fastresume files silently lose torrents. Before this
+existed, a second launch started anyway.
+
+**Handing work to a running session.** `torrenttui "magnet:?..."` while a
+session is running — a window or a background one — adds the magnet to it and
+exits, instead of starting a competing instance. This makes TorrentTUI usable as
+a `magnet:` handler from a browser. Magnets only: a `.torrent` *path* would be
+resolved against the running session's working directory rather than yours, so
+it is refused with an explanation.
+
+**On a server.** `--headless` runs the engine with no terminal at all, logging
+to `torrenttui-daemon.log` beside your config. It shuts down cleanly on SIGTERM,
+so a systemd unit or `docker stop` will not interrupt a flush.
+
+```ini
+# ~/.config/systemd/user/torrenttui.service
+# Enable with: systemctl --user enable --now torrenttui
+[Unit]
+Description=TorrentTUI background session
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/torrenttui --headless
+ExecStop=%h/.local/bin/torrenttui --stop
+# Give the session time to flush its state instead of being killed mid-write.
+TimeoutStopSec=30
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Attach from the same machine whenever you want with plain `torrenttui` — that
+stops the background session and takes it over, so run `systemctl --user start
+torrenttui` again when you are done. Over SSH the same applies: the session
+keeps running after you disconnect only if you detached it, never just because
+the connection dropped.
+
+```bash
+docker run -d --name torrenttui \
+  -v ~/Downloads/torrents:/downloads \
+  -v ~/.config/torrenttui:/home/torrenttui/.config/torrenttui \
+  -p 6881:6881 \
+  torrenttui --headless -d /downloads
+```
+
+**If a crash takes the session down**, nothing needs cleaning up: ownership is an
+OS file lock, which the kernel releases when the process dies.
+
+### Known limits
+
+- The detaching process cannot confirm that the background one *started*
+  successfully — it has to release the session for the new process to take it.
+  If something goes wrong the failure is recorded, and `torrenttui --status` and
+  the next launch will report it.
+- Adding a magnet blocks the engine until its metadata resolves, so a stop
+  issued in that window takes up to five seconds rather than being instant.
+- `[privacy]` settings are applied when a session starts. A background session
+  keeps the posture it started with even if you edit `config.toml` afterwards —
+  `--status` shows what it actually applied.
+
 ## Privacy
 
 A few defaults worth knowing:
 
 - **Logging is filtered.** Only TorrentTUI's own warnings are written to disk; librqbit's INFO-level output (peer IPs, tracker URLs, info hashes) is silenced. Bumping `RUST_LOG` re-enables it — redact before sharing logs.
 - **UPnP is off by default.** Enabling it (`network.enable_upnp = true`) opens an external port via your router and exposes you to peers outside your LAN.
+- **No background process without an explicit action.** `q` and `Ctrl+C` stop the engine. Only `Ctrl+D` leaves anything running, it always asks for confirmation first (regardless of `confirm_on_quit`), and it tells you the pid and how to stop it. `torrenttui --status` answers "is anything running?" at any time without starting anything. See [Background sessions](#background-sessions).
 - **No telemetry.** TorrentTUI makes no outbound connections except to BitTorrent peers, trackers, (if DHT is enabled) the DHT network, and — only when you submit a search — the search providers below.
 - **Search queries go to the indexers you enable.** Pressing `Enter` on a search sends the query text (nothing else — no identifiers, accounts, or keys) over HTTPS to `apibay.org` and/or `torrents-csv.com`. No request is made until you submit a search, and either provider can be disabled in `[search]`; disabling both turns the feature off entirely. Queries are not written to the log at the default filter. When `privacy.proxy_url` is set, these queries also go through the proxy.
 - **Notifications.** Control characters are stripped from torrent names at the engine boundary, and names are additionally Pango-escaped before reaching the Linux notification daemon. macOS plays a sound instead of sending a notification, so no name leaves the process there. Disable entirely with `ui.enable_notifications = false`.

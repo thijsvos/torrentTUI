@@ -24,7 +24,10 @@ librqbit = { version = "9", default-features = false, features = ["rust-tls", "w
 librqbit-dualstack-sockets = "0.7"
 
 # Async runtime
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# `signal` is needed for the headless session to shut down cleanly on SIGTERM
+# (service managers, `docker stop`) instead of dying mid-flush. It pulls in no
+# new crates: libc, mio and signal-hook-registry are already in Cargo.lock.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 futures = "0.3"
 
 # Serialization and config. The `rc` feature is required so that librqbit's

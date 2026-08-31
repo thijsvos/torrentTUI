@@ -25,6 +25,7 @@ mod actions;
 mod app;
 mod config;
 mod engine;
+mod instance;
 mod opener;
 mod player;
 mod search;
@@ -32,7 +33,7 @@ mod types;
 mod ui;
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use app::App;
@@ -101,7 +102,49 @@ struct Cli {
     /// Download directory override
     #[arg(short, long)]
     download_dir: Option<String>,
+
+    /// Run the engine with no terminal, for a server or a detached session
+    #[arg(long, conflicts_with_all = ["stop", "status"])]
+    headless: bool,
+
+    /// Stop a running background session and exit
+    #[arg(long, conflicts_with_all = ["headless", "status"])]
+    stop: bool,
+
+    /// Report whether a session is running, and exit
+    #[arg(long, conflicts_with_all = ["headless", "stop"])]
+    status: bool,
 }
+
+impl Cli {
+    fn flags(&self) -> instance::Flags {
+        instance::Flags {
+            headless: self.headless,
+            stop: self.stop,
+            status: self.status,
+            torrent_source: self.torrent_source.clone(),
+        }
+    }
+}
+
+/// How long to wait for a background session to release the lock, for `--stop`
+/// and for a take-over. Generous on purpose: `Session::stop` sleeps a second
+/// internally and a large session has fastresume state to flush.
+const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How often the session owner sweeps the control directory. Fast enough that
+/// `torrenttui "magnet:…"` from another terminal feels immediate, slow enough
+/// that an idle session still does essentially nothing.
+const CONTROL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often the owner refreshes its heartbeat — well inside the staleness
+/// threshold `instance` uses, so a busy machine never looks dead.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a launch waits for the lock before giving up. Short: `decide` has
+/// already established that we expect it to be free, so this only absorbs the
+/// tail of a take-over or a lost race.
+const ACQUIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -126,23 +169,75 @@ async fn main() -> Result<()> {
     // that may never have run the app (#44).
     let cli = Cli::parse();
 
+    // Resolve session ownership before anything else touches the filesystem.
+    // `probe` creates nothing, so `--status` on a machine that has never run
+    // the app still materializes no config directory and writes no log marker —
+    // the same rule #44 established for `--version`.
+    //
+    // This is also the single-instance guard. Two processes sharing one
+    // librqbit session is not a tidiness problem but a data-loss one: its JSON
+    // persistence has only an in-process lock and writes through a fixed temp
+    // path, and its fastresume flusher rewrites whole snapshots and deletes the
+    // file on a write error.
+    let config_dir = config::Config::config_dir();
+    let session_dir = instance::session_dir(&config_dir);
+    let mut takeover_of: Option<u32> = None;
+    match instance::decide(&cli.flags(), &instance::probe(&session_dir)) {
+        instance::Startup::Report(msg) => {
+            println!("{msg}");
+            return Ok(());
+        }
+        instance::Startup::Refuse(msg) => {
+            eprintln!("{msg}");
+            // Safe here and only here: nothing has entered the alternate
+            // screen, and tracing is not yet writing to a buffered sink.
+            std::process::exit(1);
+        }
+        instance::Startup::RequestStop => {
+            return stop_background_session(&session_dir);
+        }
+        instance::Startup::HandOff(source) => {
+            return hand_off_to_running_session(&session_dir, &source);
+        }
+        instance::Startup::TakeOver => {
+            takeover_of = take_over_background_session(&session_dir)?;
+        }
+        instance::Startup::RunTui | instance::Startup::RunHeadless => {}
+    }
+
     // Set up logging to file. Default filter is "torrenttui=warn" so librqbit
     // internals (peer IPs, tracker URLs, info hashes) don't get persisted to
     // disk by default. Users who want verbose logs can set RUST_LOG.
-    let log_dir = config::Config::config_dir();
+    let log_dir = config_dir.clone();
     std::fs::create_dir_all(&log_dir)?;
-    let log_file = open_log_file(&log_dir)?;
+    // A headless session gets its own file. Sharing one would be actively
+    // destructive: `open_log_file` rotates on every launch, and a rotation
+    // renames the very inode a running daemon holds an append handle on — the
+    // daemon would keep writing into `torrenttui.log.1` until the next rotation
+    // unlinked it, discarding its output while still consuming the disk. That
+    // log is also the only place a detached session can report a failure, so it
+    // is exactly the one that must not disappear.
+    let log_file = if cli.headless {
+        open_log_file_at(&instance::daemon_log_path(&log_dir))?
+    } else {
+        open_log_file(&log_dir)?
+    };
     // The log is cumulative now, so mark where each run begins. Written
     // straight to the file rather than through tracing: the default filter is
     // `torrenttui=warn` and a startup notice is not a warning, so it would be
     // filtered out for exactly the users who need it. Timestamps come from the
     // tracing lines that follow.
+    //
+    // The pid and mode are in the marker because two processes can now write
+    // logs in the same session — without them a bug report is unreadable.
     {
         use std::io::Write;
         let _ = writeln!(
             &log_file,
-            "=== torrenttui {} ===",
-            env!("CARGO_PKG_VERSION")
+            "=== torrenttui {} pid={} mode={} ===",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            if cli.headless { "headless" } else { "tui" }
         );
     }
     let filter =
@@ -173,6 +268,47 @@ async fn main() -> Result<()> {
         config.general.download_dir = config::expand_tilde(dir);
     }
 
+    // Take ownership for real. `decide` acted on a probe, and a probe is not a
+    // claim — another launch can have won the lock in between. `acquire_waiting`
+    // rather than `acquire` because a take-over has just watched the previous
+    // owner release, and the loser of a race deserves a moment rather than an
+    // immediate refusal.
+    let mode = if cli.headless {
+        instance::Mode::Headless
+    } else {
+        instance::Mode::Tui
+    };
+    let guard = match instance::acquire_waiting(&session_dir, ACQUIRE_WAIT)? {
+        Ok(guard) => guard,
+        Err(holder) => {
+            eprintln!("{}", instance::format_status(&holder));
+            std::process::exit(1);
+        }
+    };
+    // Every request on disk predates our lock and was addressed to a holder
+    // that no longer exists — exact, not a heuristic.
+    instance::clear_requests(&session_dir);
+    let mut record = instance::DaemonRecord::new(
+        mode,
+        instance::State::Running,
+        &instance::nonce(),
+        &config.general.download_dir,
+    );
+    record.privacy = config.privacy.summary();
+    if let Err(e) = instance::write_record(&session_dir, &record) {
+        tracing::warn!("daemon record not written: {e:#}");
+    }
+
+    if cli.headless {
+        let result = run_headless(config, &cli, &session_dir, record).await;
+        // Hold the lock until the process exits — see `SessionGuard::leak`.
+        guard.leak();
+        if let Err(ref e) = result {
+            eprintln!("Error: {:#}", e);
+        }
+        return result;
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -182,7 +318,19 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, cli, config, config_warning).await;
+    // Captured before `cli` moves: a detached child inherits no shell, so the
+    // override has to travel on its argv, already tilde-expanded.
+    let cli_download_dir = cli.download_dir.clone();
+    let result = run_app(
+        &mut terminal,
+        cli,
+        config,
+        config_warning,
+        takeover_of,
+        &session_dir,
+        record,
+    )
+    .await;
 
     let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
     disable_raw_mode()?;
@@ -193,6 +341,33 @@ async fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
+    // Hand the session over *before* releasing the lock. The child blocks on
+    // it from its first millisecond, so there is never an unlocked window for a
+    // third process to win — and the parent releases by dying, which is
+    // strictly after librqbit's spawned tasks have closed their sockets and
+    // finished their flushes. The barrier is the kernel's, not our ordering's.
+    let detaching = matches!(result, Ok(AppExit::Detach));
+    if detaching {
+        match instance::spawn_headless_child(cli_download_dir.as_deref()) {
+            Ok(pid) => {
+                println!("Running in the background (pid {pid}). Downloads and seeding continue.");
+                println!("Reattach with `torrenttui`, stop with `torrenttui --stop`.");
+            }
+            Err(e) => {
+                // The window is already gone, so this is the user's only
+                // notice. Be explicit that nothing is running.
+                eprintln!("Could not start the background process: {:#}", e);
+                eprintln!("Your torrents are stopped. Run `torrenttui` to start again.");
+            }
+        }
+    }
+
+    // Hold the lock until the process actually exits, rather than releasing it
+    // here — see `SessionGuard::leak`. librqbit's spawned tasks outlive
+    // `run_engine`'s return, and a successor that acquired before they were
+    // gone would overlap with them on the same session files.
+    guard.leak();
+
     if let Err(e) = result {
         // Alternate format prints the whole context chain — for a privacy
         // startup failure the actionable part ("error reading blocklist from
@@ -202,6 +377,341 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// How the TUI ended, which decides whether `main` hands the session to a
+/// background process or lets it end with the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppExit {
+    Quit,
+    Detach,
+}
+
+/// The engine with no terminal: the same `run_engine` the TUI drives, with the
+/// UI-bound channels drained into the log instead of a screen.
+///
+/// Draining is not optional. `msg_tx` is 16 slots deep and the engine `await`s
+/// its sends, so without a consumer the engine would block forever on the 17th
+/// status message — command loop dead, state ticks dead, and deaf to a stop
+/// request. That failure would be invisible: no terminal, and the messages that
+/// would explain it are exactly the ones stuck in the channel.
+async fn run_headless(
+    config: config::Config,
+    cli: &Cli,
+    session_dir: &Path,
+    record: instance::DaemonRecord,
+) -> Result<()> {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(32);
+    let (state_tx, mut state_rx) = mpsc::channel::<Vec<types::TorrentInfo>>(4);
+    let (msg_tx, mut msg_rx) = mpsc::channel::<String>(16);
+    let (info_tx, mut info_rx) = mpsc::channel::<EngineInfo>(4);
+
+    let engine_config = config.clone();
+    let mut engine_handle = tokio::spawn(async move {
+        engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx, info_tx).await
+    });
+
+    let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let keeper = spawn_session_keeper(
+        session_dir.to_path_buf(),
+        record,
+        cmd_tx.clone(),
+        Some(stop.clone()),
+    );
+
+    if let Some(ref source) = cli.torrent_source {
+        let source = config::expand_tilde(source.trim());
+        match validate_torrent_source(&source) {
+            Ok(()) => {
+                let _ = cmd_tx.send(EngineCommand::AddTorrent(source)).await;
+            }
+            Err(e) => tracing::warn!("ignoring invalid torrent source: {e}"),
+        }
+    }
+
+    println!(
+        "TorrentTUI is running in the background (pid {}). Downloads and seeding continue.",
+        std::process::id()
+    );
+    println!("Attach with `torrenttui`, stop with `torrenttui --stop`, or press Ctrl+C here.");
+
+    let mut signals = ShutdownSignals::install();
+    let mut engine_result: Result<()> = Ok(());
+    loop {
+        tokio::select! {
+            // Nothing renders these, but the channel must not fill: the engine
+            // `try_send`s snapshots and would otherwise spin on a full queue.
+            Some(_) = state_rx.recv() => {}
+            // Status-bar strings are the only report a headless session has, so
+            // they go to the log at a level the default filter keeps.
+            Some(msg) = msg_rx.recv() => tracing::warn!("{msg}"),
+            Some(info) = info_rx.recv() => match info {
+                // Never log the base URL: it carries the per-run basic-auth
+                // password, which the TUI path deliberately keeps out of the
+                // log too.
+                EngineInfo::HttpApiReady { .. } => tracing::info!("streaming API ready"),
+                EngineInfo::Privacy(status) => tracing::info!("privacy applied: {status:?}"),
+            },
+            joined = &mut engine_handle => {
+                engine_result = match joined {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(anyhow::anyhow!("engine task ended: {e}")),
+                };
+                // The engine is gone; there is nothing left to shut down.
+                keeper.abort();
+                return record_failure_if_any(session_dir, engine_result);
+            }
+            _ = signals.recv() => {
+                tracing::warn!("shutting down on signal");
+                break;
+            }
+            _ = stop.notified() => {
+                tracing::warn!("shutting down on request");
+                break;
+            }
+        }
+    }
+
+    let _ = cmd_tx.send(EngineCommand::Shutdown).await;
+    // Same cap the TUI uses, and for the same reason: bound how long a stuck
+    // engine can delay the flush.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine_handle).await;
+    keeper.abort();
+    record_failure_if_any(session_dir, engine_result)
+}
+
+/// Record a headless startup failure where a user with no terminal can still
+/// find it: `--status` reads this, and so does the next launch.
+fn record_failure_if_any(session_dir: &Path, result: Result<()>) -> Result<()> {
+    if let Err(ref e) = result {
+        if let Some(mut record) = instance::read_record(session_dir) {
+            record.state = instance::State::Failed;
+            record.error = Some(format!("{:#}", e));
+            let _ = instance::write_record(session_dir, &record);
+        }
+    }
+    result
+}
+
+/// The signals that mean "stop", registered once.
+///
+/// Registration must happen **outside** the run loop. A listener created fresh
+/// on each iteration is registered only while that iteration is polling it, so
+/// a signal delivered in any other instant is dropped on the floor — which is
+/// exactly how a headless session ends up ignoring both `--stop` and
+/// `docker stop` while looking perfectly healthy.
+///
+/// SIGTERM matters as much as Ctrl+C: it is what a service manager and
+/// `docker stop` send, and without a handler the process dies instantly,
+/// discarding queued fastresume writes.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let install = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(s) => Some(s),
+                // Degraded, never fatal — the control channel still stops us.
+                Err(e) => {
+                    tracing::warn!("{name} handler not installed: {e}");
+                    None
+                }
+            };
+            Self {
+                interrupt: install(SignalKind::interrupt(), "SIGINT"),
+                terminate: install(SignalKind::terminate(), "SIGTERM"),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Resolve when any of them fires.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            // `pending()` for a listener that failed to install, so the branch
+            // simply never fires instead of resolving immediately and spinning.
+            let interrupt = async {
+                match self.interrupt.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let terminate = async {
+                match self.terminate.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = interrupt => {}
+                _ = terminate => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+/// `--stop`: ask the background session to exit, and wait until it actually
+/// has.
+///
+/// Waiting for the *lock* rather than for the process is deliberate. The owner
+/// holds it for its entire process lifetime, so the kernel releasing it is
+/// positive proof the session is gone, its state flushed and its ports free — a
+/// "goodbye" file or a pid check would prove none of those.
+fn stop_background_session(session_dir: &Path) -> Result<()> {
+    let pid = instance::probe(session_dir).record().map(|r| r.pid);
+    instance::send_request(session_dir, &instance::Request::Stop)?;
+    if instance::wait_for_release(session_dir, RELEASE_WAIT) {
+        match pid {
+            Some(pid) => println!("Stopped the TorrentTUI background session (pid {pid})."),
+            None => println!("Stopped the TorrentTUI background session."),
+        }
+        return Ok(());
+    }
+    match pid {
+        Some(pid) => anyhow::bail!(
+            "the session holder (pid {pid}) did not stop within {}s.\n\
+             If that is a TorrentTUI window, quit it there with `q`.",
+            RELEASE_WAIT.as_secs()
+        ),
+        None => anyhow::bail!(
+            "the session holder did not stop within {}s.",
+            RELEASE_WAIT.as_secs()
+        ),
+    }
+}
+
+/// A magnet given while another process owns the session belongs to *that*
+/// session. Starting a second owner just to hold one magnet is exactly the
+/// silent-corruption path the lock exists to close.
+///
+/// The request becomes an ordinary `EngineCommand::AddTorrent` in the owner, so
+/// it passes through the same `strip_udp_trackers` filtering as one typed into
+/// the add dialog — which is why this does not use librqbit's HTTP API.
+fn hand_off_to_running_session(session_dir: &Path, source: &str) -> Result<()> {
+    let magnet = instance::handoff_source(&config::expand_tilde(source.trim()))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    instance::send_request(session_dir, &instance::Request::Add(magnet))?;
+    match instance::probe(session_dir).record().map(|r| r.pid) {
+        Some(pid) => println!("Added to the running TorrentTUI session (pid {pid})."),
+        None => println!("Added to the running TorrentTUI session."),
+    }
+    Ok(())
+}
+
+/// Take the session back from a background daemon: ask it to stop, wait for the
+/// lock, then carry on as an ordinary launch. Returns the pid taken over, for
+/// the status-bar note.
+///
+/// Honest about its cost — this is a restart, not an attach. Torrents stop and
+/// re-announce, but fastresume means nothing is re-hashed.
+fn take_over_background_session(session_dir: &Path) -> Result<Option<u32>> {
+    let pid = instance::probe(session_dir).record().map(|r| r.pid);
+    println!("Taking over the background session…");
+    instance::send_request(session_dir, &instance::Request::Stop)?;
+    if instance::wait_for_release(session_dir, RELEASE_WAIT) {
+        return Ok(pid);
+    }
+    match pid {
+        Some(pid) => anyhow::bail!(
+            "the background session (pid {pid}) did not stop within {}s.\n\
+             Stop it manually and try again: torrenttui --stop",
+            RELEASE_WAIT.as_secs()
+        ),
+        None => anyhow::bail!(
+            "the background session did not stop within {}s.",
+            RELEASE_WAIT.as_secs()
+        ),
+    }
+}
+
+/// Serve the control directory and keep the heartbeat fresh, for as long as
+/// this process owns the session.
+///
+/// One task for both because they share a cadence and a lifetime. The heartbeat
+/// is what lets a later launch notice that the lock is lying — advisory locking
+/// is not reliable on every filesystem, and the record is the only
+/// cross-platform second opinion.
+fn spawn_session_keeper(
+    session_dir: PathBuf,
+    mut record: instance::DaemonRecord,
+    cmd_tx: mpsc::Sender<EngineCommand>,
+    stop: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut poll = tokio::time::interval(CONTROL_POLL_INTERVAL);
+        let mut beat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = poll.tick() => {
+                    let dir = session_dir.clone();
+                    // `read_dir` is blocking, and this directory can live on a
+                    // network mount — keep it off the reactor exactly like the
+                    // free-space probe does.
+                    let Ok(requests) =
+                        tokio::task::spawn_blocking(move || instance::take_requests(&dir)).await
+                    else {
+                        continue;
+                    };
+                    for request in requests {
+                        let cmd = match request {
+                            instance::Request::Add(magnet) => EngineCommand::AddTorrent(magnet),
+                            instance::Request::Stop
+                                if record.mode == instance::Mode::Headless =>
+                            {
+                                tracing::warn!("stop requested via the control directory");
+                                // Notify the run loop *as well as* asking the
+                                // engine to shut down. The engine awaits
+                                // `add_torrent` inside its command loop, and a
+                                // magnet blocks there until its metadata
+                                // resolves — so a `Shutdown` alone can sit
+                                // unread for as long as a dead magnet takes to
+                                // give up. The run loop's own bounded wait is
+                                // what makes `--stop` always terminate.
+                                if let Some(ref notify) = stop {
+                                    notify.notify_one();
+                                }
+                                EngineCommand::Shutdown
+                            }
+                            // A window is never closed by a background request.
+                            instance::Request::Stop => continue,
+                        };
+                        if cmd_tx.send(cmd).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                _ = beat.tick() => {
+                    record.heartbeat = instance::unix_now();
+                    let dir = session_dir.clone();
+                    let snapshot = record.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(e) = instance::write_record(&dir, &snapshot) {
+                            tracing::warn!("heartbeat not written: {e:#}");
+                        }
+                    })
+                    .await;
+                }
+            }
+        }
+    })
 }
 
 /// Send an engine command, surfacing failure to the user instead of dropping
@@ -223,16 +733,24 @@ async fn send_cmd(tx: &mpsc::Sender<EngineCommand>, cmd: EngineCommand, app: &mu
 /// destroyed exactly the evidence they came back for (#42). One previous
 /// generation is kept as `torrenttui.log.1`.
 fn open_log_file(log_dir: &Path) -> io::Result<std::fs::File> {
-    let path = log_dir.join("torrenttui.log");
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+    open_log_file_at(&log_dir.join("torrenttui.log"))
+}
+
+/// Open a specific log file, rotating it first if it has grown past
+/// [`MAX_LOG_BYTES`]. Split from [`open_log_file`] so a headless session can
+/// keep its own file — see the call site for why sharing one is destructive.
+fn open_log_file_at(path: &Path) -> io::Result<std::fs::File> {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
         // A failed rotation is not worth refusing to start over; the append
         // below just carries on in the oversized file.
-        let _ = std::fs::rename(&path, log_dir.join("torrenttui.log.1"));
+        let mut previous = path.as_os_str().to_owned();
+        previous.push(".1");
+        let _ = std::fs::rename(path, PathBuf::from(previous));
     }
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
 }
 
 /// The UI loop. Spawns the engine task, then alternates between draining the
@@ -251,12 +769,16 @@ fn open_log_file(log_dir: &Path) -> io::Result<std::fs::File> {
 ///
 /// On quit it sends `Shutdown` and waits up to 5 s for the engine to flush
 /// librqbit's persisted state and finish any watch-folder cleanup.
+#[allow(clippy::too_many_arguments)]
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: Cli,
     config: config::Config,
     config_warning: Option<String>,
-) -> Result<()> {
+    takeover_of: Option<u32>,
+    session_dir: &Path,
+    record: instance::DaemonRecord,
+) -> Result<AppExit> {
     let mut app = App::new();
     let mut input_widget = InputWidget::new();
 
@@ -307,6 +829,17 @@ async fn run_app(
         Some(tokio::spawn(async move {
             engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx, info_tx).await
         }));
+
+    // Serve the control directory from the TUI too, so `torrenttui "magnet:…"`
+    // in another terminal lands in the window you already have open — not just
+    // in a background session.
+    let keeper = spawn_session_keeper(session_dir.to_path_buf(), record, cmd_tx.clone(), None);
+
+    if let Some(pid) = takeover_of {
+        app.set_info(format!(
+            "Took over the background session (stopped pid {pid})"
+        ));
+    }
 
     if let Some(ref source) = cli.torrent_source {
         // Trim before anything else: the engine's proxy-mode udp-tracker strip
@@ -482,6 +1015,14 @@ async fn run_app(
                 if app.mode == AppMode::ConfirmQuit {
                     ui::dialogs::render_quit_dialog(f, f.area());
                 }
+                if app.mode == AppMode::ConfirmDetach {
+                    ui::dialogs::render_detach_dialog(
+                        f,
+                        f.area(),
+                        app.torrents.len(),
+                        app.http_api_base.is_some(),
+                    );
+                }
                 if app.mode == AppMode::Palette {
                     ui::palette::render_palette(f, f.area(), &mut app);
                 }
@@ -489,6 +1030,7 @@ async fn run_app(
         }
 
         if app.should_quit {
+            keeper.abort();
             send_cmd(&cmd_tx, EngineCommand::Shutdown, &mut app).await;
             // Give the engine task a chance to flush librqbit's persisted
             // state. The timeout caps how long we wait if it's stuck.
@@ -499,8 +1041,10 @@ async fn run_app(
                 Err(engine_error
                     .take()
                     .unwrap_or_else(|| anyhow::anyhow!("engine task ended unexpectedly")))
+            } else if app.detach_requested {
+                Ok(AppExit::Detach)
             } else {
-                Ok(())
+                Ok(AppExit::Quit)
             };
         }
 
@@ -546,6 +1090,23 @@ async fn run_app(
                             needs_render = true;
                             continue;
                         }
+                        // Ctrl+D: detach. Intercepted here rather than in
+                        // `handle_normal_mode` because that matches on
+                        // `key.code` alone — Ctrl+D would otherwise fall into
+                        // the plain `d` arm and open the *delete* dialog, which
+                        // is what it did before this binding existed. Consumed
+                        // in every mode for the same reason Ctrl+P is: so it can
+                        // never reach a text field or fire mid-decision from a
+                        // modal.
+                        if key.code == KeyCode::Char('d')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            if app.mode == AppMode::Normal {
+                                request_detach(&mut app);
+                            }
+                            needs_render = true;
+                            continue;
+                        }
                         match app.mode {
                             AppMode::Input => handle_input_mode(&mut app, &mut input_widget, key, &cmd_tx).await,
                             AppMode::Normal => handle_normal_mode(&mut app, &mut input_widget, key, &cmd_tx).await,
@@ -553,6 +1114,7 @@ async fn run_app(
                             AppMode::Help => handle_help_mode(&mut app, key),
                             AppMode::ConfirmDelete => handle_delete_mode(&mut app, key, &cmd_tx).await,
                             AppMode::ConfirmQuit => handle_quit_mode(&mut app, key),
+                            AppMode::ConfirmDetach => handle_detach_mode(&mut app, key),
                             AppMode::Filter => handle_filter_mode(&mut app, key),
                             AppMode::ThrottleInput => handle_throttle_mode(&mut app, key, &cmd_tx).await,
                             AppMode::Search => handle_search_input_mode(&mut app, key, &search_tx, &mut search_client),
@@ -1226,6 +1788,7 @@ async fn execute_action(
         A::MarkAll => app.mark_all(),
         A::ClearMarks => app.clear_marks(),
         A::ToggleHelp => open_help(app),
+        A::Detach => request_detach(app),
         A::Quit => request_quit(app),
         A::CycleTab => cycle_detail_tab(app),
         A::ToggleFileSelection => toggle_file_selection_key(app, cmd_tx).await,
@@ -1454,6 +2017,34 @@ fn handle_quit_mode(app: &mut App, key: crossterm::event::KeyEvent) {
         }
         _ => {}
     }
+}
+
+fn handle_detach_mode(app: &mut App, key: crossterm::event::KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') => {
+            app.detach_requested = true;
+            app.should_quit = true;
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            app.mode = AppMode::Normal;
+        }
+        _ => {}
+    }
+}
+
+/// Open the detach confirmation.
+///
+/// Always confirms, deliberately ignoring `general.confirm_on_quit`: leaving a
+/// process running after the window closes is never allowed to be one
+/// keystroke. Refuses outright with nothing to do, because a background process
+/// with no torrents is pure surprise — the thing the explicitness rule exists
+/// to prevent.
+fn request_detach(app: &mut App) {
+    if app.torrents.is_empty() {
+        app.set_info("Nothing to detach \u{2014} no torrents in this session".to_string());
+        return;
+    }
+    app.mode = AppMode::ConfirmDetach;
 }
 
 fn apply_engine_info(app: &mut App, info: EngineInfo) {
@@ -1760,6 +2351,48 @@ mod tests {
         app.mode = AppMode::ConfirmQuit;
         handle_quit_mode(&mut app, key(KeyCode::Char('y')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn detach_mode_y_requests_a_detach_not_a_plain_quit() {
+        let mut app = App::new();
+        app.mode = AppMode::ConfirmDetach;
+        handle_detach_mode(&mut app, key(KeyCode::Char('y')));
+        assert!(app.should_quit);
+        assert!(app.detach_requested);
+    }
+
+    #[test]
+    fn detach_mode_n_and_esc_cancel() {
+        for cancel in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut app = App::new();
+            app.mode = AppMode::ConfirmDetach;
+            handle_detach_mode(&mut app, key(cancel));
+            assert!(!app.should_quit, "{cancel:?}");
+            assert!(!app.detach_requested, "{cancel:?}");
+            assert_eq!(app.mode, AppMode::Normal, "{cancel:?}");
+        }
+    }
+
+    #[test]
+    fn detach_always_confirms_even_with_confirm_on_quit_off() {
+        // `confirm_on_quit` is about ending the session. Detach starts a
+        // process that outlives the window, which is never one keystroke.
+        let mut app = App::new();
+        app.confirm_on_quit = false;
+        app.torrents = vec![torrent(1, types::TorrentStatus::Downloading)];
+        request_detach(&mut app);
+        assert_eq!(app.mode, AppMode::ConfirmDetach);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn detach_refuses_an_empty_session() {
+        // A background process with nothing to do is pure surprise.
+        let mut app = App::new();
+        request_detach(&mut app);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.info_message.is_some());
     }
 
     #[test]

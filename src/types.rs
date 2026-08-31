@@ -132,6 +132,10 @@ pub enum AppMode {
     Help,
     ConfirmDelete,
     ConfirmQuit,
+    /// Confirming a detach to the background. Unlike `ConfirmQuit` this is not
+    /// gated on `general.confirm_on_quit`: starting a process that outlives the
+    /// app is never allowed to be a single keystroke.
+    ConfirmDetach,
     Filter,
     ThrottleInput,
     /// Typing an indexer-search query in the bottom bar. The main area keeps
