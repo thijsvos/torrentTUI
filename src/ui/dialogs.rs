@@ -135,8 +135,14 @@ pub fn render_quit_dialog(f: &mut Frame, area: Rect) {
 pub fn render_detach_dialog(f: &mut Frame, area: Rect, torrent_count: usize, streaming: bool) {
     let mut popup = centered_rect(58, 40, area);
     // Percentage height collapses to a handful of rows on an 80x24 terminal,
-    // which would clip the two commands — the part the user most needs.
-    let needed = if streaming { 12 } else { 11 };
+    // which would clip the bottom of the dialog — and the bottom is where the
+    // answer keys and the two commands live.
+    //
+    // Counted, not guessed: blank, question, blank, two consequence lines,
+    // the optional stream warning, blank, Reattach, Stop, blank, [Y]es/[N]o —
+    // plus two border rows. Getting this one row short shipped a dialog whose
+    // [Y]es/[N]o line was cut off, which is only visible by looking at it.
+    let needed = if streaming { 13 } else { 12 };
     popup.height = popup.height.max(needed).min(area.height);
     popup.width = popup.width.max(46.min(area.width));
     f.render_widget(Clear, popup);
@@ -227,6 +233,17 @@ mod tests {
         assert!(text.contains("seeding"), "{text}");
         assert!(text.contains("torrenttui --stop"), "{text}");
         assert!(text.contains("3 torrents"), "{text}");
+    }
+
+    #[test]
+    fn detach_dialog_shows_the_answer_keys() {
+        // Regression: the popup was one row short, so the line telling the user
+        // which key answers the question was clipped off the bottom.
+        for streaming in [true, false] {
+            let text = screen(100, 30, streaming);
+            assert!(text.contains("[Y]"), "streaming={streaming}: {text}");
+            assert!(text.contains("[N]"), "streaming={streaming}: {text}");
+        }
     }
 
     #[test]
