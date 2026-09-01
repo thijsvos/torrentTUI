@@ -12,7 +12,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 <p align="center">
   <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: a Debian netinst torrent downloading at 11 MB/s from 38 peers, capped to 500 KB/s live with t and settling smoothly at the limit, the command palette opening the built-in indexer search, then Ctrl+D detaching — the confirmation explains that seeding continues and how to stop it — the window closing to a shell where torrenttui --status reports the background session still running, and plain torrenttui taking it back with the progress bar further along than it was left">
 </p>
-<p align="center"><em>A live download capped to 500 KB/s with <code>t</code>, settling smoothly — no pause flicker → command palette → built-in search, no external services → <code>Ctrl+D</code> detaches: the window closes, the session keeps downloading → <code>torrenttui</code> takes it straight back, further along than you left it.</em></p>
+<p align="center"><em>A live download capped to 500 KB/s with <code>t</code> — the status bar shows the rate settling against the limit → command palette → built-in search, no external services → <code>Ctrl+D</code> detaches: the window closes, the session keeps downloading → <code>torrenttui</code> takes it straight back, further along than you left it.</em></p>
 
 ## Contents
 
@@ -380,6 +380,9 @@ OS file lock, which the kernel releases when the process dies.
 - `[privacy]` settings are applied when a session starts. A background session
   keeps the posture it started with even if you edit `config.toml` afterwards —
   `--status` shows what it actually applied.
+- A speed limit set with `t` belongs to the running session, not to your
+  config, so it does not survive a detach and take-over. Put it in
+  `[network] max_download_speed_kbps` to have it apply to every session.
 
 ## Privacy
 

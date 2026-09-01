@@ -20,9 +20,13 @@
 # archive.org torrent will sit at 0 B/s forever — that host serves over HTTP
 # webseeds, which librqbit does not implement (BEP 19).
 #
-# The rate cap is applied early on purpose. Uncapped, this saturates the
-# link, and a recording made on a metered connection should not spend a
-# gigabyte of someone's data to show a progress bar moving.
+# The rate cap is applied early on purpose, for two reasons. Uncapped, this
+# saturates the link, and a recording made on a metered connection should not
+# spend a gigabyte of someone's data to show a progress bar moving. And the
+# cap needs time to become visible: the limiter stops requesting immediately,
+# but pieces already in flight from a thousand peers keep arriving for
+# fifteen seconds or so. Applying it before the search means the drain
+# happens while the search is on screen.
 #
 # The tail detaches and reattaches, which starts a real background process.
 # The cleanup at the bottom stops it — do not remove that, or a recording
@@ -56,7 +60,7 @@ Sleep 700ms
 Enter
 Sleep 700ms
 Enter
-Sleep 5s
+Sleep 3s
 
 # Command palette: press ':', fuzzy-search every action with its keybinding
 Type ":"
@@ -79,7 +83,14 @@ Sleep 700ms
 Type "j"
 Sleep 900ms
 Escape
-Sleep 3s
+
+# Back on the list, and this is the part worth waiting for: the rate has
+# settled at the cap. Coming down from ~15 MB/s takes a good fifteen seconds
+# — a thousand peers all have requests in flight, and those keep landing
+# after the limiter stops asking for more. The search above is deliberately
+# placed inside that window so the gif spends the drain doing something
+# useful instead of watching a number fall.
+Sleep 9s
 
 # Detach. Ctrl+D always confirms first — regardless of confirm_on_quit —
 # and says plainly that seeding continues and how to stop it. Nothing
