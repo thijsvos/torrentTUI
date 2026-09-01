@@ -10,9 +10,9 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 [![@thijsvos](https://img.shields.io/badge/@thijsvos-000000?logo=x)](https://x.com/thijsvos)
 
 <p align="center">
-  <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: opening the command palette with a colon, running the built-in torrent search, downloading an Arch Linux ISO from the results with Enter, capping the download at 500 KB/s live with t while the speed settles smoothly at the limit, and revealing the data in the file manager with o">
+  <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: opening the command palette with a colon, running the built-in torrent search for an Ubuntu ISO, setting a 500 KB/s download cap with t, then pressing Ctrl+D to detach — the confirmation explains that seeding continues and how to stop it — the window closes to a shell where torrenttui --status reports the background session still running, and plain torrenttui takes it back with the torrent intact">
 </p>
-<p align="center"><em>Command palette → built-in search → pick a result → downloading → a 500 KB/s cap applied live, no pause flicker → reveal in your file manager. No external services.</em></p>
+<p align="center"><em>Command palette → built-in search, no external services → a 500 KB/s cap applied live → <code>Ctrl+D</code> detaches: the window closes, the session keeps going → <code>torrenttui</code> takes it straight back.</em></p>
 
 ## Contents
 
