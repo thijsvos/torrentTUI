@@ -123,6 +123,38 @@ jobs:
       - name: Check the binary runs in the image
         run: docker run --rm --entrypoint torrenttui torrenttui:ci --version
 
+  # The crate is publish-ready but deliberately unpublished. This keeps that
+  # true: `--dry-run` packages and builds the tarball exactly as `cargo publish`
+  # would, so a missing `license`, a broken `exclude`, or a file the build needs
+  # that is not shipped all fail here instead of at the moment someone finally
+  # decides to publish. It contacts no registry and needs no token.
+  package:
+    name: Publish Dry Run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+
+      - name: Verify the crate would publish
+        run: cargo publish --dry-run --locked
+
+      # README.md must survive `exclude`: src/actions.rs reads it at test time
+      # through CARGO_MANIFEST_DIR, and assets/demo.gif must not, being 62% of
+      # the tarball. Both are one careless edit away from flipping.
+      - name: Check the packaged file list
+        run: |
+          LIST=$(cargo package --list --locked)
+          echo "$LIST"
+          echo "$LIST" | grep -qx 'README.md' || { echo '::error::README.md missing from the package'; exit 1; }
+          ! echo "$LIST" | grep -q 'assets/' || { echo '::error::assets/ leaked into the package'; exit 1; }
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest

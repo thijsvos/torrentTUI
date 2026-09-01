@@ -6,6 +6,20 @@ edition = "2021"
 # with a clear message instead of failing deep inside a dependency.
 rust-version = "1.95"
 description = "A terminal BitTorrent client for magnet link downloads"
+license = "MIT"
+repository = "https://github.com/thijsvos/torrentTUI"
+homepage = "https://github.com/thijsvos/torrentTUI"
+# crates.io caps both at 5; keywords are <=20 chars, alphanumeric/-/_.
+keywords = ["bittorrent", "torrent", "tui", "terminal", "ratatui"]
+categories = ["command-line-utilities", "network-programming"]
+# `assets/demo.gif` alone is 1.29 MB of a 2.09 MB tracked tree — 62% of the
+# published tarball, already-compressed so gzip cannot reclaim it, and useless
+# to anyone building from source. crates.io renders the README with images
+# resolved against `repository`, so the gif does not need to ship to display.
+#
+# Do NOT add README.md here: `src/actions.rs` reads it at test time through
+# CARGO_MANIFEST_DIR to prove the keybinding tables match the action registry.
+exclude = ["assets/*", "demo.tape"]
 
 [dependencies]
 # TUI
