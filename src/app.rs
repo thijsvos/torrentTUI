@@ -224,6 +224,11 @@ pub struct App {
     /// clamp it when the peer list shrinks; the key handlers reset it to 0
     /// whenever the Peers list is re-entered (opening Detail, switching tab).
     pub detail_peer_scroll_offset: usize,
+    /// First file row drawn in the Files tab. Same reason the peer list needs
+    /// one: `detail_file_index` alone only decides which row is highlighted,
+    /// so without this the cursor walks off the bottom of a long file list and
+    /// keeps going invisibly.
+    pub detail_file_scroll_offset: usize,
     /// Cached order of indices into `self.torrents` after applying the
     /// current filter and sort. Rebuilt when `sort_dirty` is true. The cache
     /// exists because `sorted_torrents()` is called multiple times per frame
@@ -318,6 +323,7 @@ impl App {
             marked_ids: HashSet::new(),
             detail_peer_index: 0,
             detail_peer_scroll_offset: 0,
+            detail_file_scroll_offset: 0,
             sort_cache: Vec::new(),
             sort_dirty: true,
             confirm_on_quit: true,

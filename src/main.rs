@@ -1431,6 +1431,7 @@ async fn open_detail(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
     app.detail_file_index = 0;
     app.detail_peer_index = 0;
     app.detail_peer_scroll_offset = 0;
+    app.detail_file_scroll_offset = 0;
     // Tell the engine which torrent we're viewing so the next
     // snapshot includes files/peers/info for only this one.
     let detail_id = app.selected_torrent_id;
@@ -1781,6 +1782,7 @@ fn cycle_detail_tab(app: &mut App) {
     app.detail_file_index = 0;
     app.detail_peer_index = 0;
     app.detail_peer_scroll_offset = 0;
+    app.detail_file_scroll_offset = 0;
 }
 
 async fn toggle_file_selection_key(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {

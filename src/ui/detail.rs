@@ -218,7 +218,7 @@ fn render_info_tab(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(info_widget, area);
 }
 
-fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
+fn render_files_tab(f: &mut Frame, area: Rect, app: &mut App) {
     let torrent = match app.selected_torrent() {
         Some(t) => t,
         None => return,
@@ -239,6 +239,38 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let torrent_id = torrent.id;
+    let file_count = torrent.files.len();
+
+    // Keep the highlighted row on screen. Without this the Files tab drew every
+    // row into a Paragraph with no scroll at all: a torrent with more files
+    // than the pane is tall simply ran off the bottom, and `j` moved a cursor
+    // nobody could see. Same three clamps as the Peers tab — lower the offset
+    // to follow the cursor up, raise it to follow the cursor down, then bound
+    // it so a shrinking list cannot leave the window past the end.
+    //
+    // Only the block borders are subtracted here; unlike Peers there are no
+    // header lines in this pane.
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let file_index = app.detail_file_index.min(file_count.saturating_sub(1));
+    app.detail_file_index = file_index;
+    if file_index < app.detail_file_scroll_offset {
+        app.detail_file_scroll_offset = file_index;
+    }
+    if visible_height > 0 && file_index >= app.detail_file_scroll_offset + visible_height {
+        app.detail_file_scroll_offset = file_index + 1 - visible_height;
+    }
+    let max_offset = file_count.saturating_sub(visible_height.max(1));
+    if app.detail_file_scroll_offset > max_offset {
+        app.detail_file_scroll_offset = max_offset;
+    }
+    let scroll_offset = app.detail_file_scroll_offset;
+
+    // Re-borrow immutably; no more `app` mutation below.
+    let torrent = match app.selected_torrent() {
+        Some(t) => t,
+        None => return,
+    };
+
     let mut lines: Vec<Line> = Vec::new();
     for (idx, file) in torrent.files.iter().enumerate() {
         let percent = if file.size_bytes > 0 {
@@ -297,15 +329,17 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
         ]));
     }
 
-    let files_widget = Paragraph::new(lines).block(
-        Block::default()
-            .title(format!(
-                " Files ({}) - Space:toggle  S:apply  s:stream \u{25B6} ",
-                torrent.files.len()
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
+    let files_widget = Paragraph::new(lines)
+        .scroll((scroll_offset as u16, 0))
+        .block(
+            Block::default()
+                .title(format!(
+                    " Files ({}) - Space:toggle  S:apply  s:stream \u{25B6} ",
+                    torrent.files.len()
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
     f.render_widget(files_widget, area);
 }
 
@@ -692,6 +726,93 @@ mod tests {
                 app.detail_peer_scroll_offset
             );
         }
+    }
+
+    // -- the file scroll invariant ------------------------------------------
+
+    fn files(n: usize) -> Vec<FileInfo> {
+        (0..n)
+            .map(|i| FileInfo {
+                name: format!("file-{:03}.bin", i),
+                size_bytes: 1024,
+                progress_bytes: (i * 8) as u64,
+            })
+            .collect()
+    }
+
+    /// Same invariant the peer list has: the highlighted row must lie inside
+    /// the window actually drawn. Before this the Files tab had no scrolling
+    /// at all — a long list ran off the bottom and `j` moved an invisible
+    /// cursor.
+    #[test]
+    fn file_scroll_keeps_the_cursor_inside_the_window() {
+        let mut t = torrent();
+        t.files = files(60);
+        let mut app = app_showing(t, DetailTab::Files);
+
+        let height: u16 = 20;
+        let visible = (height - 2) as usize;
+        for index in [0usize, 1, 17, 18, 40, 59] {
+            app.detail_file_index = index;
+            draw(&mut app, 120, height);
+            let offset = app.detail_file_scroll_offset;
+            assert!(
+                offset <= index && index < offset + visible,
+                "index {index} outside window [{offset}, {})",
+                offset + visible
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_past_the_fold_is_actually_drawn() {
+        // The regression in one assertion: file 059 exists, so selecting it
+        // must put it on screen.
+        let mut t = torrent();
+        t.files = files(60);
+        let mut app = app_showing(t, DetailTab::Files);
+        app.detail_file_index = 59;
+        let text = draw(&mut app, 120, 20);
+        assert!(text.contains("file-059.bin"), "last file not drawn: {text}");
+        assert!(
+            !text.contains("file-000.bin"),
+            "should have scrolled past the top"
+        );
+    }
+
+    #[test]
+    fn file_scroll_follows_the_cursor_back_up() {
+        let mut t = torrent();
+        t.files = files(60);
+        let mut app = app_showing(t, DetailTab::Files);
+        app.detail_file_index = 59;
+        draw(&mut app, 120, 20);
+        assert!(app.detail_file_scroll_offset > 0);
+
+        app.detail_file_index = 0;
+        let text = draw(&mut app, 120, 20);
+        assert_eq!(app.detail_file_scroll_offset, 0);
+        assert!(text.contains("file-000.bin"), "{text}");
+    }
+
+    #[test]
+    fn file_scroll_offset_is_bounded_when_the_list_shrinks() {
+        let mut t = torrent();
+        t.files = files(60);
+        let mut app = app_showing(t, DetailTab::Files);
+        app.detail_file_index = 59;
+        draw(&mut app, 120, 20);
+        assert!(app.detail_file_scroll_offset > 0);
+
+        let mut t = torrent();
+        t.files = files(3);
+        app.handle_state_push(vec![t]);
+        draw(&mut app, 120, 20);
+        assert!(
+            app.detail_file_scroll_offset < 3,
+            "offset {} points past a 3-file list",
+            app.detail_file_scroll_offset
+        );
     }
 
     // -- degenerate sizes ---------------------------------------------------
