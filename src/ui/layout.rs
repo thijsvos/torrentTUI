@@ -72,10 +72,17 @@ pub fn render_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(title, area);
 }
 
+/// Below this, the free-space readout is marked as a warning. Matches the
+/// README's "low-space warnings".
+const LOW_DISK_SPACE_BYTES: u64 = 1_073_741_824;
+
 pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     if let Some(ref err) = app.error_message {
+        // Prefixed, not just reddened. An error and an informational notice
+        // rendered in structurally identical widgets and were told apart by
+        // hue alone — the one distinction that vanishes without colour.
         let error = Paragraph::new(Line::from(vec![Span::styled(
-            err.clone(),
+            format!("\u{2716} {}", err),
             Style::default().fg(Color::Red),
         )]))
         .block(
@@ -193,13 +200,23 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
 
     if let Some(space) = app.free_disk_space {
         let space_str = format_size(space);
-        let style = if space < 1_073_741_824 {
+        // Both branches used to render the identical string and differ only in
+        // colour, so the low-space warning did not exist at all on a monochrome
+        // terminal, under NO_COLOR, or for a reader who cannot separate red
+        // from grey. The glyph carries the signal; the colour reinforces it.
+        let low = space < LOW_DISK_SPACE_BYTES;
+        let style = if low {
             Style::default().fg(Color::Red)
         } else {
             Style::default().fg(Color::Gray)
         };
+        let text = if low {
+            format!("\u{26a0} {} free", space_str)
+        } else {
+            format!("{} free", space_str)
+        };
         left_spans.push(Span::raw("  \u{2502}  "));
-        left_spans.push(Span::styled(format!("{} free", space_str), style));
+        left_spans.push(Span::styled(text, style));
     }
 
     if !app.filter_text.is_empty() && app.mode != AppMode::Filter {
@@ -455,5 +472,54 @@ mod tests {
     #[test]
     fn eta_hours_minutes() {
         assert_eq!(format_eta(Some(3661)), "1h 1m");
+    }
+
+    /// Render the status bar and flatten it to text, so an assertion can ask
+    /// what a reader actually sees rather than what style was applied.
+    fn status_text(app: &App) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        terminal
+            .draw(|f| render_status_bar(f, f.area(), app))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn low_disk_space_is_marked_without_relying_on_colour() {
+        // Both branches used to render identical text and differ only in hue,
+        // so the warning did not survive NO_COLOR, a monochrome terminal, or a
+        // reader who cannot separate red from grey.
+        let mut app = App::new();
+        app.free_disk_space = Some(LOW_DISK_SPACE_BYTES - 1);
+        let low = status_text(&app);
+        assert!(low.contains('\u{26a0}'), "no warning glyph: {low}");
+
+        app.free_disk_space = Some(LOW_DISK_SPACE_BYTES * 8);
+        let plenty = status_text(&app);
+        assert!(!plenty.contains('\u{26a0}'), "spurious warning: {plenty}");
+    }
+
+    #[test]
+    fn an_error_is_distinguishable_from_a_notice_without_colour() {
+        // Same widget, same borders; previously only the hue differed.
+        let mut app = App::new();
+        app.set_error("disk full".to_string());
+        let err = status_text(&app);
+        assert!(err.contains('\u{2716}'), "no error marker: {err}");
+
+        let mut app = App::new();
+        app.set_info("took over the background session".to_string());
+        let info = status_text(&app);
+        assert!(
+            !info.contains('\u{2716}'),
+            "notice marked as an error: {info}"
+        );
     }
 }
