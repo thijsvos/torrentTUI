@@ -10,9 +10,9 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 [![@thijsvos](https://img.shields.io/badge/@thijsvos-000000?logo=x)](https://x.com/thijsvos)
 
 <p align="center">
-  <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: opening the command palette with a colon, running the built-in torrent search for an Ubuntu ISO, setting a 500 KB/s download cap with t, then pressing Ctrl+D to detach — the confirmation explains that seeding continues and how to stop it — the window closes to a shell where torrenttui --status reports the background session still running, and plain torrenttui takes it back with the torrent intact">
+  <img src="assets/demo.gif" width="100%" alt="TorrentTUI demo: a Debian netinst torrent downloading at 11 MB/s from 38 peers, capped to 500 KB/s live with t and settling smoothly at the limit, the command palette opening the built-in indexer search, then Ctrl+D detaching — the confirmation explains that seeding continues and how to stop it — the window closing to a shell where torrenttui --status reports the background session still running, and plain torrenttui taking it back with the progress bar further along than it was left">
 </p>
-<p align="center"><em>Command palette → built-in search, no external services → a 500 KB/s cap applied live → <code>Ctrl+D</code> detaches: the window closes, the session keeps going → <code>torrenttui</code> takes it straight back.</em></p>
+<p align="center"><em>A live download capped to 500 KB/s with <code>t</code>, settling smoothly — no pause flicker → command palette → built-in search, no external services → <code>Ctrl+D</code> detaches: the window closes, the session keeps downloading → <code>torrenttui</code> takes it straight back, further along than you left it.</em></p>
 
 ## Contents
 
