@@ -79,6 +79,50 @@ jobs:
         run: python3 scripts/e2e_session.py target/debug/torrenttui
         shell: bash
 
+  # `rust-version = "1.95"` is asserted in Cargo.toml, the README and
+  # CONTRIBUTING, and until now every toolchain in both workflows was `@stable`
+  # — so the claim was never once tested and could have been wrong for months.
+  #
+  # This verifies the promise rather than discovering the real floor (which is
+  # currently 1.89, set by notify-rust). `cargo msrv` would find the floor but
+  # bisects across toolchains, recompiling from cold each time; one pinned
+  # check is a fraction of the cost and answers the question we actually make
+  # to users. `--locked` matters: without it this could resolve newer
+  # dependency versions than the ones we ship and test a different graph.
+  msrv:
+    name: MSRV (1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check against the declared MSRV
+        run: cargo check --all-targets --locked
+
+  # The README documents a Docker workflow and dependabot watches the base
+  # images monthly, but nothing ever built the file — so it could rot silently.
+  # Build only: no push, no registry auth, no build args.
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build -t torrenttui:ci .
+
+      - name: Check the binary runs in the image
+        run: docker run --rm --entrypoint torrenttui torrenttui:ci --version
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest

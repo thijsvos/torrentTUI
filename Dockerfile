@@ -22,7 +22,8 @@ RUN adduser -D -h /home/torrenttui torrenttui
 
 COPY --from=builder /build/target/release/torrenttui /usr/local/bin/torrenttui
 
-# BitTorrent listen ports (matches listen_port_range: 6881..6891)
+# BitTorrent listen ports. `pick_listen_port` probes listen_port..+PORT_RANGE_SIZE
+# (6881..6891 exclusive), so the last port it can pick is 6890.
 EXPOSE 6881-6890
 
 # Download directory

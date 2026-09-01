@@ -19,6 +19,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Matches ci.yml. Without it the test job below would lint more weakly than
+  # the CI run that guarded the PR, which defeats the point of the gate.
+  RUSTFLAGS: -D warnings
 
 jobs:
   check-version:
@@ -44,12 +47,53 @@ jobs:
             echo "should_release=true" >> $GITHUB_OUTPUT
           fi
 
+  # The gate. Releases are triggered by a version-bump commit pushed straight
+  # to main, so no PR review stands between a mistake and five signed binaries
+  # — this workflow previously ran no tests at all.
+  #
+  # Deliberately a job here rather than a `workflow_run` on ci.yml: both
+  # workflows fire on the same `push: main` with different concurrency groups,
+  # so they run concurrently and never observe each other, and ci.yml has no
+  # `workflow_call` trigger or aggregate "all green" job to depend on. One
+  # runner is enough — the full OS matrix already ran on the PR that produced
+  # the commit.
+  test:
+    name: Test before release
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all --locked
+
   build-release:
     name: Build ${{ matrix.name }}
-    needs: check-version
+    needs: [check-version, test]
+    # `needs.test.result` is named explicitly rather than relying on GitHub's
+    # implicit "skip if a dependency failed". That implicit rule is what an
+    # `if:` referencing `needs.*.result` exists to override — which this
+    # condition already does for the tag path, where `check-version` is
+    # deliberately skipped. Leaving `test` unnamed here would be betting the
+    # whole gate on which of those two behaviours wins.
     if: |
-      (needs.check-version.result == 'success' && needs.check-version.outputs.should_release == 'true') ||
-      (needs.check-version.result == 'skipped' && startsWith(github.ref, 'refs/tags/v'))
+      needs.test.result == 'success' &&
+      ((needs.check-version.result == 'success' && needs.check-version.outputs.should_release == 'true') ||
+       (needs.check-version.result == 'skipped' && startsWith(github.ref, 'refs/tags/v')))
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -98,17 +142,26 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # Pinned to a specific commit, not a released version: the newest cross
+      # on crates.io is 0.2.5 (Feb 2023), which predates target support this
+      # build relies on — hence the git install. Unpinned, though, whatever sat
+      # on main at build time shaped an artifact that then received a provenance
+      # attestation. This rev is what main pointed at on 2026-08-19, so the pin
+      # changes nothing about today's output; it just stops it drifting.
       - name: Install cross (Linux aarch64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: |
+          cargo install cross --locked \
+            --git https://github.com/cross-rs/cross \
+            --rev 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27
 
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (cross-compile)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Prepare artifact (Unix)
         if: runner.os != 'Windows'

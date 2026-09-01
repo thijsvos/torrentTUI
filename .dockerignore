@@ -5,3 +5,7 @@ target/
 .gitignore
 *.md
 LICENSE
+# Not used by the build; assets/demo.gif alone is 1.3 MB of context.
+assets/
+demo.tape
+scripts/
