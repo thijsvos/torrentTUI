@@ -443,3 +443,289 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
     );
     f.render_widget(peers_widget, area);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FileInfo, TorrentInfo, TorrentStatus};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn torrent() -> TorrentInfo {
+        TorrentInfo {
+            id: 0,
+            name: "debian-13.6.0-amd64-netinst.iso".to_string(),
+            size_bytes: 786_432_000,
+            downloaded_bytes: 393_216_000,
+            uploaded_bytes: 131_072_000,
+            download_speed: 512_000,
+            upload_speed: 64_000,
+            peers_connected: 42,
+            peers_total: 518,
+            status: TorrentStatus::Downloading,
+            eta_seconds: Some(754),
+            files: Vec::new(),
+            peers: Vec::new(),
+            info_hash: "8337c196d4536e9af5d2c7e599f0f1b7d71eee54".to_string(),
+            trackers: Vec::new(),
+            piece_length: Some(262_144),
+            content_path: None,
+        }
+    }
+
+    /// Distinct `downloaded_bytes` on purpose: the peer table is sorted by
+    /// `Reverse(downloaded_bytes)` and `detail_peer_index` indexes *that*
+    /// order, not `TorrentInfo::peers`. Identical peers would hide a
+    /// regression in the sort.
+    fn peers(n: usize) -> Vec<PeerInfo> {
+        (0..n)
+            .map(|i| PeerInfo {
+                address: format!("10.0.0.{}:6881", i + 1),
+                state: "Live".to_string(),
+                downloaded_bytes: ((n - i) * 1024) as u64,
+                pieces: (n - i) as u32,
+                errors: 0,
+            })
+            .collect()
+    }
+
+    fn app_showing(torrent: TorrentInfo, tab: DetailTab) -> App {
+        let mut app = App::new();
+        app.handle_state_push(vec![torrent]);
+        app.detail_tab = tab;
+        app
+    }
+
+    fn draw(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render_detail(f, f.area(), app)).unwrap();
+        screen(&terminal)
+    }
+
+    // -- the tabs render what they claim ------------------------------------
+
+    #[test]
+    fn stats_tab_shows_transfer_figures() {
+        let mut app = app_showing(torrent(), DetailTab::Stats);
+        let text = draw(&mut app, 100, 30);
+        assert!(text.contains("Downloading"), "{text}");
+        assert!(
+            text.contains("42 connected / 518 total"),
+            "peer counts missing: {text}"
+        );
+        // 393_216_000 / 786_432_000 is exactly half.
+        assert!(text.contains("50.0%"), "progress missing: {text}");
+    }
+
+    #[test]
+    fn info_tab_shows_the_info_hash_and_piece_size() {
+        let mut app = app_showing(torrent(), DetailTab::Info);
+        let text = draw(&mut app, 100, 30);
+        assert!(
+            text.contains("8337c196d4536e9af5d2c7e599f0f1b7d71eee54"),
+            "{text}"
+        );
+        assert!(text.contains("256 KB"), "piece size missing: {text}");
+    }
+
+    #[test]
+    fn info_tab_says_dht_only_when_there_are_no_trackers() {
+        let mut app = app_showing(torrent(), DetailTab::Info);
+        assert!(draw(&mut app, 100, 30).contains("(DHT only)"));
+
+        let mut t = torrent();
+        t.trackers = vec!["https://tracker.example/announce".to_string()];
+        let mut app = app_showing(t, DetailTab::Info);
+        let text = draw(&mut app, 100, 30);
+        assert!(text.contains("tracker.example"), "{text}");
+        assert!(!text.contains("(DHT only)"), "{text}");
+    }
+
+    #[test]
+    fn files_tab_falls_back_to_a_waiting_message() {
+        let mut app = app_showing(torrent(), DetailTab::Files);
+        assert!(draw(&mut app, 100, 30).contains("waiting for metadata"));
+    }
+
+    #[test]
+    fn files_tab_lists_files_with_selection_state() {
+        let mut t = torrent();
+        t.files = vec![
+            FileInfo {
+                name: "disc.iso".to_string(),
+                size_bytes: 1024,
+                progress_bytes: 512,
+            },
+            FileInfo {
+                name: "notes.txt".to_string(),
+                size_bytes: 100,
+                progress_bytes: 100,
+            },
+        ];
+        let mut app = app_showing(t, DetailTab::Files);
+        let text = draw(&mut app, 120, 30);
+        assert!(text.contains("disc.iso"), "{text}");
+        assert!(text.contains("notes.txt"), "{text}");
+        // Both selected by default, so both checkboxes are ticked.
+        assert!(text.contains("[\u{2713}]"), "checkbox missing: {text}");
+    }
+
+    #[test]
+    fn peers_tab_says_so_when_there_are_none() {
+        // Reachable with non-zero counters: librqbit reports counts before the
+        // per-peer snapshot arrives.
+        let mut app = app_showing(torrent(), DetailTab::Peers);
+        let text = draw(&mut app, 100, 30);
+        assert!(text.contains("42"), "counters should still show: {text}");
+    }
+
+    #[test]
+    fn peers_tab_lists_peers_highest_downloaded_first() {
+        let mut t = torrent();
+        t.peers = peers(3);
+        let mut app = app_showing(t, DetailTab::Peers);
+        let text = draw(&mut app, 120, 30);
+        // peers() gives 10.0.0.1 the most bytes, so it sorts to the top.
+        let first = text.find("10.0.0.1:6881").expect("peer 1 rendered");
+        let last = text.find("10.0.0.3:6881").expect("peer 3 rendered");
+        assert!(first < last, "peers not sorted by downloaded desc: {text}");
+    }
+
+    // -- the peer scroll invariant ------------------------------------------
+
+    /// After the three clamps, the highlighted row must lie inside the window
+    /// that is actually drawn: `offset <= index < offset + visible_height`.
+    /// This is the arithmetic most likely to be "simplified" later.
+    #[test]
+    fn peer_scroll_keeps_the_cursor_inside_the_window() {
+        let mut t = torrent();
+        t.peers = peers(50);
+        let mut app = app_showing(t, DetailTab::Peers);
+
+        let height: u16 = 20;
+        let visible = (height - 6) as usize;
+        for index in [0usize, 1, 13, 14, 30, 49] {
+            app.detail_peer_index = index;
+            draw(&mut app, 120, height);
+            let offset = app.detail_peer_scroll_offset;
+            assert!(
+                offset <= index && index < offset + visible,
+                "index {index} outside window [{offset}, {})",
+                offset + visible
+            );
+        }
+    }
+
+    #[test]
+    fn peer_scroll_follows_the_cursor_back_up() {
+        let mut t = torrent();
+        t.peers = peers(50);
+        let mut app = app_showing(t, DetailTab::Peers);
+
+        app.detail_peer_index = 49;
+        draw(&mut app, 120, 20);
+        assert!(
+            app.detail_peer_scroll_offset > 0,
+            "should have scrolled down"
+        );
+
+        app.detail_peer_index = 0;
+        draw(&mut app, 120, 20);
+        assert_eq!(
+            app.detail_peer_scroll_offset, 0,
+            "should scroll back to top"
+        );
+    }
+
+    #[test]
+    fn peer_scroll_offset_is_bounded_when_the_list_shrinks() {
+        let mut t = torrent();
+        t.peers = peers(50);
+        let mut app = app_showing(t, DetailTab::Peers);
+        app.detail_peer_index = 49;
+        draw(&mut app, 120, 20);
+        let scrolled = app.detail_peer_scroll_offset;
+        assert!(scrolled > 0);
+
+        // The swarm collapses to three peers between ticks.
+        let mut t = torrent();
+        t.peers = peers(3);
+        app.handle_state_push(vec![t]);
+        draw(&mut app, 120, 20);
+        assert!(
+            app.detail_peer_scroll_offset <= 3usize.saturating_sub(1),
+            "offset {} points past a 3-peer list",
+            app.detail_peer_scroll_offset
+        );
+    }
+
+    /// A pane too short to show anything must still leave the offset pointing
+    /// inside the list, so the next resize renders from a sane position.
+    ///
+    /// Note on what this does *not* cover: `visible_height.max(1)` in
+    /// `max_offset` looks load-bearing but is unreachable. `scroll_offset` is
+    /// only ever assigned `peer_index` or `peer_index + 1 - visible_height`,
+    /// both bounded by `peer_count - 1`, so the `offset > max_offset` clamp it
+    /// guards cannot fire even with the `.max(1)` removed — verified by
+    /// mutation, which every test here survives. It is defensive, not
+    /// load-bearing, and no test can honestly pin it.
+    #[test]
+    fn peer_scroll_survives_a_pane_with_no_room() {
+        let mut t = torrent();
+        t.peers = peers(10);
+        let mut app = app_showing(t, DetailTab::Peers);
+        app.detail_peer_index = 9;
+        for height in [1u16, 4, 6, 7] {
+            draw(&mut app, 120, height);
+            assert!(
+                app.detail_peer_scroll_offset < 10,
+                "height {height}: offset {} is past the list",
+                app.detail_peer_scroll_offset
+            );
+        }
+    }
+
+    // -- degenerate sizes ---------------------------------------------------
+
+    #[test]
+    fn every_tab_survives_a_tiny_terminal() {
+        // Mirrors the help overlay's 10x4 guard. Detail does index arithmetic
+        // against terminal height, so this is the file where it matters most.
+        let mut t = torrent();
+        t.files = vec![FileInfo {
+            name: "disc.iso".to_string(),
+            size_bytes: 1024,
+            progress_bytes: 512,
+        }];
+        t.peers = peers(5);
+        t.trackers = vec!["https://tracker.example/announce".to_string()];
+
+        for tab in [
+            DetailTab::Stats,
+            DetailTab::Info,
+            DetailTab::Files,
+            DetailTab::Peers,
+        ] {
+            let mut app = app_showing(t.clone(), tab);
+            let _ = draw(&mut app, 10, 4);
+            let _ = draw(&mut app, 1, 1);
+            let _ = draw(&mut app, 200, 60);
+        }
+    }
+
+    #[test]
+    fn renders_nothing_and_does_not_panic_with_no_selection() {
+        let mut app = App::new();
+        app.detail_tab = DetailTab::Peers;
+        let _ = draw(&mut app, 100, 30);
+    }
+}
