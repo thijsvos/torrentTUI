@@ -31,6 +31,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 - **Selective file download** — choose which files to download from multi-file torrents
 - **Reveal in file manager** — press `o` to open the selected torrent's data in Finder, Explorer, or your Linux file manager
 - **Detail view** — inspect torrent info, individual file progress, and peer details
+- **Why is it slow?** — press `w` and the Health tab says *why* a torrent is stalled (no way to find peers, peers unreachable, swarm has no seeders, your own cap) and what to change; see [the Health tab](#why-is-it-slow--the-health-tab)
 - **Session persistence** — torrents survive restarts via librqbit's built-in fastresume
 - **Background sessions** — press `Ctrl+D` to detach: downloads and seeding keep running in a process you started on purpose. Nothing survives a plain `q`. Run `torrenttui` again to take the session back; `torrenttui --stop` ends it
 - **Disk space monitoring** — free space indicator with low-space warnings
@@ -130,6 +131,7 @@ torrenttui --stop
 | `d` | Delete selected (or all marked) torrents |
 | `o` | Reveal the selected torrent in your file manager (Finder/Explorer/xdg-open); falls back to the download folder while data is still arriving |
 | `Enter` | Open detail view |
+| `w` | Why is it slow? Open the Health tab for the selected torrent |
 | `j` / `k` (or `↓` / `↑`) | Move selection down/up |
 | `Tab` | Cycle sort column |
 | `r` | Reverse sort order |
@@ -202,8 +204,8 @@ from the same API, and there is no warehouse of magnet links anywhere.
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Cycle tabs (Stats → Info → Files → Peers) |
-| `j` / `k` | Navigate files (Files tab) or peers (Peers tab) |
+| `Tab` | Cycle tabs (Stats → Info → Files → Peers → Health) |
+| `j` / `k` | Navigate files (Files tab) or peers (Peers tab); scroll the Health tab |
 | `Space` | Toggle file selection (Files tab) |
 | `S` | Apply current file selection to engine (Files tab) |
 | `s` | Stream selected file in default media player (Files tab) |
@@ -233,6 +235,57 @@ args = ["--no-terminal"] # optional extra args inserted before the URL
 
 Leave `command` empty to use the OS default opener (`xdg-open` on Linux,
 `open` on macOS, `start` on Windows).
+
+### Why is it slow? — the Health tab
+
+A torrent sitting at `0 B/s` is the one question every client makes you answer
+yourself. Press `w` on any torrent (or `Tab` to the **Health** tab in the
+detail view) and TorrentTUI answers it: one verdict, the evidence behind it,
+and the single most useful thing to try — naming the config key involved and
+whether it applies live (`t`) or needs a restart.
+
+```
+⚠ Stalled — 52 peers known, none reachable — nothing received for 2 min
+  • 52 known: 49 dead, 3 connecting, 0 queued, 0 live
+  • Every outgoing TCP connection failed (214 of 214)
+→ Something is blocking outgoing connections — firewall, VPN, or the ISP
+```
+
+Verdicts you will see:
+
+- **Stalled — no way to find peers.** DHT is off (proxy lockdown, or
+  `network.enable_dht = false`) and every tracker is failing or was a `udp://`
+  one the proxy stripped. The fix is spelled out: add an http(s) tracker, or
+  change the key named — with a note that `[privacy]` and `[network]` changes
+  need a restart.
+- **Stalled — peers known, none reachable.** The swarm was discovered but no
+  connection succeeds; the session-wide connection counters say whether it is
+  every TCP connection (firewall/VPN), every SOCKS5 connection (the proxy is
+  down), a bound interface without a route (`privacy.bind_interface`), or a
+  blocklist rejecting the whole swarm.
+- **Stalled — connected but nobody is sending.** Peers are live but have
+  nothing you need: a swarm with no seeders. Also flags data that was fetched
+  but never passed a hash check.
+- **Capped.** You are at your own `t` limit — the one cause that is fixed
+  live, in one keypress.
+- **Note.** Working, with something worth knowing: a thin swarm, a failed
+  UPnP mapping, seeding without a listener under the proxy.
+- **Healthy**, with the freshest tracker announce and the average piece time.
+
+Below the verdict the tab lists every number it looked at: the peer buckets
+(live / seen / dead / connecting / queued / not needed), DHT node count,
+listener port, UPnP result, each tracker's last announce or error, transfer
+quality, and the session-wide connection success rates. A magnet still waiting
+for its metadata has no row yet — librqbit only creates the torrent once a
+peer hands the metadata over — so it is listed under Session with how long it
+has been asking. In the main list a stalled torrent's status cell reads
+`⚠ Stalled` after 30 s without a byte.
+
+Where does tracker status come from? librqbit's API exposes none — so
+TorrentTUI listens to the tracker events librqbit logs, in memory only. The
+on-disk log keeps its default `torrenttui=warn` filter; nothing about peers or
+trackers is written anywhere. The one thing no client can show is a tracker's
+seeder/leecher count: librqbit discards it before it is logged.
 
 ## Configuration
 
