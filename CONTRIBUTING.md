@@ -46,6 +46,14 @@ closing a window.
 
 If you touch the engine, smoke-test against a public-domain torrent (e.g. one of [archive.org's](https://archive.org/) `.torrent` files) before submitting.
 
+When bumping `librqbit`, also check `MESSAGES` in `src/engine/health_capture.rs`.
+The Health tab's per-tracker status is reconstructed from the tracing events
+librqbit emits (its API exposes none), so the message texts and span field
+names there are pinned to the upstream source, file and line cited. A reworded
+message upstream degrades that tracker to "pending" rather than breaking
+anything — the tests in that module replay each shape, so re-verify them
+against the new crate source and update the table.
+
 ## Pull-request guidelines
 
 - Keep PRs scoped: one logical change per PR is much easier to review than a sweeping refactor.

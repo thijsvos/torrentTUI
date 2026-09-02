@@ -20,12 +20,27 @@
 //! is the one entry point that runs it.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::actions::{fuzzy_score, palette_scope, tui_description, ActionInfo, Scope, ACTIONS};
 use crate::config::{PlayerConfig, SearchConfig};
+use crate::health;
 use crate::search::{SearchOutcome, SearchResult};
-use crate::types::{AppMode, DetailTab, SortColumn, TorrentInfo, TorrentStatus};
+use crate::types::{AppMode, DetailTab, NetworkHealth, SortColumn, TorrentInfo, TorrentStatus};
 use ratatui::widgets::TableState;
+
+/// Per-torrent progress bookkeeping for the stall doctor. `bytes` is the last
+/// `downloaded_bytes` seen and `since` when it last went up — so
+/// `now - since` is how long the torrent has been standing still.
+/// `downloading` remembers the last status class, so the clock restarts on
+/// the push where a torrent *becomes* downloading rather than counting the
+/// interval since it was last seen paused.
+#[derive(Debug, Clone, Copy)]
+struct ProgressMark {
+    bytes: u64,
+    since: Instant,
+    downloading: bool,
+}
 
 /// Cap on the palette's filter buffer; action names are short, so anything
 /// longer than this can't match and only wastes redraw work.
@@ -278,6 +293,20 @@ pub struct App {
     /// a 24-line terminal, so the overlay scrolls; reset when help opens and
     /// clamped against the visible height by the renderer.
     pub help_scroll: u16,
+    /// Last byte count and when it last grew, per torrent id — the clock
+    /// behind "nothing received for 2 min". Pruned with the other id-keyed
+    /// state.
+    progress_marks: HashMap<usize, ProgressMark>,
+    /// Ids the table currently shows as stalled. Recomputed by
+    /// [`App::refresh_stall_flags`] on every push *and* every frame tick, so a
+    /// torrent that crosses the threshold while its snapshot stays identical
+    /// still triggers a repaint.
+    pub stalled_ids: HashSet<usize>,
+    /// Session-wide network facts from the latest `EngineInfo::Network`;
+    /// `None` for the first second after startup.
+    pub network_health: Option<NetworkHealth>,
+    /// Scroll offset of the Health tab, in lines.
+    pub detail_health_scroll: u16,
 }
 
 impl App {
@@ -338,6 +367,10 @@ impl App {
             download_dir: String::new(),
             palette: PaletteState::new(),
             help_scroll: 0,
+            progress_marks: HashMap::new(),
+            stalled_ids: HashSet::new(),
+            network_health: None,
+            detail_health_scroll: 0,
         }
     }
 
@@ -371,12 +404,23 @@ impl App {
     /// unconditionally meant a session of idle torrents redrew the terminal ten
     /// times a second forever — and rebuilt the sort cache each time.
     pub fn handle_state_push(&mut self, torrents: Vec<TorrentInfo>) -> bool {
+        self.handle_state_push_at(torrents, Instant::now())
+    }
+
+    /// `handle_state_push` with an explicit clock, so tests can march time
+    /// forward and watch a torrent become stalled.
+    pub fn handle_state_push_at(&mut self, torrents: Vec<TorrentInfo>, now: Instant) -> bool {
+        // Before the early return: an unchanged snapshot is exactly what a
+        // stalled torrent produces, and the clock has to keep counting.
+        self.note_progress(&torrents, now);
         let changed = Self::render_state_differs(&self.torrents, &torrents);
         self.torrents = torrents;
+        let stall_changed = self.refresh_stall_flags(now);
         if !changed {
             // Same rows, same values: the cached order is still correct and
-            // nothing on screen would move.
-            return false;
+            // nothing on screen would move — unless a row just crossed the
+            // stall threshold, which is a visible change.
+            return stall_changed;
         }
         self.invalidate_sort();
         self.prune_stale_state();
@@ -385,9 +429,82 @@ impl App {
         true
     }
 
+    /// Advance the progress clock. A torrent that is not downloading is not
+    /// "standing still" — a paused one resumes with a fresh clock rather than
+    /// being declared stalled the moment it comes back.
+    fn note_progress(&mut self, torrents: &[TorrentInfo], now: Instant) {
+        for t in torrents {
+            let downloading = matches!(t.status, TorrentStatus::Downloading);
+            match self.progress_marks.get_mut(&t.id) {
+                // Still downloading, no new bytes: the clock keeps running.
+                Some(mark)
+                    if downloading && mark.downloading && t.downloaded_bytes <= mark.bytes => {}
+                Some(mark) => {
+                    mark.bytes = t.downloaded_bytes;
+                    mark.since = now;
+                    mark.downloading = downloading;
+                }
+                None => {
+                    self.progress_marks.insert(
+                        t.id,
+                        ProgressMark {
+                            bytes: t.downloaded_bytes,
+                            since: now,
+                            downloading,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Time since the torrent last gained a byte — `None` when it is not
+    /// downloading. A progressing torrent reads as a fraction of a second
+    /// (one push interval at most); only the doctor's threshold makes it a
+    /// stall.
+    pub fn stalled_for(&self, id: usize, now: Instant) -> Option<Duration> {
+        let t = self.torrents.iter().find(|t| t.id == id)?;
+        if !matches!(t.status, TorrentStatus::Downloading) {
+            return None;
+        }
+        let mark = self.progress_marks.get(&id)?;
+        Some(now.saturating_duration_since(mark.since))
+    }
+
+    /// Recompute which rows the table marks as stalled. Returns whether the
+    /// set changed, i.e. whether a repaint is due. Called on every push and
+    /// on every frame tick.
+    pub fn refresh_stall_flags(&mut self, now: Instant) -> bool {
+        let next: HashSet<usize> = self
+            .torrents
+            .iter()
+            .filter(|t| health::is_stalled(&t.status, self.stalled_for(t.id, now)))
+            .map(|t| t.id)
+            .collect();
+        if next == self.stalled_ids {
+            return false;
+        }
+        self.stalled_ids = next;
+        true
+    }
+
+    /// The doctor's verdict for a torrent, or `None` if it is not in the list.
+    pub fn diagnose(&self, id: usize, now: Instant) -> Option<health::Verdict> {
+        let torrent = self.torrents.iter().find(|t| t.id == id)?;
+        Some(health::diagnose(&health::Context {
+            torrent,
+            network: self.network_health.as_ref(),
+            privacy: self.privacy.as_ref(),
+            download_limit_kbps: self.speed_limit_download_kbps,
+            upload_limit_kbps: self.speed_limit_upload_kbps,
+            stalled_for: self.stalled_for(id, now),
+        }))
+    }
+
     /// Compare only the fields that reach the screen. Deliberately ignores
-    /// `files`/`peers`/`trackers`, which are populated for the Detail torrent
-    /// only and are compared by the Detail view's own redraw trigger.
+    /// `files`/`peers`, which are populated for the Detail torrent only and
+    /// whose per-row values change with every byte anyway — their lengths
+    /// (and the tracker list, which changes rarely) are enough.
     fn render_state_differs(old: &[TorrentInfo], new: &[TorrentInfo]) -> bool {
         if old.len() != new.len() {
             return true;
@@ -406,6 +523,8 @@ impl App {
                 || a.eta_seconds != b.eta_seconds
                 || a.files.len() != b.files.len()
                 || a.peers.len() != b.peers.len()
+                || a.health != b.health
+                || a.trackers != b.trackers
         })
     }
 
@@ -795,6 +914,12 @@ impl App {
                 .is_some_and(|name| identities.get(id).is_none_or(|prev| prev == name))
         });
         self.deselected_files.retain(|id, _| {
+            current
+                .get(id)
+                .is_some_and(|name| identities.get(id).is_none_or(|prev| prev == name))
+        });
+        // A recycled id must not inherit the old torrent's stall clock either.
+        self.progress_marks.retain(|id, _| {
             current
                 .get(id)
                 .is_some_and(|name| identities.get(id).is_none_or(|prev| prev == name))
@@ -1292,7 +1417,93 @@ mod tests {
             trackers: Vec::new(),
             piece_length: None,
             content_path: None,
+            health: crate::types::TorrentHealth::default(),
         }
+    }
+
+    // -- the stall clock ------------------------------------------------------
+
+    #[test]
+    fn stall_clock_counts_only_while_bytes_stand_still() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        let mut t = make_torrent(1, "iso", 1000, TorrentStatus::Downloading);
+        t.downloaded_bytes = 100;
+        app.handle_state_push_at(vec![t.clone()], t0);
+        assert!(app.stalled_ids.is_empty());
+
+        // 29 s of silence: not yet.
+        let t1 = t0 + Duration::from_secs(29);
+        let repaint = app.handle_state_push_at(vec![t.clone()], t1);
+        assert!(
+            !repaint,
+            "identical snapshot under the threshold: no repaint"
+        );
+        assert!(app.stalled_ids.is_empty());
+
+        // Crossing 30 s on a frame tick with no new snapshot must repaint.
+        let t2 = t0 + Duration::from_secs(31);
+        assert!(app.refresh_stall_flags(t2));
+        assert_eq!(app.stalled_ids, HashSet::from([1]));
+        assert!(!app.refresh_stall_flags(t2), "no change, no repaint");
+
+        // A byte arrives: clock resets, marker clears.
+        t.downloaded_bytes = 101;
+        let t3 = t0 + Duration::from_secs(32);
+        assert!(app.handle_state_push_at(vec![t.clone()], t3));
+        assert!(app.stalled_ids.is_empty());
+        assert_eq!(app.stalled_for(1, t3), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_paused_torrent_resumes_with_a_fresh_clock() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        let mut t = make_torrent(1, "iso", 1000, TorrentStatus::Downloading);
+        app.handle_state_push_at(vec![t.clone()], t0);
+        t.status = TorrentStatus::Paused;
+        app.handle_state_push_at(vec![t.clone()], t0 + Duration::from_secs(600));
+        assert_eq!(app.stalled_for(1, t0 + Duration::from_secs(600)), None);
+        t.status = TorrentStatus::Downloading;
+        let resumed = t0 + Duration::from_secs(601);
+        app.handle_state_push_at(vec![t.clone()], resumed);
+        assert_eq!(app.stalled_for(1, resumed), Some(Duration::ZERO));
+        assert!(app.stalled_ids.is_empty());
+    }
+
+    #[test]
+    fn a_recycled_id_does_not_inherit_the_old_stall_clock() {
+        let mut app = App::new();
+        let t0 = Instant::now();
+        let old = make_torrent(3, "old", 1000, TorrentStatus::Downloading);
+        app.handle_state_push_at(vec![old], t0);
+        let new = make_torrent(3, "new", 1000, TorrentStatus::Downloading);
+        let t1 = t0 + Duration::from_secs(120);
+        app.handle_state_push_at(vec![new.clone()], t1);
+        // The identity check pruned the mark; the next push starts it fresh.
+        let t2 = t1 + Duration::from_millis(100);
+        app.handle_state_push_at(vec![new], t2);
+        assert!(app.stalled_for(3, t2) < Some(Duration::from_secs(1)));
+        assert!(app.stalled_ids.is_empty());
+    }
+
+    #[test]
+    fn diagnose_uses_the_app_clock_and_limits() {
+        let mut app = App::new();
+        app.speed_limit_download_kbps = 500;
+        let t0 = Instant::now();
+        let mut t = make_torrent(1, "iso", 1000, TorrentStatus::Downloading);
+        t.download_speed = 500 * 1024;
+        t.health.peers.live = 10;
+        app.handle_state_push_at(vec![t.clone()], t0);
+        let v = app.diagnose(1, t0).unwrap();
+        assert_eq!(v.severity, health::Severity::Capped);
+
+        t.download_speed = 0;
+        app.handle_state_push_at(vec![t], t0 + Duration::from_secs(1));
+        let v = app.diagnose(1, t0 + Duration::from_secs(60)).unwrap();
+        assert_eq!(v.severity, health::Severity::Stalled);
+        assert!(app.diagnose(99, t0).is_none());
     }
 
     /// Build an App the way the running app does — through `handle_state_push`,
@@ -1747,6 +1958,7 @@ mod tests {
             downloaded_bytes: 0,
             pieces: 0,
             errors: 0,
+            client_name: None,
         }
     }
 

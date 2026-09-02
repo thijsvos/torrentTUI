@@ -16,18 +16,23 @@
 //! or a persisted previous session — paused it.
 
 use crate::config::Config;
+use crate::engine::health_capture::HealthCapture;
 use crate::engine::watch;
-use crate::types::{FileInfo, PeerInfo, TorrentInfo, TorrentStatus};
+use crate::types::{
+    ConnectHealth, DhtHealth, FileInfo, NetworkHealth, PeerBreakdown, PeerInfo, TorrentHealth,
+    TorrentInfo, TorrentStatus, TrackerInfo, TransportStats,
+};
 use crate::ui::util::sanitize_display;
 use anyhow::{Context, Result};
 use librqbit::{
     api::TorrentIdOrHash,
     dht::Id20,
     http_api::{HttpApi, HttpApiOptions},
+    http_api_types::PeerStatsFilter,
     limits::LimitsConfig,
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions, DhtSessionConfig,
-    ListenerOptions, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
-    TorrentStatsState,
+    ListenerMode, ListenerOptions, ManagedTorrent, ManagedTorrentState, Session, SessionOptions,
+    SessionPersistenceConfig, TorrentStatsState,
 };
 use librqbit_dualstack_sockets::{BindOpts, TcpListener};
 use std::collections::{HashMap, HashSet};
@@ -35,6 +40,7 @@ use std::net::Ipv6Addr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// A reference to a torrent inside the session. Cloning is a refcount bump, so
@@ -123,12 +129,18 @@ pub(crate) const MAX_TORRENT_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// the cadence for completion notifications and bookkeeping pruning.
 const STATE_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Every this many state ticks the engine also pushes `EngineInfo::Network`.
+/// Session-wide counters move slowly and the doctor reads them at human
+/// speed, so once a second is plenty — and it keeps the DHT stats lock and
+/// the `stats_snapshot` allocation off the 100 ms path.
+const NETWORK_PUSH_EVERY_TICKS: u32 = 10;
+
 // ---------------------------------------------------------------------------
 
-/// One-shot facts the engine pushes to the UI outside the per-tick state
-/// snapshot — the HTTP API base URL and the privacy posture; the channel
-/// exists so future engine→UI metadata (listening port, DHT status, etc.)
-/// has a place to land without bloating the per-tick `Vec<TorrentInfo>`.
+/// Low-rate facts the engine pushes to the UI outside the per-tick state
+/// snapshot: the HTTP API base URL and the privacy posture (once each, at
+/// startup) and the session-wide network health (about once a second). The
+/// channel keeps them out of the per-tick `Vec<TorrentInfo>`.
 #[derive(Debug, Clone)]
 pub enum EngineInfo {
     /// The embedded HTTP API is listening on this base URL (e.g.
@@ -143,6 +155,10 @@ pub enum EngineInfo {
     /// they reflect the running session rather than a parsed config that
     /// might have failed to apply.
     Privacy(PrivacyStatus),
+    /// Session-wide network facts for the stall doctor. Sent every
+    /// `NETWORK_PUSH_EVERY_TICKS` ticks with `try_send`: a dropped one is
+    /// superseded a second later.
+    Network(NetworkHealth),
 }
 
 /// The active privacy posture, as applied at session creation.
@@ -228,6 +244,20 @@ pub struct TorrentEngine {
     privacy_status: Option<PrivacyStatus>,
     /// One-off note from `migrate_session_dir`, surfaced once at startup.
     migration_note: Option<String>,
+    /// Tracker/UPnP outcomes overheard from librqbit's tracing — the health
+    /// layer in `main` writes, snapshot building reads.
+    capture: Arc<HealthCapture>,
+    /// Whether the listener was asked to speak uTP. librqbit's default is
+    /// TCP only, and the doctor says so rather than showing zero uTP peers as
+    /// if that were a finding.
+    utp_enabled: bool,
+    /// Session start, for the uptime line.
+    started_at: Instant,
+    /// Adds in flight, keyed by a ticket from `begin_pending_add`. A magnet
+    /// stays here for as long as librqbit waits for metadata — the only
+    /// visible trace of a magnet nobody is seeding.
+    pending_adds: std::sync::Mutex<HashMap<u64, (String, Instant)>>,
+    next_pending_ticket: std::sync::atomic::AtomicU64,
 }
 
 /// The network shape derived from config — the privacy-critical decisions,
@@ -403,7 +433,7 @@ fn build_session_opts(
 }
 
 impl TorrentEngine {
-    pub async fn new(config: &Config) -> Result<Self> {
+    pub async fn new(config: &Config, capture: Arc<HealthCapture>) -> Result<Self> {
         let download_dir = PathBuf::from(&config.general.download_dir);
         std::fs::create_dir_all(&download_dir)?;
 
@@ -420,6 +450,16 @@ impl TorrentEngine {
             },
             session_dir,
         );
+        // Read off the options actually handed to librqbit, so a future
+        // `mode: TcpAndUtp` in `build_session_opts` flips this without a
+        // second edit.
+        let utp_enabled = opts
+            .listen
+            .as_ref()
+            .is_some_and(|l| matches!(l.mode, ListenerMode::UtpOnly | ListenerMode::TcpAndUtp));
+        if plan.upnp {
+            capture.mark_upnp_pending();
+        }
 
         let session = Session::new_with_opts(download_dir, opts)
             .await
@@ -447,7 +487,49 @@ impl TorrentEngine {
             migration_note,
             proxy_active,
             privacy_status,
+            capture,
+            utp_enabled,
+            started_at: Instant::now(),
+            pending_adds: std::sync::Mutex::new(HashMap::new()),
+            next_pending_ticket: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Register an add that is about to start. Returns the ticket to hand to
+    /// `end_pending_add` once `add_torrent` returns, however it returns.
+    pub fn begin_pending_add(&self, source: &str) -> u64 {
+        let ticket = self
+            .next_pending_ticket
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_adds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(ticket, (pending_add_label(source), Instant::now()));
+        ticket
+    }
+
+    pub fn end_pending_add(&self, ticket: u64) {
+        self.pending_adds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&ticket);
+    }
+
+    fn pending_adds(&self) -> Vec<crate::types::PendingAdd> {
+        let now = Instant::now();
+        let mut adds: Vec<_> = self
+            .pending_adds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|(label, since)| crate::types::PendingAdd {
+                label: label.clone(),
+                secs: now.saturating_duration_since(*since).as_secs(),
+            })
+            .collect();
+        // Oldest first: that is the one worth worrying about.
+        adds.sort_by(|a, b| b.secs.cmp(&a.secs).then_with(|| a.label.cmp(&b.label)));
+        adds
     }
 
     /// True when the session runs behind a SOCKS5 proxy (lockdown mode).
@@ -618,6 +700,8 @@ impl TorrentEngine {
     /// FileInfo + PeerInfo allocations per tick at 50 torrents × 100 files
     /// × 50 peers, of which the UI only ever displayed one torrent's worth.
     pub fn get_all_torrents(&self, detail_id: Option<usize>) -> Vec<TorrentInfo> {
+        let now = Instant::now();
+        let proxied = self.proxy_active;
         self.session.with_torrents(|iter| {
             iter.map(|(id, handle)| {
                 let stats = handle.stats();
@@ -631,6 +715,9 @@ impl TorrentEngine {
 
                 let uploaded_bytes = stats.uploaded_bytes;
                 let status = derive_status(&stats);
+                // Hex once per torrent per tick: the capture is keyed by it
+                // and the Detail view shows it.
+                let hash_hex = handle.info_hash().as_string();
 
                 let (download_speed, upload_speed, eta_seconds, peers_connected) =
                     if let Some(ref live) = stats.live {
@@ -698,21 +785,80 @@ impl TorrentEngine {
                     Vec::new()
                 };
 
-                let info_hash = if is_detail {
-                    handle.info_hash().as_string()
-                } else {
-                    String::new()
-                };
-                let trackers: Vec<String> = if is_detail {
-                    handle
-                        .shared()
-                        .trackers
+                // The tracker roll-up is filled for every torrent (the doctor
+                // reads it for the table's stall marker); the per-tracker
+                // list with error texts only for the Detail target.
+                let tracker_urls = &handle.shared().trackers;
+                let mut tracker_pairs: Vec<(String, &str)> = tracker_urls
+                    .iter()
+                    .map(|u| (u.to_string(), u.scheme()))
+                    .collect();
+                // Stable order in the Detail view: `trackers` is a HashSet.
+                tracker_pairs.sort();
+                let tracker_counts = self.capture.tracker_counts(
+                    &hash_hex,
+                    tracker_pairs.iter().map(|(u, s)| (u.as_str(), *s)),
+                    proxied,
+                    now,
+                );
+                let trackers: Vec<TrackerInfo> = if is_detail {
+                    tracker_pairs
                         .iter()
-                        .map(|u| u.to_string())
+                        .map(|(url, scheme)| TrackerInfo {
+                            status: self
+                                .capture
+                                .tracker_status(&hash_hex, url, scheme, proxied, now),
+                            url: sanitize_display(url),
+                        })
                         .collect()
                 } else {
                     Vec::new()
                 };
+
+                // The full error chain (`{:#}`) carries librqbit's inner
+                // context — "error creating file … No space left" — where
+                // `stats.error` is the one-line `Debug` of the outer error.
+                let error_chain = if is_detail && matches!(status, TorrentStatus::Error(_)) {
+                    handle.with_state(|s| match s {
+                        ManagedTorrentState::Error(e) => Some(sanitize_display(&format!("{e:#}"))),
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+
+                let health = match stats.live {
+                    Some(ref live) => {
+                        let ps = &live.snapshot.peer_stats;
+                        TorrentHealth {
+                            peers: PeerBreakdown {
+                                queued: ps.queued,
+                                connecting: ps.connecting,
+                                live: ps.live,
+                                seen: ps.seen,
+                                dead: ps.dead,
+                                not_needed: ps.not_needed,
+                                live_tcp: ps.live_tcp,
+                                live_utp: ps.live_utp,
+                                live_socks: ps.live_socks,
+                            },
+                            fetched_bytes: live.snapshot.fetched_bytes,
+                            checked_bytes: live.snapshot.downloaded_and_checked_bytes,
+                            avg_piece_ms: live
+                                .average_piece_download_time
+                                .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64),
+                            trackers: tracker_counts,
+                            error_chain,
+                        }
+                    }
+                    None => TorrentHealth {
+                        trackers: tracker_counts,
+                        error_chain,
+                        ..Default::default()
+                    },
+                };
+
+                let info_hash = if is_detail { hash_hex } else { String::new() };
                 let piece_length = if is_detail {
                     handle.with_metadata(|m| m.info.info().piece_length).ok()
                 } else {
@@ -721,11 +867,15 @@ impl TorrentEngine {
 
                 // Don't sort here: only the selected torrent's peers are ever
                 // displayed, and the detail-view renderer sorts lazily.
+                //
+                // `All`, not the default `Live`: the doctor's "52 known, 0
+                // connected, 49 dead" story is only visible in the Peers tab
+                // if the dead and connecting ones are listed too.
                 let peers: Vec<PeerInfo> = if is_detail {
                     handle
                         .live()
                         .map(|live| {
-                            let snapshot = live.per_peer_stats_snapshot(Default::default());
+                            let snapshot = live.per_peer_stats_snapshot(all_peers_filter());
                             snapshot
                                 .peers
                                 .into_iter()
@@ -735,6 +885,7 @@ impl TorrentEngine {
                                     downloaded_bytes: ps.counters.fetched_bytes,
                                     pieces: ps.counters.downloaded_and_checked_pieces,
                                     errors: ps.counters.errors,
+                                    client_name: ps.client_name.as_deref().map(sanitize_display),
                                 })
                                 .collect()
                         })
@@ -761,10 +912,69 @@ impl TorrentEngine {
                     trackers,
                     piece_length,
                     content_path,
+                    health,
                 }
             })
             .collect()
         })
+    }
+
+    /// Session-wide facts for the doctor. Allocates one `stats_snapshot` and
+    /// takes the DHT's routing-table lock, which is why `run_engine` calls it
+    /// once a second rather than per tick.
+    pub fn network_health(&self) -> NetworkHealth {
+        let snap = self.session.stats_snapshot();
+        // librqbit's per-family snapshot types are `pub` inside private
+        // modules — usable through a value, not nameable in a signature — so
+        // the v4+v6 fold is a macro rather than a function.
+        macro_rules! sum {
+            ($fam:expr) => {
+                TransportStats {
+                    attempts: $fam.v4.attempts.saturating_add($fam.v6.attempts),
+                    successes: $fam.v4.successes.saturating_add($fam.v6.successes),
+                    errors: $fam.v4.errors.saturating_add($fam.v6.errors),
+                }
+            };
+        }
+        NetworkHealth {
+            listen_port: self.session.listen_addr().map(|a| a.port()),
+            dht: self.session.get_dht().map(|dht| {
+                let s = dht.stats();
+                DhtHealth {
+                    routing_table_size: s.routing_table_size,
+                    routing_table_size_v6: s.routing_table_size_v6,
+                    outstanding_requests: s.outstanding_requests,
+                }
+            }),
+            blocked_incoming: snap.counters.blocked_incoming,
+            blocked_outgoing: snap.counters.blocked_outgoing,
+            connect: ConnectHealth {
+                tcp: sum!(snap.connections.tcp),
+                socks: sum!(snap.connections.socks),
+                utp: sum!(snap.connections.utp),
+            },
+            peers: PeerBreakdown {
+                queued: snap.peers.queued,
+                connecting: snap.peers.connecting,
+                live: snap.peers.live,
+                seen: snap.peers.seen,
+                dead: snap.peers.dead,
+                not_needed: snap.peers.not_needed,
+                live_tcp: snap.peers.live_tcp,
+                live_utp: snap.peers.live_utp,
+                live_socks: snap.peers.live_socks,
+            },
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            upnp: self.capture.upnp(),
+            utp_enabled: self.utp_enabled,
+            pending_adds: self.pending_adds(),
+        }
+    }
+
+    /// Info hashes of every torrent in the session, for pruning the capture.
+    pub fn all_hashes(&self) -> HashSet<String> {
+        self.session
+            .with_torrents(|iter| iter.map(|(_, h)| h.info_hash().as_string()).collect())
     }
 
     /// Look up a live torrent by id. Linear scan under the session lock, which
@@ -789,6 +999,16 @@ impl TorrentEngine {
     pub fn session(&self) -> &Arc<Session> {
         &self.session
     }
+}
+
+/// The per-peer snapshot filter that includes dead, queued and connecting
+/// peers, not just live ones. librqbit re-exports `PeerStatsFilter` but not
+/// the enum its `state` field holds, so the only way to name `All` from
+/// outside the crate is the serde representation the HTTP API accepts. Falls
+/// back to the default (live only) if that ever stops parsing — the Peers
+/// tab then shows less, not nothing.
+fn all_peers_filter() -> PeerStatsFilter {
+    serde_json::from_value(serde_json::json!({ "state": "all" })).unwrap_or_default()
 }
 
 /// Map librqbit's stats into our user-facing `TorrentStatus`. Pure helper so
@@ -1010,6 +1230,47 @@ pub(crate) fn strip_udp_trackers(magnet: &str) -> StrippedMagnet {
     }
 }
 
+/// Longest label a pending add gets in the UI.
+const MAX_PENDING_LABEL_CHARS: usize = 40;
+
+/// A short, safe name for an add in flight: the magnet's `dn=` if it has
+/// one, else the first 12 hex characters of its hash; for a file path, the
+/// file name. Never the raw source — a magnet is hundreds of characters of
+/// tracker URLs.
+pub(crate) fn pending_add_label(source: &str) -> String {
+    let label = if let Some((_, query)) = source.strip_prefix("magnet:?").map(|q| ("", q)) {
+        let mut name = None;
+        let mut hash = None;
+        for param in query.split('&') {
+            let (k, v) = param.split_once('=').unwrap_or((param, ""));
+            match form_decode(k).to_ascii_lowercase().as_str() {
+                "dn" if name.is_none() => name = Some(form_decode(v)),
+                "xt" if hash.is_none() => {
+                    hash = form_decode(v)
+                        .rsplit(':')
+                        .next()
+                        .map(|h| h.chars().take(12).collect::<String>())
+                }
+                _ => {}
+            }
+        }
+        name.filter(|n| !n.trim().is_empty())
+            .or(hash)
+            .unwrap_or_else(|| "magnet".to_string())
+    } else {
+        Path::new(source)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.to_string())
+    };
+    crate::ui::util::truncate(&sanitize_display(&label), MAX_PENDING_LABEL_CHARS)
+}
+
+/// librqbit's own error for a magnet with no discovery source; under a proxy
+/// it is the direct result of stripping the udp trackers, and the doctor's
+/// explanation is more useful than the bare message.
+const NO_DISCOVERY_ERROR: &str = "no known way to resolve peers";
+
 /// True for librqbit's "redundant transition" errors — `pause` on a paused
 /// torrent ("torrent is already paused") and `unpause` on a live one
 /// ("torrent is already live"). These are the *normal* outcome of bulk
@@ -1180,6 +1441,7 @@ fn spawn_watch_cleanup(
 /// resurrect a torrent the user just deleted.
 pub async fn run_engine(
     config: Config,
+    capture: Arc<HealthCapture>,
     cmd_rx: mpsc::Receiver<EngineCommand>,
     state_tx: mpsc::Sender<Vec<TorrentInfo>>,
     msg_tx: mpsc::Sender<String>,
@@ -1188,7 +1450,7 @@ pub async fn run_engine(
     // `Arc` so `AddTorrent` can be handled off the command loop — see the
     // AddTorrent arm. Every `engine.method()` below still resolves through
     // `Deref`, so nothing else changes.
-    let engine = std::sync::Arc::new(TorrentEngine::new(&config).await?);
+    let engine = std::sync::Arc::new(TorrentEngine::new(&config, capture).await?);
 
     // Report the applied privacy posture once, right after the session that
     // embodies it exists — the header badge renders from this, never from
@@ -1364,6 +1626,10 @@ pub async fn run_engine(
     // per-tick snapshot skips files/peers/trackers entirely.
     let mut detail_torrent_id: Option<usize> = None;
 
+    // Counts state ticks so the network push and the capture sweep run on
+    // every `NETWORK_PUSH_EVERY_TICKS`th one.
+    let mut ticks_since_network_push: u32 = 0;
+
     /// Build the latest per-torrent snapshot and broadcast it to the UI. Also
     /// fires completion notifications and prunes the finished-set of torrents
     /// that no longer exist. Runs at the end of every command except
@@ -1438,7 +1704,7 @@ pub async fn run_engine(
                         // reaches librqbit (see strip_udp_trackers). Warn when
                         // that leaves the magnet trackerless — with DHT also
                         // off in this mode there is no discovery path left.
-                        let source = if engine.proxy_active() && source.starts_with("magnet:?") {
+                        let (source, stripped_udp) = if engine.proxy_active() && source.starts_with("magnet:?") {
                             let stripped = strip_udp_trackers(&source);
                             if stripped.removed > 0 && stripped.trackers_left == 0 {
                                 let _ = msg_tx
@@ -1449,9 +1715,9 @@ pub async fn run_engine(
                                     )
                                     .await;
                             }
-                            stripped.magnet
+                            (stripped.magnet, stripped.removed)
                         } else {
-                            source
+                            (source, 0)
                         };
                         // Off the command loop, deliberately. For a magnet,
                         // `add_torrent` does not return until librqbit has
@@ -1465,9 +1731,20 @@ pub async fn run_engine(
                         let engine = engine.clone();
                         let msg_tx = msg_tx.clone();
                         let finished_tx = finished_tx.clone();
+                        let ticket = engine.begin_pending_add(&source);
                         tokio::spawn(async move {
-                            match engine.add_torrent(&source).await {
+                            let outcome = engine.add_torrent(&source).await;
+                            engine.end_pending_add(ticket);
+                            match outcome {
                                 Ok((id, handle, already_managed)) => {
+                                    // Recorded by hash once the add resolves —
+                                    // the only moment both the strip count and
+                                    // the hash are in one place. The doctor
+                                    // reads it to explain a torrent that has
+                                    // "no trackers" under the proxy lockdown.
+                                    engine
+                                        .capture
+                                        .note_stripped_udp(&handle.info_hash().as_string(), stripped_udp);
                                     let stats = handle.stats();
                                     let raw =
                                         handle.name().unwrap_or_else(|| "Unknown".to_string());
@@ -1486,8 +1763,25 @@ pub async fn run_engine(
                                     }
                                 }
                                 Err(e) => {
-                                    let _ =
-                                        msg_tx.send(format!("Failed to add torrent: {}", e)).await;
+                                    let text = format!("{e:#}");
+                                    // librqbit refuses a magnet it has no way
+                                    // to resolve. Under the proxy lockdown
+                                    // that is the udp-tracker strip plus DHT
+                                    // off — say so, and what to do about it.
+                                    let msg = if text.contains(NO_DISCOVERY_ERROR)
+                                        && engine.proxy_active()
+                                    {
+                                        format!(
+                                            "\u{26a0} Cannot resolve this magnet: proxy lockdown \
+                                             turns DHT off and stripped {} udp:// tracker(s). Add \
+                                             an http(s) tracker (&tr=https://…) or unset \
+                                             privacy.proxy_url (restart required)",
+                                            stripped_udp
+                                        )
+                                    } else {
+                                        format!("Failed to add torrent: {}", e)
+                                    };
+                                    let _ = msg_tx.send(msg).await;
                                     tracing::error!("Failed to add torrent: {}", e);
                                 }
                             }
@@ -1673,6 +1967,16 @@ pub async fn run_engine(
             }
             _ = state_tick.tick() => {
                 push_state(&engine, &state_tx, &msg_tx, &mut finished_set, enable_notifications, detail_torrent_id).await;
+                ticks_since_network_push += 1;
+                if ticks_since_network_push >= NETWORK_PUSH_EVERY_TICKS {
+                    ticks_since_network_push = 0;
+                    // try_send for the same reason push_state uses it: a
+                    // dropped snapshot is superseded by the next one.
+                    let _ = info_tx.try_send(EngineInfo::Network(engine.network_health()));
+                    // Forget tracker records for torrents that are gone, so a
+                    // long session with churn does not grow the capture.
+                    engine.capture.retain_hashes(&engine.all_hashes());
+                }
             }
         }
     }

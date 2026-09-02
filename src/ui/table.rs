@@ -50,6 +50,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let sort_rev = app.sort_reversed;
     let spinner_tick = app.spinner_tick;
     let marked_ids = &app.marked_ids;
+    let stalled_ids = &app.stalled_ids;
 
     // Build header with sort indicator
     let header_cells = HEADER_LABELS.iter().enumerate().map(|(i, h)| {
@@ -81,7 +82,11 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                 _ => render_progress_bar(percent, 15),
             };
 
-            let (status_text, status_style) = status_cell_style(&torrent.status);
+            let (status_text, status_style) = if stalled_ids.contains(&torrent.id) {
+                stalled_cell_style()
+            } else {
+                status_cell_style(&torrent.status)
+            };
 
             let progress_style = match torrent.status {
                 TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
@@ -164,9 +169,82 @@ pub fn status_cell_style(status: &TorrentStatus) -> (String, Style) {
     (status.to_string(), style)
 }
 
+/// The Status cell for a downloading torrent that has not received a byte in
+/// `health::STALL_AFTER`. The underlying `TorrentStatus` stays `Downloading`
+/// (sorting and filtering are unchanged); only the cell says otherwise. The
+/// glyph carries the state without colour, and red is shared with `Error`
+/// deliberately — both mean "not going to finish by itself".
+pub fn stalled_cell_style() -> (String, Style) {
+    (
+        "\u{26a0} Stalled".to_string(),
+        Style::default().fg(Color::Red),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{TorrentHealth, TorrentInfo};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn torrent(id: usize) -> TorrentInfo {
+        TorrentInfo {
+            id,
+            name: format!("t{id}"),
+            size_bytes: 1000,
+            downloaded_bytes: 10,
+            uploaded_bytes: 0,
+            download_speed: 0,
+            upload_speed: 0,
+            peers_connected: 0,
+            peers_total: 0,
+            status: TorrentStatus::Downloading,
+            eta_seconds: None,
+            files: Vec::new(),
+            peers: Vec::new(),
+            info_hash: String::new(),
+            trackers: Vec::new(),
+            piece_length: None,
+            content_path: None,
+            health: TorrentHealth::default(),
+        }
+    }
+
+    fn screen(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render_table(f, f.area(), app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn a_stalled_row_says_so_in_words() {
+        let mut app = App::new();
+        let t0 = std::time::Instant::now();
+        app.handle_state_push_at(vec![torrent(1), torrent(2)], t0);
+        let text = screen(&mut app, 120, 10);
+        assert!(text.contains("Downloading"), "{text}");
+        assert!(!text.contains("Stalled"), "{text}");
+
+        // Only torrent 1 crosses the threshold (2 got a byte).
+        let mut t2 = torrent(2);
+        t2.downloaded_bytes = 11;
+        app.handle_state_push_at(
+            vec![torrent(1), t2],
+            t0 + std::time::Duration::from_secs(31),
+        );
+        let text = screen(&mut app, 120, 10);
+        assert!(text.contains("\u{26a0} Stalled"), "{text}");
+        assert!(
+            text.contains("Downloading"),
+            "torrent 2 must still read Downloading: {text}"
+        );
+    }
 
     #[test]
     fn downloading_is_blue() {
