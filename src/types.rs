@@ -253,11 +253,17 @@ pub struct NetworkHealth {
 }
 
 /// One add in flight — see `NetworkHealth::pending_adds`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PendingAdd {
     /// The magnet's `dn=` name, a `.torrent` file name, or the hash prefix.
     pub label: String,
     pub secs: u64,
+    /// Roll-up of the magnet's own `tr=` trackers, keyed by its info hash —
+    /// librqbit announces to them while resolving, so the capture already
+    /// knows which ones answered.
+    pub trackers: TrackerCounts,
+    /// One failing tracker with its error, when there is one.
+    pub tracker_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

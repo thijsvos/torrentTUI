@@ -1078,8 +1078,18 @@ async fn run_app(
                         app.table_area = None;
                     }
                     _ => {
-                        app.table_area = Some(chunks[1]);
-                        ui::table::render_table(f, chunks[1], &mut app);
+                        // Magnets still waiting for metadata get a strip
+                        // under the table; the click map covers only the
+                        // table itself.
+                        let (table_area, pending_area) = ui::layout::split_pending(
+                            chunks[1],
+                            ui::table::pending_strip_height(&app),
+                        );
+                        app.table_area = Some(table_area);
+                        ui::table::render_table(f, table_area, &mut app);
+                        if let Some(strip) = pending_area {
+                            ui::table::render_pending_adds(f, strip, &app);
+                        }
                     }
                 }
                 if app.mode == AppMode::Palette {
@@ -1136,7 +1146,7 @@ async fn run_app(
                     }
                 }
                 if app.mode == AppMode::ConfirmQuit {
-                    ui::dialogs::render_quit_dialog(f, f.area());
+                    ui::dialogs::render_quit_dialog(f, f.area(), app.pending_add_count());
                 }
                 if app.mode == AppMode::ConfirmDetach {
                     ui::dialogs::render_detach_dialog(
@@ -1579,7 +1589,16 @@ async fn handle_input_mode(
             let value = config::expand_tilde(input_widget.value().trim());
             match validate_torrent_source(&value) {
                 Ok(()) => {
+                    // A magnet has nothing to show until a peer answers;
+                    // say so. A .torrent carries its metadata and lands in
+                    // the list at once, so it needs no notice.
+                    let magnet_label = value
+                        .starts_with("magnet:?")
+                        .then(|| engine::torrent::pending_add_label(&value));
                     send_cmd(cmd_tx, EngineCommand::AddTorrent(value), app).await;
+                    if let Some(label) = magnet_label {
+                        app.set_info(resolving_notice(&label));
+                    }
                     app.mode = AppMode::Normal;
                 }
                 Err(e) => {
@@ -1779,9 +1798,21 @@ async fn download_selected_result(app: &mut App, cmd_tx: &mpsc::Sender<EngineCom
     }
     send_cmd(cmd_tx, EngineCommand::AddTorrent(magnet), app).await;
     app.search.added.insert(info_hash);
-    // Stay in the results for multi-grab; the engine reports
-    // duplicates/failures on its own message channel.
-    app.set_info(format!("Added: {}", title));
+    // Stay in the results for multi-grab. Not "Added": a magnet is only a
+    // torrent once a peer has sent its metadata, and this used to claim
+    // success for a magnet that then never appeared. The engine says
+    // "Added" itself when the row exists; until then the list shows it
+    // under "Resolving".
+    app.set_info(resolving_notice(&title));
+}
+
+/// What the UI says when a magnet has been handed to the engine: what is
+/// happening and where to look, never that it is done.
+fn resolving_notice(title: &str) -> String {
+    format!(
+        "Resolving \"{}\" \u{2014} it joins the list once a peer sends its metadata",
+        title
+    )
 }
 
 async fn handle_detail_mode(

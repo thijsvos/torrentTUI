@@ -275,11 +275,16 @@ Verdicts you will see:
 Below the verdict the tab lists every number it looked at: the peer buckets
 (live / seen / dead / connecting / queued / not needed), DHT node count,
 listener port, UPnP result, each tracker's last announce or error, transfer
-quality, and the session-wide connection success rates. A magnet still waiting
-for its metadata has no row yet — librqbit only creates the torrent once a
-peer hands the metadata over — so it is listed under Session with how long it
-has been asking. In the main list a stalled torrent's status cell reads
-`⚠ Stalled` after 30 s without a byte.
+quality, and the session-wide connection success rates. In the main list a
+stalled torrent's status cell reads `⚠ Stalled` after 30 s without a byte.
+
+A magnet is a special case: librqbit only creates the torrent once a peer has
+handed over its metadata, so until then there is nothing to put in the list.
+Rather than pretend it was "added", TorrentTUI shows it in a **Resolving**
+strip under the list with how long it has been waiting and — after 30 s — why
+nobody has answered (DHT state, each of the magnet's trackers). After 15
+minutes without metadata the engine gives up and says so. Quitting with a
+magnet still resolving asks first, because a quit drops it.
 
 Where does tracker status come from? librqbit's API exposes none — so
 TorrentTUI listens to the tracker events librqbit logs, in memory only. The

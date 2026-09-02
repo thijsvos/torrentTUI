@@ -80,16 +80,24 @@ pub fn render_delete_dialog(
     f.render_widget(dialog, popup);
 }
 
-pub fn render_quit_dialog(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(40, 20, area);
+/// `resolving` is how many magnets are still waiting for metadata: quitting
+/// drops them, and they are not "downloads" — say what is actually at stake.
+pub fn render_quit_dialog(f: &mut Frame, area: Rect, resolving: usize) {
+    let mut popup = centered_rect(40, 20, area);
+    // 40% of an 80-column terminal is 32 columns, which clips the resolving
+    // sentence mid-word; same floor the detach dialog uses.
+    popup.width = popup.width.max(58.min(area.width));
+    popup.height = popup.height.max(7).min(area.height);
     f.render_widget(Clear, popup);
 
+    let what = match resolving {
+        0 => "  Active downloads in progress.".to_string(),
+        1 => "  A magnet is still resolving; quitting drops it.".to_string(),
+        n => format!("  {n} magnets are still resolving; quitting drops them."),
+    };
     let text = vec![
         Line::from(""),
-        Line::from(Span::styled(
-            "  Active downloads in progress.",
-            Style::default().fg(Color::White),
-        )),
+        Line::from(Span::styled(what, Style::default().fg(Color::White))),
         Line::from(Span::styled(
             "  Really quit?",
             Style::default().fg(Color::White),
@@ -258,5 +266,32 @@ mod tests {
         // than index past the area.
         let _ = screen(10, 4, true);
         let _ = screen(1, 1, false);
+    }
+
+    fn quit_screen(resolving: usize) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| render_quit_dialog(f, f.area(), resolving))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn quit_dialog_says_what_a_quit_would_drop() {
+        assert!(quit_screen(0).contains("Active downloads in progress."));
+        let one = quit_screen(1);
+        assert!(
+            one.contains("A magnet is still resolving; quitting drops it."),
+            "{one}"
+        );
+        let two = quit_screen(2);
+        assert!(two.contains("2 magnets are still resolving"), "{two}");
+        assert!(two.contains("[Y]") && two.contains("[N]"), "{two}");
     }
 }
