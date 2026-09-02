@@ -163,23 +163,21 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cross build --release --locked --target ${{ matrix.target }}
 
+      # The binary is the whole release asset. Tarballs and .sha256 files used
+      # to ship alongside it, but a checksum next to the file it checks proves
+      # nothing the Sigstore attestation below does not prove better — and
+      # four files per platform made the release page hard to read.
       - name: Prepare artifact (Unix)
         if: runner.os != 'Windows'
         run: |
           cp target/${{ matrix.target }}/release/torrenttui ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
-          shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
-          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
-          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Prepare artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cp target/${{ matrix.target }}/release/torrenttui.exe ${{ matrix.artifact }}.exe
-          (Get-FileHash "${{ matrix.artifact }}.exe" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.artifact }}.exe" | Out-File "${{ matrix.artifact }}.exe.sha256" -Encoding ASCII
-          Compress-Archive -Path "${{ matrix.artifact }}.exe" -DestinationPath "${{ matrix.artifact }}.zip"
-          (Get-FileHash "${{ matrix.artifact }}.zip" -Algorithm SHA256).Hash.ToLower() + "  ${{ matrix.artifact }}.zip" | Out-File "${{ matrix.artifact }}.zip.sha256" -Encoding ASCII
 
       # Attest the binary itself. Users can verify with:
       #   gh attestation verify <binary> --repo thijsvos/torrentTUI
@@ -195,20 +193,15 @@ jobs:
         with:
           subject-path: ${{ matrix.artifact }}.exe
 
+      # Workflow artifacts only exist to carry the binary to the publish job;
+      # the release assets are the copy that matters. One day of retention
+      # keeps the Actions tab from accumulating a second, unsigned set.
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}
-            ${{ matrix.artifact }}${{ matrix.ext }}
-            ${{ matrix.artifact }}.sha256
-            ${{ matrix.artifact }}${{ matrix.ext }}.sha256
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.tar.gz.sha256
-            ${{ matrix.artifact }}.zip
-            ${{ matrix.artifact }}.zip.sha256
-          if-no-files-found: ignore
+          path: ${{ matrix.artifact }}${{ matrix.ext }}
+          retention-days: 1
 
   create-macos-universal:
     name: Create macOS Universal Binary
@@ -225,17 +218,10 @@ jobs:
         with:
           name: torrenttui-macos-aarch64
 
-      - name: Extract and combine
+      - name: Combine
         run: |
-          tar xzf torrenttui-macos-x86_64.tar.gz
-          mv torrenttui-macos-x86_64 torrenttui-x86_64
-          tar xzf torrenttui-macos-aarch64.tar.gz
-          mv torrenttui-macos-aarch64 torrenttui-aarch64
-          lipo -create torrenttui-x86_64 torrenttui-aarch64 -output torrenttui-macos-universal
+          lipo -create torrenttui-macos-x86_64 torrenttui-macos-aarch64 -output torrenttui-macos-universal
           chmod +x torrenttui-macos-universal
-          shasum -a 256 torrenttui-macos-universal > torrenttui-macos-universal.sha256
-          tar czf torrenttui-macos-universal.tar.gz torrenttui-macos-universal
-          shasum -a 256 torrenttui-macos-universal.tar.gz > torrenttui-macos-universal.tar.gz.sha256
 
       - name: Attest universal binary provenance
         uses: actions/attest-build-provenance@v4
@@ -246,11 +232,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: torrenttui-macos-universal
-          path: |
-            torrenttui-macos-universal
-            torrenttui-macos-universal.sha256
-            torrenttui-macos-universal.tar.gz
-            torrenttui-macos-universal.tar.gz.sha256
+          path: torrenttui-macos-universal
+          retention-days: 1
 
   publish-release:
     name: Publish Release
@@ -283,11 +266,13 @@ jobs:
         with:
           path: artifacts
 
+      # Exactly six files: five targets plus the macOS universal binary.
       - name: Collect release files
         run: |
           mkdir release-files
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" -o -name "*.exe" -o -name "torrenttui-*" \) -exec cp {} release-files/ \;
+          find artifacts -type f -name "torrenttui-*" -exec cp {} release-files/ \;
           ls -la release-files/
+          test "$(ls release-files | wc -l)" -eq 6
 
       - name: Generate changelog
         id: changelog
@@ -327,7 +312,10 @@ jobs:
             echo "**Windows:**"
             echo "Download \`torrenttui-windows-x86_64.exe\` and add its directory to your PATH."
             echo ""
-            echo "Tarballs and checksums are also available for each platform."
+            echo "Every binary carries a Sigstore build-provenance attestation. Verify one with:"
+            echo "\`\`\`bash"
+            echo "gh attestation verify <binary> --repo thijsvos/torrentTUI"
+            echo "\`\`\`"
           } > changelog.md
 
       - name: Create GitHub Release
