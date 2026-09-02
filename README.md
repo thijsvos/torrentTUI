@@ -42,22 +42,29 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 
 ### From releases
 
-Download the latest binary for your platform from [Releases](https://github.com/thijsvos/torrentTUI/releases).
+Download the binary for your platform from [Releases](https://github.com/thijsvos/torrentTUI/releases) — each release is just the six binaries, nothing to unpack.
 
 **Linux:**
 ```bash
-tar xzf torrenttui-linux-x86_64.tar.gz
+chmod +x torrenttui-linux-x86_64
 sudo mv torrenttui-linux-x86_64 /usr/local/bin/torrenttui
 ```
 
 **macOS:**
 ```bash
-tar xzf torrenttui-macos-universal.tar.gz
+chmod +x torrenttui-macos-universal
 sudo mv torrenttui-macos-universal /usr/local/bin/torrenttui
 ```
 
 **Windows:**
-Extract `torrenttui-windows-x86_64.zip` and add the directory to your PATH.
+Download `torrenttui-windows-x86_64.exe` and add its directory to your PATH.
+
+Every binary carries a Sigstore build-provenance attestation, so you can check
+that what you downloaded was built by this repository's release workflow:
+
+```bash
+gh attestation verify torrenttui-linux-x86_64 --repo thijsvos/torrentTUI
+```
 
 ### From source
 
