@@ -16,7 +16,9 @@
 //! its DHT, listener and proxy once, and only the speed caps swap in place.
 
 use crate::engine::torrent::PrivacyStatus;
-use crate::types::{NetworkHealth, TorrentInfo, TorrentStatus, TrackerStatus, UpnpState};
+use crate::types::{
+    NetworkHealth, PendingAdd, TorrentInfo, TorrentStatus, TrackerStatus, UpnpState,
+};
 use crate::ui::layout::{format_size, format_speed};
 use std::time::Duration;
 
@@ -145,20 +147,55 @@ pub fn diagnose(ctx: &Context) -> Verdict {
 
 /// A magnet still being resolved: librqbit only creates the torrent once a
 /// peer has handed over the metadata, so until then the only thing to show is
-/// how long it has been asking. Session-level, because there is no torrent.
-pub fn pending_add_line(label: &str, secs: u64, network: Option<&NetworkHealth>) -> String {
-    let mut line = format!("Resolving \"{}\" for {}", label, fmt_secs(secs));
-    if secs >= STALL_AFTER.as_secs() {
-        line.push_str(" — no peer has sent the metadata yet");
-        if let Some(n) = network {
-            match &n.dht {
-                None => line.push_str(" (DHT is off)"),
-                Some(d) if d.routing_table_size + d.routing_table_size_v6 == 0 => {
-                    line.push_str(" (DHT has no nodes)")
-                }
-                Some(_) => {}
+/// how long it has been asking and what the discovery sources are doing.
+/// Session-level, because there is no torrent.
+pub fn pending_add_line(add: &PendingAdd, network: Option<&NetworkHealth>) -> String {
+    let mut line = format!("Resolving \"{}\" for {}", add.label, fmt_secs(add.secs));
+    if add.secs < STALL_AFTER.as_secs() {
+        return line;
+    }
+    line.push_str(" — no peer has sent the metadata yet");
+    let mut why = Vec::new();
+    if let Some(n) = network {
+        match &n.dht {
+            None => why.push("DHT is off".to_string()),
+            Some(d) if d.routing_table_size + d.routing_table_size_v6 == 0 => {
+                why.push("DHT has no nodes".to_string())
             }
+            Some(d) => why.push(format!(
+                "DHT: {} nodes",
+                d.routing_table_size + d.routing_table_size_v6
+            )),
         }
+    }
+    let tc = &add.trackers;
+    if tc.total == 0 {
+        why.push("no trackers".to_string());
+    } else {
+        let mut t = format!("trackers: {}", tc.total);
+        let mut parts = Vec::new();
+        if tc.ok > 0 {
+            parts.push(format!("{} ok", tc.ok));
+        }
+        if tc.failing > 0 {
+            parts.push(format!("{} failing", tc.failing));
+        }
+        if tc.pending > 0 {
+            parts.push(format!("{} not answered", tc.pending));
+        }
+        if tc.bypassing_proxy > 0 {
+            parts.push(format!("{} udp bypassing the proxy", tc.bypassing_proxy));
+        }
+        if !parts.is_empty() {
+            t.push_str(&format!(" ({})", parts.join(", ")));
+        }
+        why.push(t);
+    }
+    if let Some(note) = &add.tracker_note {
+        why.push(note.clone());
+    }
+    if !why.is_empty() {
+        line.push_str(&format!(" ({})", why.join("; ")));
     }
     line
 }
@@ -764,18 +801,39 @@ mod tests {
     #[test]
     fn a_resolving_magnet_is_reported_at_session_level() {
         let n = network();
+        let mut add = PendingAdd {
+            label: "debian.iso".to_string(),
+            secs: 5,
+            trackers: TrackerCounts {
+                total: 6,
+                failing: 2,
+                pending: 4,
+                ..Default::default()
+            },
+            tracker_note: Some("opentrackr: timed out".to_string()),
+        };
         assert_eq!(
-            pending_add_line("debian.iso", 5, Some(&n)),
+            pending_add_line(&add, Some(&n)),
             "Resolving \"debian.iso\" for 5 s"
         );
-        let line = pending_add_line("debian.iso", 45, Some(&n));
-        assert!(line.contains("no peer has sent the metadata yet"), "{line}");
-        assert!(!line.contains("DHT"), "{line}");
+        add.secs = 45;
+        let line = pending_add_line(&add, Some(&n));
+        assert_eq!(
+            line,
+            "Resolving \"debian.iso\" for 45 s — no peer has sent the metadata yet \
+             (DHT: 312 nodes; trackers: 6 (2 failing, 4 not answered); opentrackr: timed out)"
+        );
         let off = NetworkHealth {
             dht: None,
             ..network()
         };
-        assert!(pending_add_line("x", 45, Some(&off)).ends_with("(DHT is off)"));
+        add.trackers = TrackerCounts::default();
+        add.tracker_note = None;
+        assert!(
+            pending_add_line(&add, Some(&off)).ends_with("(DHT is off; no trackers)"),
+            "{}",
+            pending_add_line(&add, Some(&off))
+        );
     }
 
     #[test]

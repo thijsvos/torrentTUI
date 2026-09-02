@@ -757,10 +757,7 @@ fn render_health_tab(f: &mut Frame, area: Rect, app: &mut App) {
         )));
         for add in &n.pending_adds {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "    {}",
-                    health::pending_add_line(&add.label, add.secs, Some(n))
-                ),
+                format!("    {}", health::pending_add_line(add, Some(n))),
                 Style::default().fg(Color::Yellow),
             )));
         }
@@ -1046,6 +1043,7 @@ mod tests {
             pending_adds: vec![crate::types::PendingAdd {
                 label: "ubuntu.iso".to_string(),
                 secs: 45,
+                ..Default::default()
             }],
             ..Default::default()
         });

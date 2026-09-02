@@ -22,14 +22,71 @@ const HEADER_LABELS: [&str; 8] = [
     "Status",
 ];
 
+/// Height of the strip that lists magnets still waiting for metadata: two
+/// lines per add (the diagnosis wraps) inside a bordered block, `None` when
+/// there is nothing pending so the table keeps the whole area.
+pub fn pending_strip_height(app: &App) -> Option<u16> {
+    let n = app
+        .network_health
+        .as_ref()
+        .map(|n| n.pending_adds.len())
+        .unwrap_or(0);
+    (n > 0).then(|| (n as u16).saturating_mul(2).saturating_add(2).min(10))
+}
+
+/// The magnets librqbit has not turned into torrents yet, each with how long
+/// it has been waiting and — past the warm-up — why nobody has answered.
+///
+/// A magnet only becomes a torrent once a peer hands over its metadata, so
+/// until then it has no row in the table above. Before this strip existed
+/// the UI said "Added" and then showed nothing at all: a magnet nobody was
+/// seeding simply vanished, and the user was left to wonder.
+pub fn render_pending_adds(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let Some(network) = app.network_health.as_ref() else {
+        return;
+    };
+    let spinner = SPINNER_FRAMES[app.spinner_tick];
+    let lines: Vec<Line> = network
+        .pending_adds
+        .iter()
+        .map(|add| {
+            let text = crate::health::pending_add_line(add, Some(network));
+            let style = if add.secs >= crate::health::STALL_AFTER.as_secs() {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Magenta)
+            };
+            Line::from(vec![
+                Span::styled(format!(" {} ", spinner), style),
+                Span::styled(text, style),
+            ])
+        })
+        .collect();
+    // Wrapped, not clipped: the diagnosis is the point of the line.
+    let widget = ratatui::widgets::Paragraph::new(lines)
+        .wrap(ratatui::widgets::Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(format!(
+                    " Resolving ({}) - appears above once a peer answers ",
+                    network.pending_adds.len()
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+    f.render_widget(widget, area);
+}
+
 pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let sorted = app.sorted_torrents();
 
     if sorted.is_empty() {
-        let msg = if app.filter_text.is_empty() {
-            "No torrents. Press 'a' to add a magnet link or .torrent file."
-        } else {
+        let msg = if !app.filter_text.is_empty() {
             "No torrents match the current filter."
+        } else if pending_strip_height(app).is_some() {
+            "No torrents yet — the magnet below appears here once a peer sends its metadata."
+        } else {
+            "No torrents. Press 'a' to add a magnet link or .torrent file."
         };
         let empty_msg = ratatui::widgets::Paragraph::new(Line::from(vec![Span::styled(
             msg,
@@ -264,5 +321,111 @@ mod tests {
     fn error_text_includes_message() {
         let (text, _) = status_cell_style(&TorrentStatus::Error("disk full".to_string()));
         assert!(text.contains("disk full"));
+    }
+
+    // -- the pending strip ----------------------------------------------------
+
+    fn pending(label: &str, secs: u64) -> crate::types::PendingAdd {
+        crate::types::PendingAdd {
+            label: label.to_string(),
+            secs,
+            trackers: crate::types::TrackerCounts {
+                total: 6,
+                failing: 2,
+                pending: 4,
+                ..Default::default()
+            },
+            tracker_note: Some("opentrackr: timed out".to_string()),
+        }
+    }
+
+    fn draw_main(app: &mut App, w: u16, h: u16) -> String {
+        // Mirrors run_app: table on top, strip underneath when there is one.
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| {
+                let (table, strip) =
+                    crate::ui::layout::split_pending(f.area(), pending_strip_height(app));
+                render_table(f, table, app);
+                if let Some(strip) = strip {
+                    render_pending_adds(f, strip, app);
+                }
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn a_resolving_magnet_is_visible_even_with_an_empty_list() {
+        // The bug: "Added" was said, the list stayed empty, and nothing on
+        // screen ever mentioned the magnet again.
+        let mut app = App::new();
+        app.network_health = Some(crate::types::NetworkHealth {
+            pending_adds: vec![pending("Arch Linux 2026.09.01", 45)],
+            dht: Some(crate::types::DhtHealth::default()),
+            ..Default::default()
+        });
+        let text = draw_main(&mut app, 140, 20);
+        assert!(text.contains("Resolving (1)"), "{text}");
+        assert!(
+            text.contains("Resolving \"Arch Linux 2026.09.01\" for 45 s"),
+            "{text}"
+        );
+        assert!(text.contains("no peer has sent the metadata yet"), "{text}");
+        assert!(text.contains("DHT has no nodes"), "{text}");
+        assert!(text.contains("2 failing"), "{text}");
+        assert!(text.contains("opentrackr: timed out"), "{text}");
+        assert!(
+            text.contains("appears here once a peer sends its metadata"),
+            "{text}"
+        );
+        assert!(!text.contains("Press 'a' to add"), "{text}");
+    }
+
+    #[test]
+    fn the_strip_sits_under_real_rows_and_disappears_when_nothing_is_pending() {
+        let mut app = App::new();
+        app.handle_state_push(vec![torrent(1)]);
+        app.network_health = Some(crate::types::NetworkHealth {
+            pending_adds: vec![pending("x", 3)],
+            ..Default::default()
+        });
+        let text = draw_main(&mut app, 120, 20);
+        let row = text.find("t1").expect("real row drawn");
+        let strip = text.find("Resolving (1)").expect("strip drawn");
+        assert!(row < strip, "strip must sit below the table: {text}");
+        // Inside the warm-up: no diagnosis yet, just the wait.
+        assert!(text.contains("Resolving \"x\" for 3 s"), "{text}");
+        assert!(!text.contains("no peer has sent"), "{text}");
+
+        app.network_health = Some(crate::types::NetworkHealth::default());
+        let text = draw_main(&mut app, 120, 20);
+        assert!(!text.contains("Resolving"), "{text}");
+        assert_eq!(pending_strip_height(&app), None);
+    }
+
+    #[test]
+    fn the_strip_never_squeezes_the_table_out_on_a_short_terminal() {
+        let mut app = App::new();
+        app.handle_state_push(vec![torrent(1)]);
+        app.network_health = Some(crate::types::NetworkHealth {
+            pending_adds: (0..20).map(|i| pending(&format!("m{i}"), 1)).collect(),
+            ..Default::default()
+        });
+        assert_eq!(pending_strip_height(&app), Some(10), "capped");
+        for h in [1u16, 4, 6, 8, 12] {
+            let text = draw_main(&mut app, 100, h);
+            // Whatever the height, drawing must not panic; with room for
+            // both, the table header still shows.
+            if h >= 12 {
+                assert!(text.contains("Name"), "{text}");
+            }
+        }
     }
 }

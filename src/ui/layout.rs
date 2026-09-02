@@ -37,6 +37,25 @@ pub fn get_layout(area: Rect) -> Vec<Rect> {
         .to_vec()
 }
 
+/// Carve the pending-adds strip off the bottom of the main area. `None`
+/// height means no strip: the table keeps everything. The table always keeps
+/// at least its border and header rows so a tall strip on a short terminal
+/// cannot squeeze it to nothing.
+pub fn split_pending(area: Rect, strip: Option<u16>) -> (Rect, Option<Rect>) {
+    let Some(h) = strip else {
+        return (area, None);
+    };
+    let h = h.min(area.height.saturating_sub(4));
+    if h < 3 {
+        return (area, None);
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(h)])
+        .split(area);
+    (chunks[0], Some(chunks[1]))
+}
+
 pub fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled("TorrentTUI", Style::default().fg(Color::Cyan)),
@@ -197,6 +216,13 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("  \u{2502}  "),
         Span::raw(format!("{} active / {} total", active, total)),
     ];
+    let resolving = app.pending_add_count();
+    if resolving > 0 {
+        left_spans.push(Span::styled(
+            format!(" \u{b7} {} resolving", resolving),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
 
     if let Some(space) = app.free_disk_space {
         let space_str = format_size(space);
@@ -521,5 +547,41 @@ mod tests {
             !info.contains('\u{2716}'),
             "notice marked as an error: {info}"
         );
+    }
+
+    #[test]
+    fn status_bar_counts_magnets_still_resolving() {
+        let mut app = App::new();
+        assert!(!status_text(&app).contains("resolving"));
+        app.network_health = Some(crate::types::NetworkHealth {
+            pending_adds: vec![crate::types::PendingAdd {
+                label: "arch".to_string(),
+                secs: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let text = status_text(&app);
+        assert!(
+            text.contains("0 active / 0 total \u{b7} 1 resolving"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn split_pending_keeps_the_table_and_caps_the_strip() {
+        let area = Rect::new(0, 0, 100, 30);
+        assert_eq!(split_pending(area, None), (area, None));
+        let (table, strip) = split_pending(area, Some(3));
+        assert_eq!(table.height, 27);
+        assert_eq!(strip.unwrap().height, 3);
+        assert_eq!(strip.unwrap().y, 27);
+        // Too short for both: the table keeps everything.
+        let short = Rect::new(0, 0, 100, 6);
+        assert_eq!(split_pending(short, Some(3)), (short, None));
+        // A tall strip is clipped so the table keeps at least four rows.
+        let (table, strip) = split_pending(Rect::new(0, 0, 100, 10), Some(8));
+        assert_eq!(table.height, 4);
+        assert_eq!(strip.unwrap().height, 6);
     }
 }

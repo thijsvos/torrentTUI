@@ -380,14 +380,24 @@ impl App {
     /// abruptly, even though nothing is being downloaded.
     pub fn confirm_on_quit_required(&self) -> bool {
         self.confirm_on_quit
-            && self.torrents.iter().any(|t| {
-                matches!(
-                    t.status,
-                    TorrentStatus::Downloading
-                        | TorrentStatus::FetchingMetadata
-                        | TorrentStatus::Seeding
-                )
-            })
+            && (self.pending_add_count() > 0
+                || self.torrents.iter().any(|t| {
+                    matches!(
+                        t.status,
+                        TorrentStatus::Downloading
+                            | TorrentStatus::FetchingMetadata
+                            | TorrentStatus::Seeding
+                    )
+                }))
+    }
+
+    /// Magnets the engine is still resolving — they have no row yet, and a
+    /// quit drops them, which is why they count as work in progress.
+    pub fn pending_add_count(&self) -> usize {
+        self.network_health
+            .as_ref()
+            .map(|n| n.pending_adds.len())
+            .unwrap_or(0)
     }
 
     /// Mark the cached sort order as dirty. Call from anywhere that mutates
@@ -953,10 +963,14 @@ impl App {
             .count()
     }
 
+    /// Whether the spinner should animate: a torrent being checked, or a
+    /// magnet still waiting for metadata in the pending strip.
     pub fn has_fetching_metadata(&self) -> bool {
-        self.torrents
-            .iter()
-            .any(|t| matches!(t.status, TorrentStatus::FetchingMetadata))
+        self.pending_add_count() > 0
+            || self
+                .torrents
+                .iter()
+                .any(|t| matches!(t.status, TorrentStatus::FetchingMetadata))
     }
 
     /// Show an error in the status bar for 3 seconds. Replaces any error
@@ -2026,6 +2040,27 @@ mod tests {
             app_with_torrents(vec![make_torrent(0, "A", 100, TorrentStatus::Downloading)]);
         app.confirm_on_quit = false;
         assert!(!app.confirm_on_quit_required());
+    }
+
+    #[test]
+    fn a_magnet_still_resolving_counts_as_work_in_progress() {
+        // An empty list with a pending magnet: quitting would drop it, so
+        // the confirmation must fire — and the spinner must be animating.
+        let mut app = App::new();
+        app.confirm_on_quit = true;
+        assert!(!app.confirm_on_quit_required());
+        assert!(!app.has_fetching_metadata());
+        app.network_health = Some(crate::types::NetworkHealth {
+            pending_adds: vec![crate::types::PendingAdd {
+                label: "arch".to_string(),
+                secs: 10,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(app.pending_add_count(), 1);
+        assert!(app.confirm_on_quit_required());
+        assert!(app.has_fetching_metadata());
     }
 
     #[test]

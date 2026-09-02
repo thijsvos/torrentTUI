@@ -256,8 +256,22 @@ pub struct TorrentEngine {
     /// Adds in flight, keyed by a ticket from `begin_pending_add`. A magnet
     /// stays here for as long as librqbit waits for metadata — the only
     /// visible trace of a magnet nobody is seeding.
-    pending_adds: std::sync::Mutex<HashMap<u64, (String, Instant)>>,
+    pending_adds: std::sync::Mutex<HashMap<u64, PendingEntry>>,
     next_pending_ticket: std::sync::atomic::AtomicU64,
+}
+
+/// What the engine knows about an add before librqbit has created the
+/// torrent: enough to show it and to ask the capture how its trackers are
+/// doing. Parsed once from the source at `begin_pending_add`.
+#[derive(Debug, Clone)]
+struct PendingEntry {
+    label: String,
+    since: Instant,
+    /// 40-char lowercase hex, when the source is a magnet with a valid
+    /// `xt=urn:btih:` — the key librqbit's tracker spans carry.
+    info_hash: Option<String>,
+    /// `(url, scheme)` of every `tr=` parameter, already form-decoded.
+    trackers: Vec<(String, String)>,
 }
 
 /// The network shape derived from config — the privacy-critical decisions,
@@ -501,10 +515,19 @@ impl TorrentEngine {
         let ticket = self
             .next_pending_ticket
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let parsed = parse_magnet(source);
         self.pending_adds
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(ticket, (pending_add_label(source), Instant::now()));
+            .insert(
+                ticket,
+                PendingEntry {
+                    label: pending_add_label(source),
+                    since: Instant::now(),
+                    info_hash: parsed.as_ref().and_then(|m| m.info_hash.clone()),
+                    trackers: parsed.map(|m| m.trackers).unwrap_or_default(),
+                },
+            );
         ticket
     }
 
@@ -515,17 +538,63 @@ impl TorrentEngine {
             .remove(&ticket);
     }
 
+    /// The pending add's current picture, for a give-up message.
+    fn pending_add(&self, ticket: u64) -> Option<crate::types::PendingAdd> {
+        let entry = self
+            .pending_adds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&ticket)
+            .cloned()?;
+        Some(self.describe_pending(&entry, Instant::now()))
+    }
+
+    fn describe_pending(&self, e: &PendingEntry, now: Instant) -> crate::types::PendingAdd {
+        let (trackers, tracker_note) = match &e.info_hash {
+            Some(hash) => {
+                let counts = self.capture.tracker_counts(
+                    hash,
+                    e.trackers.iter().map(|(u, s)| (u.as_str(), s.as_str())),
+                    self.proxy_active,
+                    now,
+                );
+                let note =
+                    e.trackers.iter().find_map(|(url, scheme)| {
+                        match self
+                            .capture
+                            .tracker_status(hash, url, scheme, self.proxy_active, now)
+                        {
+                            crate::types::TrackerStatus::Failing { last_error, .. } => Some(
+                                format!("{}: {}", crate::health::tracker_host(url), last_error),
+                            ),
+                            _ => None,
+                        }
+                    });
+                (counts, note)
+            }
+            None => (Default::default(), None),
+        };
+        crate::types::PendingAdd {
+            label: e.label.clone(),
+            secs: now.saturating_duration_since(e.since).as_secs(),
+            trackers,
+            tracker_note,
+        }
+    }
+
     fn pending_adds(&self) -> Vec<crate::types::PendingAdd> {
         let now = Instant::now();
-        let mut adds: Vec<_> = self
+        let entries: Vec<PendingEntry> = self
             .pending_adds
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-            .map(|(label, since)| crate::types::PendingAdd {
-                label: label.clone(),
-                secs: now.saturating_duration_since(*since).as_secs(),
-            })
+            .cloned()
+            .collect();
+        // Describe outside the lock: the capture has its own.
+        let mut adds: Vec<_> = entries
+            .iter()
+            .map(|e| self.describe_pending(e, now))
             .collect();
         // Oldest first: that is the one worth worrying about.
         adds.sort_by(|a, b| b.secs.cmp(&a.secs).then_with(|| a.label.cmp(&b.label)));
@@ -971,10 +1040,24 @@ impl TorrentEngine {
         }
     }
 
-    /// Info hashes of every torrent in the session, for pruning the capture.
+    /// Info hashes the capture must keep records for: every torrent in the
+    /// session *and* every magnet still resolving. librqbit announces to a
+    /// magnet's trackers while it waits for metadata, and those are exactly
+    /// the records the pending strip reads — sweeping them because the
+    /// torrent "does not exist yet" made every pending tracker read as
+    /// "not answered" forever.
     pub fn all_hashes(&self) -> HashSet<String> {
-        self.session
-            .with_torrents(|iter| iter.map(|(_, h)| h.info_hash().as_string()).collect())
+        let mut hashes: HashSet<String> = self
+            .session
+            .with_torrents(|iter| iter.map(|(_, h)| h.info_hash().as_string()).collect());
+        hashes.extend(
+            self.pending_adds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .filter_map(|e| e.info_hash.clone()),
+        );
+        hashes
     }
 
     /// Look up a live torrent by id. Linear scan under the session lock, which
@@ -1233,35 +1316,70 @@ pub(crate) fn strip_udp_trackers(magnet: &str) -> StrippedMagnet {
 /// Longest label a pending add gets in the UI.
 const MAX_PENDING_LABEL_CHARS: usize = 40;
 
+/// How long a magnet may sit in librqbit's `add_torrent` waiting for a peer
+/// to hand over its metadata before the engine gives up. librqbit itself
+/// never does — its tracker and DHT loops retry forever — so without this a
+/// magnet nobody is seeding is a task that lives until the window closes,
+/// and the only report the user ever got was silence. Long, because a
+/// sparse swarm can legitimately take minutes; the pending strip shows the
+/// wait and the reason the whole time.
+const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The parts of a magnet link the engine reads for its own bookkeeping.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ParsedMagnet {
+    /// `dn=`, form-decoded, if present and non-blank.
+    pub name: Option<String>,
+    /// 40-char lowercase hex, when `xt=urn:btih:` carries a hash librqbit
+    /// would accept (hex or base32).
+    pub info_hash: Option<String>,
+    /// Every `tr=` value with its URL scheme, in magnet order.
+    pub trackers: Vec<(String, String)>,
+}
+
+/// Parse a magnet the same way librqbit reads it (form-decoded query
+/// pairs). `None` for anything that is not a magnet.
+pub(crate) fn parse_magnet(source: &str) -> Option<ParsedMagnet> {
+    let query = source.strip_prefix("magnet:?")?;
+    let mut out = ParsedMagnet::default();
+    for param in query.split('&') {
+        let (k, v) = param.split_once('=').unwrap_or((param, ""));
+        let value = form_decode(v);
+        match form_decode(k).to_ascii_lowercase().as_str() {
+            "dn" if out.name.is_none() && !value.trim().is_empty() => out.name = Some(value),
+            "xt" if out.info_hash.is_none() => {
+                if let Some(raw) = value.strip_prefix("urn:btih:") {
+                    // `Id20::from_str` takes hex and base32, exactly what
+                    // librqbit accepts; anything else is not a hash we can
+                    // key the capture on.
+                    out.info_hash = raw.parse::<Id20>().ok().map(|h| h.as_string());
+                }
+            }
+            "tr" => {
+                if let Ok(url) = url::Url::parse(&value) {
+                    out.trackers.push((value.clone(), url.scheme().to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
 /// A short, safe name for an add in flight: the magnet's `dn=` if it has
 /// one, else the first 12 hex characters of its hash; for a file path, the
 /// file name. Never the raw source — a magnet is hundreds of characters of
 /// tracker URLs.
 pub(crate) fn pending_add_label(source: &str) -> String {
-    let label = if let Some((_, query)) = source.strip_prefix("magnet:?").map(|q| ("", q)) {
-        let mut name = None;
-        let mut hash = None;
-        for param in query.split('&') {
-            let (k, v) = param.split_once('=').unwrap_or((param, ""));
-            match form_decode(k).to_ascii_lowercase().as_str() {
-                "dn" if name.is_none() => name = Some(form_decode(v)),
-                "xt" if hash.is_none() => {
-                    hash = form_decode(v)
-                        .rsplit(':')
-                        .next()
-                        .map(|h| h.chars().take(12).collect::<String>())
-                }
-                _ => {}
-            }
-        }
-        name.filter(|n| !n.trim().is_empty())
-            .or(hash)
-            .unwrap_or_else(|| "magnet".to_string())
-    } else {
-        Path::new(source)
+    let label = match parse_magnet(source) {
+        Some(m) => m
+            .name
+            .or_else(|| m.info_hash.map(|h| h.chars().take(12).collect()))
+            .unwrap_or_else(|| "magnet".to_string()),
+        None => Path::new(source)
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| source.to_string())
+            .unwrap_or_else(|| source.to_string()),
     };
     crate::ui::util::truncate(&sanitize_display(&label), MAX_PENDING_LABEL_CHARS)
 }
@@ -1270,6 +1388,40 @@ pub(crate) fn pending_add_label(source: &str) -> String {
 /// it is the direct result of stripping the udp trackers, and the doctor's
 /// explanation is more useful than the bare message.
 const NO_DISCOVERY_ERROR: &str = "no known way to resolve peers";
+
+/// The tail of the give-up message: what the discovery sources were doing
+/// while nobody answered. Empty when there is nothing specific to say.
+pub(crate) fn give_up_reason(p: &crate::types::PendingAdd, dht_enabled: bool) -> String {
+    let mut parts = Vec::new();
+    if !dht_enabled {
+        parts.push("DHT is off".to_string());
+    }
+    let tc = &p.trackers;
+    if tc.total == 0 {
+        parts.push("the magnet has no trackers".to_string());
+    } else if tc.failing > 0 {
+        parts.push(format!(
+            "{} of {} trackers failing{}",
+            tc.failing,
+            tc.total,
+            p.tracker_note
+                .as_deref()
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_default()
+        ));
+    } else if tc.ok > 0 {
+        parts.push(format!(
+            "{} tracker{} answered but listed no reachable peer",
+            tc.ok,
+            if tc.ok == 1 { "" } else { "s" }
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", parts.join("; "))
+    }
+}
 
 /// True for librqbit's "redundant transition" errors — `pause` on a paused
 /// torrent ("torrent is already paused") and `unpause` on a live one
@@ -1732,9 +1884,42 @@ pub async fn run_engine(
                         let msg_tx = msg_tx.clone();
                         let finished_tx = finished_tx.clone();
                         let ticket = engine.begin_pending_add(&source);
+                        let dht_enabled = engine.session().get_dht().is_some();
                         tokio::spawn(async move {
-                            let outcome = engine.add_torrent(&source).await;
+                            // Bounded: dropping the future cancels librqbit's
+                            // resolution (a plain select! loop, no detached
+                            // tasks), so a magnet nobody seeds ends as a
+                            // message rather than a task that dies with the
+                            // window. The picture is read *before* the entry
+                            // is removed so the message can say why.
+                            let outcome =
+                                tokio::time::timeout(METADATA_TIMEOUT, engine.add_torrent(&source))
+                                    .await;
+                            let gave_up = match outcome {
+                                Ok(_) => None,
+                                Err(_) => engine.pending_add(ticket),
+                            };
                             engine.end_pending_add(ticket);
+                            let outcome = match outcome {
+                                Ok(outcome) => outcome,
+                                Err(_) => {
+                                    let why = gave_up
+                                        .as_ref()
+                                        .map(|p| give_up_reason(p, dht_enabled))
+                                        .unwrap_or_default();
+                                    let label = gave_up.map(|p| p.label).unwrap_or_default();
+                                    let msg = format!(
+                                        "\u{26a0} Gave up on \"{}\" after {} min: no peer sent its \
+                                         metadata{}",
+                                        label,
+                                        METADATA_TIMEOUT.as_secs() / 60,
+                                        why
+                                    );
+                                    tracing::warn!("{msg}");
+                                    let _ = msg_tx.send(msg).await;
+                                    return;
+                                }
+                            };
                             match outcome {
                                 Ok((id, handle, already_managed)) => {
                                     // Recorded by hash once the add resolves —
@@ -1760,6 +1945,11 @@ pub async fn run_engine(
                                         }
                                     } else {
                                         tracing::info!("Added torrent {}", id);
+                                        // The only "added" the UI ever says:
+                                        // the torrent exists now, with a row.
+                                        let _ = msg_tx
+                                            .send(format!("\u{2713} Added \"{}\"", name))
+                                            .await;
                                     }
                                 }
                                 Err(e) => {
@@ -2359,6 +2549,105 @@ mod tests {
         // Smoke test the derive added for tracing/panic dumps.
         let cmd = EngineCommand::Pause(42);
         assert!(format!("{cmd:?}").contains("Pause"));
+    }
+
+    // -- pending adds ---------------------------------------------------------
+
+    const HEX: &str = "8337c196d4536e9af5d2c7e599f0f1b7d71eee54";
+
+    #[test]
+    fn parse_magnet_reads_name_hash_and_trackers() {
+        let m = parse_magnet(&format!(
+            "magnet:?xt=urn:btih:{HEX}&dn=Arch+Linux%202026&tr=udp%3A%2F%2Ft.example%3A1337&tr=https://h.example/announce&x.pe=1.2.3.4:1"
+        ))
+        .unwrap();
+        assert_eq!(m.name.as_deref(), Some("Arch Linux 2026"));
+        assert_eq!(m.info_hash.as_deref(), Some(HEX));
+        assert_eq!(
+            m.trackers,
+            vec![
+                ("udp://t.example:1337".to_string(), "udp".to_string()),
+                (
+                    "https://h.example/announce".to_string(),
+                    "https".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_magnet_normalizes_base32_and_uppercase_hashes_to_hex() {
+        // librqbit accepts both; the capture keys on lowercase hex.
+        let upper = HEX.to_ascii_uppercase();
+        let m = parse_magnet(&format!("magnet:?xt=urn:btih:{upper}")).unwrap();
+        assert_eq!(m.info_hash.as_deref(), Some(HEX));
+        let base32 = "QM34DFWUKNXJV5OSY7SZT4HRW7LR53SU"; // same 20 bytes
+        let m = parse_magnet(&format!("magnet:?xt=urn:btih:{base32}")).unwrap();
+        assert_eq!(m.info_hash.as_deref(), Some(HEX));
+        // Garbage is not a hash, and a file path is not a magnet.
+        assert_eq!(
+            parse_magnet("magnet:?xt=urn:btih:nope").unwrap().info_hash,
+            None
+        );
+        assert!(parse_magnet("/tmp/x.torrent").is_none());
+    }
+
+    #[test]
+    fn pending_add_label_prefers_the_name_then_the_hash_then_the_file_name() {
+        assert_eq!(
+            pending_add_label(&format!("magnet:?xt=urn:btih:{HEX}&dn=Arch%20Linux")),
+            "Arch Linux"
+        );
+        assert_eq!(
+            pending_add_label(&format!("magnet:?xt=urn:btih:{HEX}&dn=%20")),
+            "8337c196d453"
+        );
+        assert_eq!(pending_add_label("magnet:?dn="), "magnet");
+        assert_eq!(
+            pending_add_label("/tmp/dir/debian.torrent"),
+            "debian.torrent"
+        );
+        // Bounded and sanitized: a 300-char dn with a control char.
+        let long = format!("magnet:?dn={}%07", "x".repeat(300));
+        let label = pending_add_label(&long);
+        assert!(label.chars().count() <= MAX_PENDING_LABEL_CHARS);
+        assert!(!label.contains('\u{7}'));
+    }
+
+    #[test]
+    fn give_up_reason_names_what_was_tried() {
+        use crate::types::{PendingAdd, TrackerCounts};
+        let mut p = PendingAdd {
+            label: "x".into(),
+            secs: 900,
+            trackers: TrackerCounts {
+                total: 6,
+                failing: 2,
+                pending: 4,
+                ..Default::default()
+            },
+            tracker_note: Some("opentrackr: timed out".into()),
+        };
+        assert_eq!(
+            give_up_reason(&p, true),
+            " — 2 of 6 trackers failing (opentrackr: timed out)"
+        );
+        assert_eq!(
+            give_up_reason(&p, false),
+            " — DHT is off; 2 of 6 trackers failing (opentrackr: timed out)"
+        );
+        p.trackers = TrackerCounts::default();
+        assert_eq!(give_up_reason(&p, true), " — the magnet has no trackers");
+        p.trackers = TrackerCounts {
+            total: 1,
+            ok: 1,
+            ..Default::default()
+        };
+        p.tracker_note = None;
+        assert_eq!(
+            give_up_reason(&p, true),
+            " — 1 tracker answered but listed no reachable peer"
+        );
     }
 
     #[test]
