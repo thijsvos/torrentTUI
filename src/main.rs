@@ -165,13 +165,11 @@ async fn main() -> Result<()> {
     // codes after a crash until they `reset(1)`.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        // Same order as `restore_terminal`, minus the drain: mouse capture
+        // off before the tty goes cooked.
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            DisableBracketedPaste
-        );
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
         original_hook(panic_info);
     }));
 
@@ -357,14 +355,7 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    restore_terminal(&mut terminal)?;
 
     // Hand the session over *before* releasing the lock. The child blocks on
     // it from its first millisecond, so there is never an unlocked window for a
@@ -426,6 +417,48 @@ async fn main() -> Result<()> {
 enum AppExit {
     Quit,
     Detach,
+}
+
+/// Give the terminal back to the shell, in an order that leaves nothing
+/// behind on the tty.
+///
+/// Mouse capture turns on *all-motion* reporting, and the quit path waits up
+/// to 5 s for the engine to flush with nothing reading input. A pointer
+/// drifting across the window in that gap queues a stream of
+/// `ESC [ < 35;x;y M` reports on the tty, and the old teardown — raw mode
+/// off, *then* mouse capture off — handed them straight to the shell, whose
+/// line editor swallowed the `ESC [ <` and echoed the rest: `35;31;23M…` after
+/// every quit. So: mouse capture off first, while still raw; drain whatever
+/// is already queued; only then hand the cooked tty back.
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
+    drain_pending_input();
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+/// Read and discard input already queued on the tty. The idle window covers
+/// the terminal's latency in honouring `DisableMouseCapture` (reports still in
+/// flight over an ssh hop); the cap bounds a terminal that never goes quiet
+/// so exit is delayed by at most that long.
+fn drain_pending_input() {
+    const IDLE: std::time::Duration = std::time::Duration::from_millis(150);
+    const CAP: std::time::Duration = std::time::Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + CAP;
+    while std::time::Instant::now() < deadline {
+        match crossterm::event::poll(IDLE) {
+            Ok(true) => {
+                let _ = crossterm::event::read();
+            }
+            _ => break,
+        }
+    }
 }
 
 /// The engine with no terminal: the same `run_engine` the TUI drives, with the
