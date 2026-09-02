@@ -25,6 +25,7 @@ mod actions;
 mod app;
 mod config;
 mod engine;
+mod health;
 mod instance;
 mod opener;
 mod player;
@@ -46,11 +47,13 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use engine::health_capture::{HealthCapture, HealthLayer};
 use engine::torrent::{EngineCommand, EngineInfo};
 use futures::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{prelude::*, EnvFilter};
 use types::{AppMode, DetailTab};
 use ui::input::{validate_magnet, validate_torrent_source, InputWidget};
 
@@ -260,10 +263,19 @@ async fn main() -> Result<()> {
     }
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("torrenttui=warn"));
-    tracing_subscriber::fmt()
-        .with_writer(log_file)
-        .with_ansi(false)
-        .with_env_filter(filter)
+    // Two layers with their own filters. The file log keeps exactly the
+    // filter above; the health layer listens to librqbit's tracker and UPnP
+    // events in memory only — it is how the Health tab knows a tracker is
+    // failing, since librqbit exposes none of that through its API.
+    let health = HealthCapture::new();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(log_file)
+                .with_ansi(false)
+                .with_filter(filter),
+        )
+        .with(HealthLayer::new(health.clone()).with_filter(HealthLayer::targets()))
         .init();
 
     // Load config. A parse error returns `(default, Some(warning))` so we can
@@ -323,7 +335,7 @@ async fn main() -> Result<()> {
     }
 
     if cli.headless {
-        let result = run_headless(config, &cli, &session_dir, record).await;
+        let result = run_headless(config, health, &cli, &session_dir, record).await;
         // Hold the lock until the process exits — see `SessionGuard::leak`.
         guard.leak();
         if let Err(ref e) = result {
@@ -348,6 +360,7 @@ async fn main() -> Result<()> {
         &mut terminal,
         cli,
         config,
+        health,
         config_warning,
         takeover_of,
         &session_dir,
@@ -471,6 +484,7 @@ fn drain_pending_input() {
 /// would explain it are exactly the ones stuck in the channel.
 async fn run_headless(
     config: config::Config,
+    health: Arc<HealthCapture>,
     cli: &Cli,
     session_dir: &Path,
     record: instance::DaemonRecord,
@@ -482,7 +496,7 @@ async fn run_headless(
 
     let engine_config = config.clone();
     let mut engine_handle = tokio::spawn(async move {
-        engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx, info_tx).await
+        engine::torrent::run_engine(engine_config, health, cmd_rx, state_tx, msg_tx, info_tx).await
     });
 
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -525,6 +539,9 @@ async fn run_headless(
                 // log too.
                 EngineInfo::HttpApiReady { .. } => tracing::info!("streaming API ready"),
                 EngineInfo::Privacy(status) => tracing::info!("privacy applied: {status:?}"),
+                // Once a second, and nobody is watching; the TUI shows it on
+                // take-over from its own fresh pushes.
+                EngineInfo::Network(_) => {}
             },
             joined = &mut engine_handle => {
                 engine_result = match joined {
@@ -849,6 +866,7 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cli: Cli,
     config: config::Config,
+    health: Arc<HealthCapture>,
     config_warning: Option<String>,
     takeover_of: Option<instance::DaemonRecord>,
     session_dir: &Path,
@@ -902,7 +920,8 @@ async fn run_app(
     // start.
     let mut engine_handle: Option<tokio::task::JoinHandle<Result<()>>> =
         Some(tokio::spawn(async move {
-            engine::torrent::run_engine(engine_config, cmd_rx, state_tx, msg_tx, info_tx).await
+            engine::torrent::run_engine(engine_config, health, cmd_rx, state_tx, msg_tx, info_tx)
+                .await
         }));
 
     // Serve the control directory from the TUI too, so `torrenttui "magnet:…"`
@@ -1327,10 +1346,16 @@ async fn run_app(
                 }
                 let disk_changed = prev_disk != app.free_disk_space;
 
+                // A torrent crossing the stall threshold produces no new
+                // snapshot (that is what stalling means), so the clock has to
+                // be checked here, on the frame tick.
+                let stall_changed = app.refresh_stall_flags(std::time::Instant::now());
+
                 if app.has_fetching_metadata() || app.search_spinner_active() {
                     app.tick_spinner();
                     needs_render = true;
                 } else if disk_changed
+                    || stall_changed
                     || app.error_message.is_some()
                     || app.info_message.is_some()
                 {
@@ -1456,15 +1481,25 @@ fn open_delete_confirm(app: &mut App) {
 }
 
 async fn open_detail(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    open_detail_on(app, DetailTab::Stats, cmd_tx).await;
+}
+
+/// The `w` action — "why is it slow?": Detail, straight to the Health tab.
+async fn open_health(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    open_detail_on(app, DetailTab::Health, cmd_tx).await;
+}
+
+async fn open_detail_on(app: &mut App, tab: DetailTab, cmd_tx: &mpsc::Sender<EngineCommand>) {
     if app.sorted_torrents().is_empty() {
         return;
     }
     app.mode = AppMode::Detail;
-    app.detail_tab = DetailTab::Stats;
+    app.detail_tab = tab;
     app.detail_file_index = 0;
     app.detail_peer_index = 0;
     app.detail_peer_scroll_offset = 0;
     app.detail_file_scroll_offset = 0;
+    app.detail_health_scroll = 0;
     // Tell the engine which torrent we're viewing so the next
     // snapshot includes files/peers/info for only this one.
     let detail_id = app.selected_torrent_id;
@@ -1511,6 +1546,7 @@ async fn handle_normal_mode(
         KeyCode::Char('P') => pause_all(app, cmd_tx).await,
         KeyCode::Char('d') => open_delete_confirm(app),
         KeyCode::Enter => open_detail(app, cmd_tx).await,
+        KeyCode::Char('w') => open_health(app, cmd_tx).await,
         KeyCode::Char('?') => open_help(app),
         KeyCode::Tab => {
             let next = app.sort_column.next();
@@ -1776,6 +1812,10 @@ async fn handle_detail_mode(
                     }
                 }
             }
+            // Unbounded here; the renderer clamps to the content height.
+            DetailTab::Health => {
+                app.detail_health_scroll = app.detail_health_scroll.saturating_add(1);
+            }
             _ => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.detail_tab {
@@ -1784,6 +1824,9 @@ async fn handle_detail_mode(
             }
             DetailTab::Peers => {
                 app.detail_peer_index = app.detail_peer_index.saturating_sub(1);
+            }
+            DetailTab::Health => {
+                app.detail_health_scroll = app.detail_health_scroll.saturating_sub(1);
             }
             _ => {}
         },
@@ -1816,6 +1859,7 @@ fn cycle_detail_tab(app: &mut App) {
     app.detail_peer_index = 0;
     app.detail_peer_scroll_offset = 0;
     app.detail_file_scroll_offset = 0;
+    app.detail_health_scroll = 0;
 }
 
 async fn toggle_file_selection_key(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
@@ -1883,6 +1927,7 @@ async fn execute_action(
         A::Delete => open_delete_confirm(app),
         A::RevealFolder => handle_open_folder(app),
         A::OpenDetail => open_detail(app, cmd_tx).await,
+        A::OpenHealth => open_health(app, cmd_tx).await,
         A::CycleSort => {
             let next = app.sort_column.next();
             app.change_sort_column(next);
@@ -2173,6 +2218,9 @@ fn apply_engine_info(app: &mut App, info: EngineInfo) {
             }
             app.set_info(format!("Privacy active: {}", parts.join(" \u{b7} ")));
             app.privacy = Some(status);
+        }
+        EngineInfo::Network(health) => {
+            app.network_health = Some(health);
         }
     }
 }
@@ -2543,6 +2591,7 @@ mod tests {
             trackers: Vec::new(),
             piece_length: None,
             content_path: None,
+            health: types::TorrentHealth::default(),
         }
     }
 
