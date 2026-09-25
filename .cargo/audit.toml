@@ -1,0 +1,11 @@
+# cargo-audit configuration — also read by CI's rustsec/audit-check job.
+#
+# RUSTSEC-2026-0293: ringbuf < 0.5.2 double-drops elements when an element's
+# `Drop` panics inside `Consumer::skip`/`clear`. The sole consumer is
+# librqbit-utp 0.7.0 (via librqbit 9), which pins ringbuf ^0.4.7, so the fix
+# is not reachable from this crate. It is also not exploitable here: the only
+# ring buffer librqbit-utp builds is `SharedRb<Heap<u8>>` (stream_tx.rs), and
+# `u8` has no `Drop` to panic. Drop this ignore once librqbit-utp moves to
+# ringbuf >= 0.5.2.
+[advisories]
+ignore = ["RUSTSEC-2026-0293"]
