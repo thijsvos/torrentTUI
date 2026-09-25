@@ -10,10 +10,13 @@ use std::fmt;
 /// What the UI shows in the Status column. Derived fresh from librqbit's stats
 /// on every tick, so it is a snapshot, not a state machine.
 ///
-/// `Complete` and `Seeding` are the same underlying condition — a finished
-/// torrent — split purely on whether it is uploading *right now*, so a seeding
-/// torrent with no active peers flips between the two tick to tick. Code that
-/// means "finished" must match both; several places in the engine do.
+/// `Seeding` means finished and live — listening, announcing, and serving any
+/// peer that asks — whether or not a byte is going out *right now*. It used
+/// to also require a nonzero upload speed, with a separate `Complete` for the
+/// idle case, but librqbit's upload speed covers only the last ~0.5 s, so
+/// a torrent seeding lightly flickered between the two several times a
+/// second and one nobody was downloading from never said Seeding at all.
+/// Whether it is actually uploading is the `upload_speed` column's job.
 ///
 /// `Paused` always means the user (or a persisted previous session) paused
 /// it. Speed limits are enforced inside librqbit's rate limiter, so the
@@ -22,7 +25,6 @@ pub enum TorrentStatus {
     FetchingMetadata,
     Downloading,
     Paused,
-    Complete,
     Seeding,
     Error(String),
 }
@@ -33,7 +35,6 @@ impl fmt::Display for TorrentStatus {
             TorrentStatus::FetchingMetadata => write!(f, "Fetching Metadata"),
             TorrentStatus::Downloading => write!(f, "Downloading"),
             TorrentStatus::Paused => write!(f, "Paused"),
-            TorrentStatus::Complete => write!(f, "Complete"),
             TorrentStatus::Seeding => write!(f, "Seeding"),
             TorrentStatus::Error(e) => write!(f, "Error: {}", e),
         }
@@ -50,7 +51,6 @@ impl TorrentStatus {
             TorrentStatus::FetchingMetadata => ("Fetching Metadata", ""),
             TorrentStatus::Downloading => ("Downloading", ""),
             TorrentStatus::Paused => ("Paused", ""),
-            TorrentStatus::Complete => ("Complete", ""),
             TorrentStatus::Seeding => ("Seeding", ""),
             TorrentStatus::Error(e) => ("Error: ", e),
         }
@@ -363,10 +363,11 @@ pub enum SortColumn {
     Name = 1,
     Size = 2,
     Progress = 3,
-    Speed = 4,
-    Peers = 5,
-    Eta = 6,
-    Status = 7,
+    DownSpeed = 4,
+    UpSpeed = 5,
+    Peers = 6,
+    Eta = 7,
+    Status = 8,
 }
 
 impl SortColumn {
@@ -384,8 +385,9 @@ impl SortColumn {
             SortColumn::Index => SortColumn::Name,
             SortColumn::Name => SortColumn::Size,
             SortColumn::Size => SortColumn::Progress,
-            SortColumn::Progress => SortColumn::Speed,
-            SortColumn::Speed => SortColumn::Peers,
+            SortColumn::Progress => SortColumn::DownSpeed,
+            SortColumn::DownSpeed => SortColumn::UpSpeed,
+            SortColumn::UpSpeed => SortColumn::Peers,
             SortColumn::Peers => SortColumn::Eta,
             SortColumn::Eta => SortColumn::Status,
             SortColumn::Status => SortColumn::Index,
@@ -483,7 +485,6 @@ mod tests {
         );
         assert_eq!(TorrentStatus::Downloading.to_string(), "Downloading");
         assert_eq!(TorrentStatus::Paused.to_string(), "Paused");
-        assert_eq!(TorrentStatus::Complete.to_string(), "Complete");
         assert_eq!(TorrentStatus::Seeding.to_string(), "Seeding");
         assert_eq!(
             TorrentStatus::Error("disk full".to_string()).to_string(),
@@ -495,13 +496,15 @@ mod tests {
     fn sort_column_indices() {
         assert_eq!(SortColumn::Index.column_index(), 0);
         assert_eq!(SortColumn::Name.column_index(), 1);
-        assert_eq!(SortColumn::Status.column_index(), 7);
+        assert_eq!(SortColumn::DownSpeed.column_index(), 4);
+        assert_eq!(SortColumn::UpSpeed.column_index(), 5);
+        assert_eq!(SortColumn::Status.column_index(), 8);
     }
 
     #[test]
     fn sort_column_next_cycles() {
         let mut col = SortColumn::Index;
-        for _ in 0..8 {
+        for _ in 0..9 {
             col = col.next();
         }
         assert_eq!(col, SortColumn::Index);
@@ -559,7 +562,6 @@ mod tests {
             TorrentStatus::FetchingMetadata,
             TorrentStatus::Downloading,
             TorrentStatus::Paused,
-            TorrentStatus::Complete,
             TorrentStatus::Seeding,
             TorrentStatus::Error("alpha".to_string()),
             TorrentStatus::Error("beta".to_string()),

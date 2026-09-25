@@ -1103,22 +1103,12 @@ fn derive_status(stats: &librqbit::TorrentStats) -> TorrentStatus {
         // with it (nothing) rather than what it is doing right now.
         TorrentStatsState::Initializing { paused: true } => TorrentStatus::Paused,
         TorrentStatsState::Initializing { paused: false } => TorrentStatus::FetchingMetadata,
-        TorrentStatsState::Live => {
-            if stats.finished {
-                let ul_speed = stats
-                    .live
-                    .as_ref()
-                    .map(|l| (l.upload_speed.mbps * MIB_TO_BYTES) as u64)
-                    .unwrap_or(0);
-                if ul_speed > 0 {
-                    TorrentStatus::Seeding
-                } else {
-                    TorrentStatus::Complete
-                }
-            } else {
-                TorrentStatus::Downloading
-            }
-        }
+        // Finished and live is seeding, full stop — the torrent is listening
+        // and announcing whether or not a peer is pulling from it this
+        // instant. Gating on upload speed (librqbit's is a ~0.5 s window)
+        // made the cell flicker; see `TorrentStatus`.
+        TorrentStatsState::Live if stats.finished => TorrentStatus::Seeding,
+        TorrentStatsState::Live => TorrentStatus::Downloading,
         TorrentStatsState::Paused => TorrentStatus::Paused,
         TorrentStatsState::Error => TorrentStatus::Error(stats.error.clone().unwrap_or_default()),
     }
@@ -1801,9 +1791,7 @@ pub async fn run_engine(
         finished_set.retain(|id| current_ids.contains(id));
 
         for t in &torrents {
-            if matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding)
-                && !finished_set.contains(&t.id)
-            {
+            if matches!(t.status, TorrentStatus::Seeding) && !finished_set.contains(&t.id) {
                 finished_set.insert(t.id);
                 // Advisory; not worth blocking the engine for.
                 let _ = msg_tx.try_send(format!("\u{2713} \"{}\" complete", t.name));
@@ -2542,6 +2530,74 @@ mod tests {
         let remaining = 10 * 1024 * 1024;
         let dl_bps = (1.0_f64 * MIB_TO_BYTES) as u64;
         assert_eq!(compute_eta(remaining, dl_bps), Some(10));
+    }
+
+    fn stats(state: TorrentStatsState, finished: bool, upload_mbps: f64) -> librqbit::TorrentStats {
+        let mut stats = librqbit::TorrentStats {
+            state,
+            file_progress: Vec::new(),
+            error: None,
+            progress_bytes: 0,
+            uploaded_bytes: 0,
+            total_bytes: 100,
+            finished,
+            // `LiveStats` is not re-exported; inference names it for us.
+            live: matches!(state, TorrentStatsState::Live).then(Default::default),
+        };
+        if let Some(l) = stats.live.as_mut() {
+            l.upload_speed = upload_mbps.into();
+        }
+        stats
+    }
+
+    #[test]
+    fn a_finished_live_torrent_is_seeding_even_when_nobody_is_downloading() {
+        // The bug in #86: with no upload in the last ~0.5 s this read
+        // "Complete", so an idle seed never said Seeding, and a light one
+        // flipped between the two several times a second.
+        assert_eq!(
+            derive_status(&stats(TorrentStatsState::Live, true, 0.0)),
+            TorrentStatus::Seeding
+        );
+        assert_eq!(
+            derive_status(&stats(TorrentStatsState::Live, true, 1.5)),
+            TorrentStatus::Seeding
+        );
+    }
+
+    #[test]
+    fn derive_status_maps_every_librqbit_state() {
+        assert_eq!(
+            derive_status(&stats(TorrentStatsState::Live, false, 0.0)),
+            TorrentStatus::Downloading
+        );
+        assert_eq!(
+            derive_status(&stats(TorrentStatsState::Paused, true, 0.0)),
+            TorrentStatus::Paused,
+            "a paused finished torrent is not seeding"
+        );
+        assert_eq!(
+            derive_status(&stats(
+                TorrentStatsState::Initializing { paused: false },
+                false,
+                0.0
+            )),
+            TorrentStatus::FetchingMetadata
+        );
+        assert_eq!(
+            derive_status(&stats(
+                TorrentStatsState::Initializing { paused: true },
+                false,
+                0.0
+            )),
+            TorrentStatus::Paused
+        );
+        let mut errored = stats(TorrentStatsState::Error, false, 0.0);
+        errored.error = Some("disk full".to_string());
+        assert_eq!(
+            derive_status(&errored),
+            TorrentStatus::Error("disk full".to_string())
+        );
     }
 
     #[test]
