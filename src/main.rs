@@ -1430,13 +1430,11 @@ async fn pause_toggle(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
     } else if let Some(torrent) = app.selected_torrent() {
         let id = torrent.id;
         match torrent.status {
-            // Seeding and Complete are pausable too — librqbit
-            // handles a finished torrent fine, and the marked and
-            // `P` paths already pause them, so leaving them out
-            // here made `p` a dropped keypress on a seeding row.
-            types::TorrentStatus::Downloading
-            | types::TorrentStatus::Complete
-            | types::TorrentStatus::Seeding => {
+            // Seeding is pausable too — librqbit handles a finished
+            // torrent fine, and the marked and `P` paths already pause
+            // it, so leaving it out here made `p` a dropped keypress on
+            // a seeding row.
+            types::TorrentStatus::Downloading | types::TorrentStatus::Seeding => {
                 send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
             }
             types::TorrentStatus::Paused => {
@@ -1463,7 +1461,6 @@ async fn pause_all(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
                 t.status,
                 types::TorrentStatus::Downloading
                     | types::TorrentStatus::Paused
-                    | types::TorrentStatus::Complete
                     | types::TorrentStatus::Seeding
             )
         })
@@ -2418,20 +2415,15 @@ mod tests {
         // Was a silent no-op: the match fell through to `_ => {}`, so a single
         // seeding torrent could not be stopped even though mark+p and P both
         // paused it.
-        for status in [
-            types::TorrentStatus::Seeding,
-            types::TorrentStatus::Complete,
-        ] {
-            let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
-            let mut app = App::new();
-            let mut iw = InputWidget::new();
-            app.handle_state_push(vec![torrent(0, status.clone())]);
-            handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
-            assert!(
-                matches!(rx.try_recv().expect("a command"), EngineCommand::Pause(0)),
-                "{status:?} should pause"
-            );
-        }
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Seeding)]);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('p')), &tx).await;
+        assert!(matches!(
+            rx.try_recv().expect("a command"),
+            EngineCommand::Pause(0)
+        ));
     }
 
     #[test]

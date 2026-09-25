@@ -128,7 +128,7 @@ pub fn diagnose(ctx: &Context) -> Verdict {
             causes: Vec::new(),
             next_step: Some("Press p to resume".to_string()),
         },
-        TorrentStatus::Complete | TorrentStatus::Seeding => seeding(ctx),
+        TorrentStatus::Seeding => seeding(ctx),
         TorrentStatus::FetchingMetadata => Verdict {
             severity: Severity::Healthy,
             headline: format!(
@@ -276,12 +276,12 @@ fn seeding(ctx: &Context) -> Verdict {
         format!("Seeding to {} peer{}", live, plural(u64::from(live)))
     } else if live > 0 {
         format!(
-            "Complete — {} peer{} connected, nobody needs data right now",
+            "Seeding — {} peer{} connected, nobody needs data right now",
             live,
             plural(u64::from(live))
         )
     } else {
-        "Complete — no peers connected".to_string()
+        "Seeding — no peers connected".to_string()
     };
     Verdict {
         severity: if causes.is_empty() {
@@ -1230,7 +1230,7 @@ mod tests {
 
     #[test]
     fn seeding_notes_a_failed_upnp_mapping() {
-        let mut t = torrent(TorrentStatus::Complete);
+        let mut t = torrent(TorrentStatus::Seeding);
         t.health.peers.live = 0;
         let n = NetworkHealth {
             upnp: UpnpState::Failed("no gateway".to_string()),
@@ -1238,7 +1238,7 @@ mod tests {
         };
         let v = diagnose(&ctx(&t, Some(&n)));
         assert_eq!(v.severity, Severity::Note);
-        assert_eq!(v.headline, "Complete — no peers connected");
+        assert_eq!(v.headline, "Seeding — no peers connected");
         assert!(v.causes[0].contains("UPnP could not open port 6881: no gateway"));
     }
 
@@ -1278,7 +1278,7 @@ mod tests {
     fn stall_marker_only_applies_to_transfers_in_progress() {
         let long = Some(Duration::from_secs(600));
         assert!(!is_stalled(&TorrentStatus::Paused, long));
-        assert!(!is_stalled(&TorrentStatus::Complete, long));
+        assert!(!is_stalled(&TorrentStatus::Seeding, long));
         assert!(!is_stalled(&TorrentStatus::FetchingMetadata, long));
         assert!(!is_stalled(&TorrentStatus::Error("x".into()), long));
         assert!(is_stalled(&TorrentStatus::Downloading, long));

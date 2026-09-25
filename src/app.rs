@@ -376,8 +376,8 @@ impl App {
 
     /// Whether `q` should open the confirmation dialog instead of quitting
     /// outright. True for anything mid-work: downloading, resolving metadata,
-    /// or actively seeding. Seeding counts because quitting still cuts peers
-    /// abruptly, even though nothing is being downloaded.
+    /// or seeding. Seeding counts because quitting stops sharing and cuts
+    /// peers abruptly, even though nothing is being downloaded.
     pub fn confirm_on_quit_required(&self) -> bool {
         self.confirm_on_quit
             && (self.pending_add_count() > 0
@@ -679,7 +679,8 @@ impl App {
                         .progress_percent()
                         .partial_cmp(&tb.progress_percent())
                         .unwrap_or(std::cmp::Ordering::Equal),
-                    SortColumn::Speed => ta.download_speed.cmp(&tb.download_speed),
+                    SortColumn::DownSpeed => ta.download_speed.cmp(&tb.download_speed),
+                    SortColumn::UpSpeed => ta.upload_speed.cmp(&tb.upload_speed),
                     SortColumn::Peers => ta.peers_connected.cmp(&tb.peers_connected),
                     SortColumn::Eta => match (ta.eta_seconds, tb.eta_seconds) {
                         (Some(a_eta), Some(b_eta)) => a_eta.cmp(&b_eta),
@@ -780,7 +781,8 @@ impl App {
                     .progress_percent()
                     .partial_cmp(&b.progress_percent())
                     .unwrap_or(std::cmp::Ordering::Equal),
-                SortColumn::Speed => a.download_speed.cmp(&b.download_speed),
+                SortColumn::DownSpeed => a.download_speed.cmp(&b.download_speed),
+                SortColumn::UpSpeed => a.upload_speed.cmp(&b.upload_speed),
                 SortColumn::Peers => a.peers_connected.cmp(&b.peers_connected),
                 SortColumn::Eta => match (a.eta_seconds, b.eta_seconds) {
                     (Some(a_eta), Some(b_eta)) => a_eta.cmp(&b_eta),
@@ -1741,15 +1743,19 @@ mod tests {
             SortColumn::Size,
             SortColumn::Progress,
             SortColumn::Status,
-            SortColumn::Speed,
+            SortColumn::DownSpeed,
+            SortColumn::UpSpeed,
+            SortColumn::Peers,
             SortColumn::Eta,
         ] {
             for reversed in [false, true] {
-                let torrents = vec![
-                    make_torrent(0, "Zeta", 100, TorrentStatus::Downloading),
-                    make_torrent(1, "Alpha", 300, TorrentStatus::Paused),
-                    make_torrent(2, "Mid", 200, TorrentStatus::Seeding),
-                ];
+                let mut zeta = make_torrent(0, "Zeta", 100, TorrentStatus::Downloading);
+                zeta.download_speed = 900;
+                zeta.upload_speed = 20;
+                let alpha = make_torrent(1, "Alpha", 300, TorrentStatus::Paused);
+                let mut mid = make_torrent(2, "Mid", 200, TorrentStatus::Seeding);
+                mid.upload_speed = 700;
+                let torrents = vec![zeta, alpha, mid];
                 let mut cached = app_with_torrents(torrents.clone());
                 cached.change_sort_column(column);
                 if reversed {
@@ -1800,6 +1806,25 @@ mod tests {
         let sorted = app.sorted_torrents();
         assert_eq!(sorted[0].name, "Small");
         assert_eq!(sorted[1].name, "Big");
+    }
+
+    #[test]
+    fn sorted_by_upload_speed() {
+        let mut idle = make_torrent(0, "Idle", 100, TorrentStatus::Seeding);
+        idle.upload_speed = 0;
+        let mut busy = make_torrent(1, "Busy", 100, TorrentStatus::Seeding);
+        busy.upload_speed = 500_000;
+        let mut some = make_torrent(2, "Some", 100, TorrentStatus::Downloading);
+        some.upload_speed = 1_000;
+        let mut app = app_with_torrents(vec![idle, busy, some]);
+        app.change_sort_column(SortColumn::UpSpeed);
+        app.toggle_sort_reversed();
+        let names: Vec<&str> = app
+            .sorted_torrents()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, ["Busy", "Some", "Idle"]);
     }
 
     #[test]
@@ -2027,11 +2052,21 @@ mod tests {
     #[test]
     fn confirm_on_quit_required_false_when_idle() {
         let mut app = app_with_torrents(vec![
-            make_torrent(0, "A", 100, TorrentStatus::Complete),
-            make_torrent(1, "B", 100, TorrentStatus::Paused),
+            make_torrent(0, "A", 100, TorrentStatus::Paused),
+            make_torrent(1, "B", 100, TorrentStatus::Error("x".to_string())),
         ]);
         app.confirm_on_quit = true;
         assert!(!app.confirm_on_quit_required());
+    }
+
+    #[test]
+    fn confirm_on_quit_required_true_when_seeding() {
+        // Seeding is steady now (finished + live), so the prompt no longer
+        // depends on whether a peer happened to pull a block in the last
+        // half second.
+        let mut app = app_with_torrents(vec![make_torrent(0, "A", 100, TorrentStatus::Seeding)]);
+        app.confirm_on_quit = true;
+        assert!(app.confirm_on_quit_required());
     }
 
     #[test]

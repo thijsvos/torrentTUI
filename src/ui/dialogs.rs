@@ -91,7 +91,7 @@ pub fn render_quit_dialog(f: &mut Frame, area: Rect, resolving: usize) {
     f.render_widget(Clear, popup);
 
     let what = match resolving {
-        0 => "  Active downloads in progress.".to_string(),
+        0 => "  Quitting stops all downloading and seeding.".to_string(),
         1 => "  A magnet is still resolving; quitting drops it.".to_string(),
         n => format!("  {n} magnets are still resolving; quitting drops them."),
     };
@@ -284,7 +284,8 @@ mod tests {
 
     #[test]
     fn quit_dialog_says_what_a_quit_would_drop() {
-        assert!(quit_screen(0).contains("Active downloads in progress."));
+        // A seed-only session prompts too, so "downloads" alone was wrong.
+        assert!(quit_screen(0).contains("Quitting stops all downloading and seeding."));
         let one = quit_screen(1);
         assert!(
             one.contains("A magnet is still resolving; quitting drops it."),
