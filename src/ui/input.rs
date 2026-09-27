@@ -1,10 +1,12 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+
+use crate::theme::Theme;
 
 const PLACEHOLDER: &str = "magnet:?xt=urn:btih:... or /path/to/file.torrent";
 
@@ -72,22 +74,22 @@ impl InputWidget {
     }
 }
 
-pub fn render_input(f: &mut Frame, area: Rect, input: &InputWidget) {
+pub fn render_input(f: &mut Frame, area: Rect, input: &InputWidget, theme: Theme) {
     let title = " Add Torrent (magnet link or .torrent path) ";
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.primary));
 
     let line = if input.buffer.is_empty() {
         Line::from(vec![
-            Span::styled(PLACEHOLDER, Style::default().fg(Color::DarkGray)),
-            Span::styled("\u{2588}", Style::default().fg(Color::White)),
+            Span::styled(PLACEHOLDER, Style::default().fg(theme.muted)),
+            Span::styled("\u{2588}", Style::default().fg(theme.text)),
         ])
     } else {
         Line::from(vec![
             Span::raw(input.buffer.as_str()),
-            Span::styled("\u{2588}", Style::default().fg(Color::White)),
+            Span::styled("\u{2588}", Style::default().fg(theme.text)),
         ])
     };
 

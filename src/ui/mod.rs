@@ -17,4 +17,5 @@ pub mod palette;
 pub mod progress;
 pub mod search;
 pub mod table;
+pub mod theme_select;
 pub mod util;

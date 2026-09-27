@@ -26,6 +26,7 @@ use crate::actions::{fuzzy_score, palette_scope, tui_description, ActionInfo, Sc
 use crate::config::{PlayerConfig, SearchConfig};
 use crate::health;
 use crate::search::{SearchOutcome, SearchResult};
+use crate::theme::{self, Theme};
 use crate::types::{AppMode, DetailTab, NetworkHealth, SortColumn, TorrentInfo, TorrentStatus};
 use ratatui::widgets::TableState;
 
@@ -78,6 +79,35 @@ impl PaletteState {
             input: String::new(),
             anchor: None,
             return_mode: AppMode::Normal,
+            table_state,
+        }
+    }
+}
+
+/// State for the theme-selector overlay. The list itself is the static
+/// `theme::THEMES` registry, so only the cursor and the data needed to undo an
+/// abandoned browse live here.
+pub struct ThemeSelectState {
+    /// Highlighted row — an index into `theme::THEMES`.
+    pub index: usize,
+    /// Mode the selector opened over; returned to on apply or cancel.
+    pub return_mode: AppMode,
+    /// Theme active when the selector opened, restored on cancel so browsing
+    /// and backing out leaves no trace.
+    pub original_theme: Theme,
+    pub original_name: &'static str,
+    pub table_state: TableState,
+}
+
+impl ThemeSelectState {
+    fn new() -> Self {
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
+        Self {
+            index: 0,
+            return_mode: AppMode::Normal,
+            original_theme: Theme::system(),
+            original_name: "system",
             table_state,
         }
     }
@@ -289,6 +319,13 @@ pub struct App {
     pub download_dir: String,
     /// Command-palette overlay state; see [`PaletteState`].
     pub palette: PaletteState,
+    /// Active colour theme, applied to every renderer.
+    pub theme: Theme,
+    /// Id of the active theme in `theme::THEMES`; the value persisted to
+    /// `config.toml`.
+    pub theme_name: &'static str,
+    /// Theme-selector overlay state; see [`ThemeSelectState`].
+    pub theme_select: ThemeSelectState,
     /// Scroll offset of the help overlay. The registry-driven table outgrew
     /// a 24-line terminal, so the overlay scrolls; reset when help opens and
     /// clamped against the visible height by the renderer.
@@ -366,6 +403,9 @@ impl App {
             search_proxy_url: None,
             download_dir: String::new(),
             palette: PaletteState::new(),
+            theme: Theme::system(),
+            theme_name: "system",
+            theme_select: ThemeSelectState::new(),
             help_scroll: 0,
             progress_marks: HashMap::new(),
             stalled_ids: HashSet::new(),
@@ -1202,14 +1242,13 @@ impl App {
     /// Whether a search view is what the user currently sees — directly, or
     /// underneath the palette overlay.
     pub fn in_search_view(&self) -> bool {
-        match &self.mode {
-            AppMode::Search | AppMode::SearchResults => true,
-            AppMode::Palette => matches!(
-                self.palette.return_mode,
-                AppMode::Search | AppMode::SearchResults
-            ),
-            _ => false,
-        }
+        let underlying = match &self.mode {
+            AppMode::Search | AppMode::SearchResults => return true,
+            AppMode::Palette => self.palette.return_mode.clone(),
+            AppMode::ThemeSelect => self.theme_select.return_mode.clone(),
+            _ => return false,
+        };
+        matches!(underlying, AppMode::Search | AppMode::SearchResults)
     }
 
     /// Whether the frame tick should animate the spinner for a search in
@@ -1224,11 +1263,13 @@ impl App {
     /// plain `mode == Detail` check missed the palette-over-Detail case and
     /// leaked per-tick file/peer building.
     pub fn in_detail_view(&self) -> bool {
-        match &self.mode {
-            AppMode::Detail => true,
-            AppMode::Palette => self.palette.return_mode == AppMode::Detail,
-            _ => false,
-        }
+        let underlying = match &self.mode {
+            AppMode::Detail => return true,
+            AppMode::Palette => self.palette.return_mode.clone(),
+            AppMode::ThemeSelect => self.theme_select.return_mode.clone(),
+            _ => return false,
+        };
+        underlying == AppMode::Detail
     }
 
     /// Open the command palette over the current mode. Returns whether it
@@ -1324,6 +1365,66 @@ impl App {
         let idx = self.palette_selected_index(&matches).saturating_sub(1);
         self.palette.anchor = Some(matches[idx]);
         self.palette.table_state.select(Some(idx));
+    }
+
+    /// Resolve a theme id (usually `config.ui.theme`) and apply it. Unknown
+    /// ids fall back to `system` via [`theme::by_name`], so a stale or
+    /// mistyped config value never fails to start.
+    pub fn set_theme(&mut self, name: &str) {
+        let entry = theme::by_name(name);
+        self.theme = entry.theme;
+        self.theme_name = entry.id;
+    }
+
+    /// Open the theme selector over the current view, starting on the active
+    /// theme. The overlay is drawn over the underlying view, so the return
+    /// mode is that view — the palette's own return mode when it was opened
+    /// from the palette.
+    pub fn open_theme_select(&mut self) {
+        let index = theme::THEMES
+            .iter()
+            .position(|e| e.id == self.theme_name)
+            .unwrap_or(0);
+        self.theme_select.return_mode = if self.mode == AppMode::Palette {
+            self.palette.return_mode.clone()
+        } else {
+            self.mode.clone()
+        };
+        self.theme_select.index = index;
+        self.theme_select.original_theme = self.theme;
+        self.theme_select.original_name = self.theme_name;
+        self.theme_select.table_state.select(Some(index));
+        self.mode = AppMode::ThemeSelect;
+    }
+
+    /// Move the highlight `delta` rows (wrapping) and preview the theme under
+    /// it live, so the frame behind the overlay re-colours as you browse.
+    pub fn theme_select_move(&mut self, delta: isize) {
+        let n = theme::THEMES.len() as isize;
+        if n == 0 {
+            return;
+        }
+        let next = (self.theme_select.index as isize + delta).rem_euclid(n) as usize;
+        self.theme_select.index = next;
+        self.theme_select.table_state.select(Some(next));
+        self.theme = theme::THEMES[next].theme;
+    }
+
+    /// Close the selector, restoring the theme that was active when it opened.
+    pub fn theme_select_cancel(&mut self) {
+        self.theme = self.theme_select.original_theme;
+        self.theme_name = self.theme_select.original_name;
+        self.mode = self.theme_select.return_mode.clone();
+    }
+
+    /// Commit the highlighted theme and return its id so the caller can
+    /// persist it to `config.toml`.
+    pub fn theme_select_confirm(&mut self) -> &'static str {
+        let entry = &theme::THEMES[self.theme_select.index];
+        self.theme = entry.theme;
+        self.theme_name = entry.id;
+        self.mode = self.theme_select.return_mode.clone();
+        entry.id
     }
 
     /// Whether a file is included in the download. Returns `true` for torrents
@@ -2558,8 +2659,18 @@ mod tests {
         app.search.searched_once = true;
         app.search.query = "q".to_string();
         app.open_palette();
-        app.palette_next(); // anchor the second visible action
-        let anchored = app.palette.anchor.expect("anchored");
+        // Anchor an action the arriving outcome will push down: the Download
+        // row (hidden while in flight) sorts above "Edit the query".
+        let mut anchored = None;
+        for _ in 0..app.palette_matches().len() {
+            app.palette_next();
+            let a = app.palette.anchor.expect("anchored");
+            if tui_description(a).contains("Edit the query") {
+                anchored = Some(a);
+                break;
+            }
+        }
+        let anchored = anchored.expect("anchored 'Edit the query'");
         let before = app.palette_selected_index(&app.palette_matches());
 
         // The outcome lands while the palette is open: new rows appear.
@@ -2576,6 +2687,60 @@ mod tests {
             before, after,
             "its index moved — identity tracking did the work"
         );
+    }
+
+    #[test]
+    fn theme_selector_previews_live_and_cancel_restores() {
+        let mut app = App::new();
+        app.set_theme("gruvbox");
+        let original = app.theme;
+
+        app.open_theme_select();
+        assert_eq!(app.mode, AppMode::ThemeSelect);
+        // Opens on the active theme...
+        assert_eq!(crate::theme::THEMES[app.theme_select.index].id, "gruvbox");
+
+        // ...moving previews immediately, without touching the saved id...
+        app.theme_select_move(1);
+        assert_ne!(app.theme, original, "the preview applies at once");
+        assert_eq!(app.theme_name, "gruvbox", "the saved id stays put");
+
+        // ...and cancelling restores the theme from before the browse.
+        app.theme_select_cancel();
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.theme, original);
+        assert_eq!(app.theme_name, "gruvbox");
+    }
+
+    #[test]
+    fn theme_selector_confirm_keeps_the_highlighted_theme_and_wraps() {
+        let mut app = App::new();
+        app.open_theme_select();
+        // Wrapping backward from the first entry lands on the last.
+        app.theme_select_move(-1);
+        assert_eq!(app.theme_select.index, crate::theme::THEMES.len() - 1);
+        let expected = crate::theme::THEMES[app.theme_select.index].id;
+        assert_eq!(app.theme_select_confirm(), expected);
+        assert_eq!(app.theme_name, expected);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn theme_selector_returns_to_the_view_it_opened_over() {
+        let mut app = App::new();
+        app.mode = AppMode::Detail;
+        app.open_theme_select();
+        app.theme_select_cancel();
+        assert_eq!(app.mode, AppMode::Detail);
+    }
+
+    #[test]
+    fn an_unknown_theme_id_falls_back_to_system() {
+        // A stale or hand-edited config value must never stop startup.
+        let mut app = App::new();
+        app.set_theme("definitely-not-a-theme");
+        assert_eq!(app.theme_name, "system");
+        assert_eq!(app.theme, Theme::system());
     }
 
     #[test]

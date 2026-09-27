@@ -1,11 +1,12 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
+use crate::theme::Theme;
 use crate::ui::util::centered_rect;
 use crate::ui::util::truncate;
 
@@ -22,6 +23,7 @@ pub fn render_delete_dialog(
     area: Rect,
     torrent_name: &str,
     watch_dir_configured: bool,
+    theme: Theme,
 ) {
     let mut popup = centered_rect(50, 25, area);
     // The percentage height is only 6 rows on an 80x24 terminal, which is
@@ -35,14 +37,14 @@ pub fn render_delete_dialog(
         Line::from(""),
         Line::from(Span::styled(
             format!("  Delete \"{}\"?", truncate(torrent_name, 40)),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text),
         )),
     ];
 
     if watch_dir_configured {
         text.push(Line::from(Span::styled(
             "  Also removes the .torrent from your watch folder",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         )));
     }
 
@@ -52,19 +54,21 @@ pub fn render_delete_dialog(
             Span::styled(
                 "  [K]",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("eep files   "),
             Span::styled(
                 "[D]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("elete files   "),
             Span::styled(
                 "[C]",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("ancel"),
@@ -75,14 +79,14 @@ pub fn render_delete_dialog(
         Block::default()
             .title(" Confirm Delete ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red)),
+            .border_style(Style::default().fg(theme.error)),
     );
     f.render_widget(dialog, popup);
 }
 
 /// `resolving` is how many magnets are still waiting for metadata: quitting
 /// drops them, and they are not "downloads" — say what is actually at stake.
-pub fn render_quit_dialog(f: &mut Frame, area: Rect, resolving: usize) {
+pub fn render_quit_dialog(f: &mut Frame, area: Rect, resolving: usize, theme: Theme) {
     let mut popup = centered_rect(40, 20, area);
     // 40% of an 80-column terminal is 32 columns, which clips the resolving
     // sentence mid-word; same floor the detach dialog uses.
@@ -97,22 +101,24 @@ pub fn render_quit_dialog(f: &mut Frame, area: Rect, resolving: usize) {
     };
     let text = vec![
         Line::from(""),
-        Line::from(Span::styled(what, Style::default().fg(Color::White))),
+        Line::from(Span::styled(what, Style::default().fg(theme.text))),
         Line::from(Span::styled(
             "  Really quit?",
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text),
         )),
         Line::from(""),
         Line::from(vec![
             Span::styled(
                 "  [Y]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("es   "),
             Span::styled(
                 "[N]",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("o"),
@@ -123,7 +129,7 @@ pub fn render_quit_dialog(f: &mut Frame, area: Rect, resolving: usize) {
         Block::default()
             .title(" Confirm Quit ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(theme.warning)),
     );
     f.render_widget(dialog, popup);
 }
@@ -140,7 +146,13 @@ pub fn render_quit_dialog(f: &mut Frame, area: Rect, resolving: usize) {
 /// concrete, and `streaming` warns that an open player will stop: the HTTP API
 /// belongs to this process, and the background copy binds a fresh port with a
 /// fresh per-run password.
-pub fn render_detach_dialog(f: &mut Frame, area: Rect, torrent_count: usize, streaming: bool) {
+pub fn render_detach_dialog(
+    f: &mut Frame,
+    area: Rect,
+    torrent_count: usize,
+    streaming: bool,
+    theme: Theme,
+) {
     let mut popup = centered_rect(58, 40, area);
     // Percentage height collapses to a handful of rows on an 80x24 terminal,
     // which would clip the bottom of the dialog — and the bottom is where the
@@ -155,12 +167,12 @@ pub fn render_detach_dialog(f: &mut Frame, area: Rect, torrent_count: usize, str
     popup.width = popup.width.max(46.min(area.width));
     f.render_widget(Clear, popup);
 
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(theme.muted);
     let mut text = vec![
         Line::from(""),
         Line::from(Span::styled(
             "  Keep downloading after TorrentTUI closes?",
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -193,13 +205,15 @@ pub fn render_detach_dialog(f: &mut Frame, area: Rect, torrent_count: usize, str
             Span::styled(
                 "  [Y]",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("es   "),
             Span::styled(
                 "[N]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("o"),
         ]),
@@ -209,7 +223,7 @@ pub fn render_detach_dialog(f: &mut Frame, area: Rect, torrent_count: usize, str
         Block::default()
             .title(" Detach to Background ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(theme.warning)),
     );
     f.render_widget(dialog, popup);
 }
@@ -222,7 +236,7 @@ mod tests {
     fn screen(width: u16, height: u16, streaming: bool) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|f| render_detach_dialog(f, f.area(), 3, streaming))
+            .draw(|f| render_detach_dialog(f, f.area(), 3, streaming, Theme::system()))
             .unwrap();
         terminal
             .backend()
@@ -271,7 +285,7 @@ mod tests {
     fn quit_screen(resolving: usize) -> String {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
-            .draw(|f| render_quit_dialog(f, f.area(), resolving))
+            .draw(|f| render_quit_dialog(f, f.area(), resolving, Theme::system()))
             .unwrap();
         terminal
             .backend()

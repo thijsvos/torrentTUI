@@ -5,7 +5,7 @@
 
 use ratatui::{
     layout::{Constraint, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame,
@@ -16,18 +16,19 @@ use crate::ui::layout::format_size;
 use crate::ui::progress::SPINNER_FRAMES;
 
 pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     let title = block_title(app);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(theme.muted));
 
     if app.search.in_flight {
         let spinner = SPINNER_FRAMES[app.spinner_tick];
         let msg = format!("{} Searching for \"{}\"...", spinner, app.search.query);
         let widget = Paragraph::new(Line::from(vec![Span::styled(
             msg,
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(theme.accent),
         )]))
         .block(block)
         .centered();
@@ -45,7 +46,7 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
             let msg = format!("No results for \"{}\".", app.search.query);
             (
                 vec![Line::from(msg), Line::from(""), Line::from(EMPTY_HINTS)],
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             )
         } else {
             let mut lines: Vec<Line> = app
@@ -56,7 +57,7 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
                 .collect();
             lines.push(Line::from(""));
             lines.push(Line::from(EMPTY_HINTS));
-            (lines, Style::default().fg(Color::Red))
+            (lines, Style::default().fg(theme.error))
         };
         let widget = Paragraph::new(lines).style(style).block(block).centered();
         f.render_widget(widget, area);
@@ -83,7 +84,7 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
                 };
                 Cell::from(label).style(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.primary)
                         .add_modifier(Modifier::BOLD),
                 )
             }),
@@ -102,12 +103,12 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
                 None => "?".to_string(),
             };
             Row::new(vec![
-                Cell::from(mark).style(Style::default().fg(Color::Green)),
+                Cell::from(mark).style(Style::default().fg(theme.success)),
                 Cell::from(r.title.clone()),
                 Cell::from(size),
-                Cell::from(r.seeders.to_string()).style(Style::default().fg(Color::Green)),
-                Cell::from(r.leechers.to_string()).style(Style::default().fg(Color::Red)),
-                Cell::from(r.source.label()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(r.seeders.to_string()).style(Style::default().fg(theme.success)),
+                Cell::from(r.leechers.to_string()).style(Style::default().fg(theme.error)),
+                Cell::from(r.source.label()).style(Style::default().fg(theme.muted)),
             ])
         })
         .collect();
@@ -127,7 +128,7 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
     .block(block)
     .row_highlight_style(
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(theme.selection_bg)
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("\u{25b6} ");

@@ -1,5 +1,3 @@
-use ratatui::style::Color;
-
 const FILLED: char = '█';
 const EMPTY: char = '░';
 
@@ -26,20 +24,6 @@ pub fn render_progress_bar(percent: f64, width: usize) -> String {
     use std::fmt::Write;
     let _ = write!(bar, " {:>5.1}%", percent);
     bar
-}
-
-pub fn progress_color(percent: f64) -> Color {
-    if percent >= 100.0 {
-        Color::Green
-    } else if percent >= 75.0 {
-        Color::LightGreen
-    } else if percent >= 50.0 {
-        Color::Yellow
-    } else if percent >= 25.0 {
-        Color::Rgb(255, 165, 0) // Orange
-    } else {
-        Color::Red
-    }
 }
 
 /// Braille spinner frames for the "fetching metadata" cell. The length must
@@ -92,19 +76,6 @@ mod tests {
         let bar = render_progress_bar(-10.0, 10);
         assert!(bar.starts_with("░░░░░░░░░░"));
         assert!(bar.contains("0.0%"));
-    }
-
-    #[test]
-    fn color_thresholds() {
-        assert_eq!(progress_color(0.0), Color::Red);
-        assert_eq!(progress_color(24.9), Color::Red);
-        assert_eq!(progress_color(25.0), Color::Rgb(255, 165, 0));
-        assert_eq!(progress_color(49.9), Color::Rgb(255, 165, 0));
-        assert_eq!(progress_color(50.0), Color::Yellow);
-        assert_eq!(progress_color(74.9), Color::Yellow);
-        assert_eq!(progress_color(75.0), Color::LightGreen);
-        assert_eq!(progress_color(99.9), Color::LightGreen);
-        assert_eq!(progress_color(100.0), Color::Green);
     }
 
     #[test]

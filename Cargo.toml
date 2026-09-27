@@ -50,6 +50,10 @@ futures = "0.3"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "1.0"
+# Format-preserving edits for the one key the app writes back at runtime
+# (`[ui] theme`), so comments, key order and `~` paths survive. Already in the
+# dependency tree via proc-macro-crate.
+toml_edit = "0.25"
 
 # Utilities
 dirs = "7"

@@ -38,6 +38,7 @@ pub enum ActionId {
     MarkAll,
     ClearMarks,
     ToggleHelp,
+    SelectTheme,
     Detach,
     Quit,
     // Detail view
@@ -382,6 +383,24 @@ pub const ACTIONS: &[ActionInfo] = &[
         // Detaching an empty session would leave a background process with
         // nothing to do — the kind of surprise the explicitness rule forbids.
         available: has_torrents,
+    },
+    ActionInfo {
+        // Global: the palette offers it from every non-input view, and `T` is
+        // bound in each of them (Normal, Detail, Search results). The selector
+        // returns to the view it opened over, so unlike Help/Quit it leaves
+        // Detail's SetDetailTorrent materialization intact.
+        id: Some(ActionId::SelectTheme),
+        scope: Scope::Global,
+        section: Section::Main,
+        keys: "`T`",
+        description: "Choose a colour theme",
+        short: Some("Choose a colour theme"),
+        // Not a status-bar hint: the Normal line already clips on narrow
+        // terminals, and the palette and `?` overlay both carry it.
+        hint: None,
+        hint_when_empty: false,
+        in_palette: true,
+        available: always,
     },
     ActionInfo {
         id: Some(ActionId::Quit),

@@ -8,13 +8,14 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
 use crate::app::App;
+use crate::theme::Theme;
 use crate::types::AppMode;
 
 /// Split the frame into the three regions every mode shares: a 3-row header, a
@@ -57,8 +58,9 @@ pub fn split_pending(area: Rect, strip: Option<u16>) -> (Rect, Option<Rect>) {
 }
 
 pub fn render_header(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme;
     let mut spans = vec![
-        Span::styled("TorrentTUI", Style::default().fg(Color::Cyan)),
+        Span::styled("TorrentTUI", Style::default().fg(theme.primary)),
         Span::raw(concat!(" v", env!("CARGO_PKG_VERSION"))),
     ];
     // Privacy badge — rendered only from the engine-reported posture (what
@@ -77,7 +79,7 @@ pub fn render_header(f: &mut Frame, area: Rect, app: &App) {
         if !parts.is_empty() {
             spans.push(Span::styled(
                 format!("  [{}]", parts.join("+")),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.success),
             ));
         }
     }
@@ -85,7 +87,7 @@ pub fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme.muted)),
         )
         .centered();
     f.render_widget(title, area);
@@ -96,18 +98,19 @@ pub fn render_header(f: &mut Frame, area: Rect, app: &App) {
 const LOW_DISK_SPACE_BYTES: u64 = 1_073_741_824;
 
 pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme;
     if let Some(ref err) = app.error_message {
         // Prefixed, not just reddened. An error and an informational notice
         // rendered in structurally identical widgets and were told apart by
         // hue alone — the one distinction that vanishes without colour.
         let error = Paragraph::new(Line::from(vec![Span::styled(
             format!("\u{2716} {}", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
+                .border_style(Style::default().fg(theme.error)),
         );
         f.render_widget(error, area);
         return;
@@ -116,12 +119,12 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     if let Some(ref info) = app.info_message {
         let info_widget = Paragraph::new(Line::from(vec![Span::styled(
             info.clone(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(theme.warning)),
         );
         f.render_widget(info_widget, area);
         return;
@@ -154,12 +157,13 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         AppMode::Palette => {
             "type to filter  Enter:run  \u{2191}/\u{2193}:navigate  Esc:close".to_string()
         }
+        AppMode::ThemeSelect => "\u{2191}/\u{2193}:preview  Enter:apply  Esc:cancel".to_string(),
     };
 
     // Build right-aligned speed section
     let mut right_spans = vec![Span::styled(
         format!("\u{2193} {}", down_speed),
-        Style::default().fg(Color::Green),
+        Style::default().fg(theme.success),
     )];
     if app.speed_limit_download_kbps > 0 {
         right_spans.push(Span::styled(
@@ -167,7 +171,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
                 " [{}]",
                 format_speed(app.speed_limit_download_kbps.saturating_mul(1024))
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         ));
     }
     right_spans.push(Span::raw("  "));
@@ -182,13 +186,13 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         };
         right_spans.push(Span::styled(
             format!("R:{:.2}  ", ratio),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme.text_dim),
         ));
     }
 
     right_spans.push(Span::styled(
         format!("\u{2191} {} ", up_speed),
-        Style::default().fg(Color::Magenta),
+        Style::default().fg(theme.accent),
     ));
     if app.speed_limit_upload_kbps > 0 {
         right_spans.push(Span::styled(
@@ -196,7 +200,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
                 "[{}] ",
                 format_speed(app.speed_limit_upload_kbps.saturating_mul(1024))
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         ));
     }
 
@@ -212,7 +216,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
 
     // Build left section: hints, counts, disk, filter
     let mut left_spans = vec![
-        Span::styled(format!(" {}", hints), Style::default().fg(Color::Gray)),
+        Span::styled(format!(" {}", hints), Style::default().fg(theme.text_dim)),
         Span::raw("  \u{2502}  "),
         Span::raw(format!("{} active / {} total", active, total)),
     ];
@@ -220,7 +224,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     if resolving > 0 {
         left_spans.push(Span::styled(
             format!(" \u{b7} {} resolving", resolving),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(theme.accent),
         ));
     }
 
@@ -232,9 +236,9 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         // from grey. The glyph carries the signal; the colour reinforces it.
         let low = space < LOW_DISK_SPACE_BYTES;
         let style = if low {
-            Style::default().fg(Color::Red)
+            Style::default().fg(theme.error)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.text_dim)
         };
         let text = if low {
             format!("\u{26a0} {} free", space_str)
@@ -249,7 +253,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         left_spans.push(Span::raw("  \u{2502}  "));
         left_spans.push(Span::styled(
             format!("filter: \"{}\"", app.filter_text),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         ));
     }
 
@@ -257,14 +261,14 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         left_spans.push(Span::raw("  \u{2502}  "));
         left_spans.push(Span::styled(
             format!("{} marked", app.marked_count()),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.primary),
         ));
     }
 
     // Split into two columns: left fills, right is fixed-width for speeds
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(theme.muted));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -288,37 +292,37 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(right_widget, columns[1]);
 }
 
-pub fn render_filter_bar(f: &mut Frame, area: Rect, filter_text: &str) {
+pub fn render_filter_bar(f: &mut Frame, area: Rect, filter_text: &str, theme: Theme) {
     let line = Line::from(vec![
-        Span::styled(" Filter: ", Style::default().fg(Color::Cyan)),
+        Span::styled(" Filter: ", Style::default().fg(theme.primary)),
         Span::raw(filter_text),
-        Span::styled("\u{2588}", Style::default().fg(Color::White)), // cursor
+        Span::styled("\u{2588}", Style::default().fg(theme.text)), // cursor
     ]);
 
     let bar = Paragraph::new(line).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(theme.primary)),
     );
     f.render_widget(bar, area);
 }
 
-pub fn render_search_bar(f: &mut Frame, area: Rect, query: &str) {
+pub fn render_search_bar(f: &mut Frame, area: Rect, query: &str, theme: Theme) {
     let line = Line::from(vec![
-        Span::styled(" Search torrents: ", Style::default().fg(Color::Cyan)),
+        Span::styled(" Search torrents: ", Style::default().fg(theme.primary)),
         Span::raw(query),
-        Span::styled("\u{2588}", Style::default().fg(Color::White)), // cursor
+        Span::styled("\u{2588}", Style::default().fg(theme.text)), // cursor
     ]);
 
     let bar = Paragraph::new(line).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(theme.primary)),
     );
     f.render_widget(bar, area);
 }
 
-pub fn render_throttle_bar(f: &mut Frame, area: Rect, step: u8, input_buf: &str) {
+pub fn render_throttle_bar(f: &mut Frame, area: Rect, step: u8, input_buf: &str, theme: Theme) {
     let prompt = if step == 0 {
         " Download limit (KB/s, 0=unlimited): "
     } else {
@@ -326,15 +330,15 @@ pub fn render_throttle_bar(f: &mut Frame, area: Rect, step: u8, input_buf: &str)
     };
 
     let line = Line::from(vec![
-        Span::styled(prompt, Style::default().fg(Color::Cyan)),
+        Span::styled(prompt, Style::default().fg(theme.primary)),
         Span::raw(input_buf),
-        Span::styled("\u{2588}", Style::default().fg(Color::White)),
+        Span::styled("\u{2588}", Style::default().fg(theme.text)),
     ]);
 
     let bar = Paragraph::new(line).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(theme.primary)),
     );
     f.render_widget(bar, area);
 }

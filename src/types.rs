@@ -354,6 +354,11 @@ pub enum AppMode {
     /// The view it opened over keeps rendering underneath; the mode to return
     /// to lives in `App::palette`.
     Palette,
+    /// The theme selector overlay: a list of the built-in themes, previewed
+    /// live as the highlight moves. The view it opened over keeps rendering
+    /// underneath (see `palette_scope`); the mode to return to lives in
+    /// `App::theme_select`.
+    ThemeSelect,
 }
 
 #[repr(u8)]

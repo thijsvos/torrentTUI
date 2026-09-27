@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -252,6 +252,12 @@ pub struct UiConfig {
     pub refresh_rate_ms: u64,
     #[serde(default = "default_true")]
     pub enable_notifications: bool,
+    /// Colour theme id, chosen from the built-in registry (`theme::THEMES`).
+    /// An id matching no theme falls back to `system` at startup, so a stale or
+    /// mistyped value never prevents the app from starting. Written back here
+    /// whenever the user picks a theme from the in-app selector.
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 fn default_download_dir() -> String {
@@ -272,6 +278,10 @@ fn default_listen_port() -> u16 {
 
 fn default_refresh_rate() -> u64 {
     100
+}
+
+fn default_theme() -> String {
+    "system".to_string()
 }
 
 fn default_http_api_bind() -> String {
@@ -337,6 +347,7 @@ impl Default for UiConfig {
         Self {
             refresh_rate_ms: default_refresh_rate(),
             enable_notifications: true,
+            theme: default_theme(),
         }
     }
 }
@@ -416,24 +427,82 @@ impl Config {
     /// in-memory values, so any `~` the user wrote has already been expanded by
     /// `load` and gets persisted in expanded form.
     pub fn save(&self) -> Result<()> {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = toml::to_string_pretty(self)?;
-        // Atomic write: tmp file + fsync + rename. A power loss or SIGKILL
-        // mid-write would otherwise leave the user with a zero-byte config
-        // and silently restored defaults on next launch.
-        let tmp = path.with_extension("toml.tmp");
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(content.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        write_atomic(&Self::config_path(), &toml::to_string_pretty(self)?)
     }
+
+    /// Persist a theme chosen in the app by editing only `[ui] theme` in the
+    /// file on disk.
+    ///
+    /// Not [`Config::save`]: that re-serializes the in-memory config, which at
+    /// runtime is not what the file says. It would drop comments and unknown
+    /// keys, write `~` paths back expanded, bake a one-off `--download-dir`
+    /// into the file, and — when the file failed to parse and the session fell
+    /// back to defaults — replace the user's settings, proxy included, with
+    /// those defaults.
+    pub fn save_theme(theme: &str) -> Result<()> {
+        save_theme_at(&Self::config_path(), theme)
+    }
+}
+
+/// [`Config::save_theme`] against an explicit path, for tests.
+fn save_theme_at(path: &Path, theme: &str) -> Result<()> {
+    // Write through a symlink rather than replacing it: dotfile managers link
+    // config.toml into a repo, and a rename onto the link would cut it loose.
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        // Deleted while the app ran. A file holding just the theme is valid:
+        // every other key falls back to its default.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let mut doc: toml_edit::DocumentMut = content.parse().map_err(|e: toml_edit::TomlError| {
+        let line = e
+            .span()
+            .map(|span| content[..span.start].matches('\n').count() + 1);
+        match line {
+            Some(line) => anyhow::anyhow!("config.toml line {line}: {}", e.message()),
+            None => anyhow::anyhow!("config.toml: {}", e.message()),
+        }
+    })?;
+    let ui = doc.entry("ui").or_insert(toml_edit::table());
+    let Some(ui) = ui.as_table_like_mut() else {
+        anyhow::bail!("config.toml: `ui` is not a table");
+    };
+    match ui.get_mut("theme").and_then(toml_edit::Item::as_value_mut) {
+        // Replace just the value, keeping its spacing and trailing comment.
+        Some(value) => {
+            let decor = value.decor().clone();
+            *value = toml_edit::Value::from(theme);
+            *value.decor_mut() = decor;
+        }
+        None => {
+            ui.insert("theme", toml_edit::value(theme));
+        }
+    }
+    write_atomic(&path, &doc.to_string())
+}
+
+/// Atomic write: tmp file + fsync + rename. A power loss or SIGKILL mid-write
+/// would otherwise leave the user with a zero-byte config and silently
+/// restored defaults on next launch. An existing file's permissions carry
+/// over, so a config kept private (it can hold proxy credentials) stays so.
+fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        std::fs::set_permissions(&tmp, meta.permissions())?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -455,6 +524,7 @@ mod tests {
         assert_eq!(config.network.http_api_bind, "127.0.0.1:0");
         assert_eq!(config.ui.refresh_rate_ms, 100);
         assert!(config.ui.enable_notifications);
+        assert_eq!(config.ui.theme, "system");
         assert!(config.player.command.is_empty());
         assert!(config.player.args.is_empty());
         assert!(config.search.enable_apibay);
@@ -571,6 +641,8 @@ confirm_on_quit = false
         assert_eq!(config.network.listen_port, 6881);
         assert_eq!(config.ui.refresh_rate_ms, 100);
         assert!(config.ui.enable_notifications);
+        // A config written before theming existed still parses and defaults.
+        assert_eq!(config.ui.theme, "system");
         assert!(config.search.enable_apibay);
         assert!(config.search.enable_torrents_csv);
     }
@@ -594,6 +666,7 @@ http_api_bind = "127.0.0.1:8731"
 [ui]
 refresh_rate_ms = 200
 enable_notifications = false
+theme = "tokyonight"
 
 [player]
 command = "mpv"
@@ -620,6 +693,7 @@ max_results = 10
         assert_eq!(config.network.http_api_bind, "127.0.0.1:8731");
         assert_eq!(config.ui.refresh_rate_ms, 200);
         assert!(!config.ui.enable_notifications);
+        assert_eq!(config.ui.theme, "tokyonight");
         assert_eq!(config.player.command, "mpv");
         assert_eq!(config.player.args, vec!["--no-terminal".to_string()]);
         assert!(!config.search.enable_apibay);
@@ -728,5 +802,143 @@ enable_torrents_csv = false
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(!config.search.enable_apibay);
         assert!(!config.search.enable_torrents_csv);
+    }
+
+    /// Write `content` as a config file in a fresh temp dir, save `theme`
+    /// into it, and return the dir (kept alive), the path and the result.
+    fn save_theme_into(
+        content: &str,
+        theme: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, Result<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, content).unwrap();
+        let result = save_theme_at(&path, theme);
+        (dir, path, result)
+    }
+
+    #[test]
+    fn saving_a_theme_changes_that_one_value_and_nothing_else() {
+        // Everything a whole-file rewrite used to destroy: comments, an
+        // unexpanded `~`, a key this version does not know, key order, and the
+        // trailing comment on the theme line itself (the README's sample
+        // config carries one).
+        let before = r#"# my notes: keep downloads on the NAS
+[general]
+download_dir = "~/dl"   # tilde on purpose, dotfiles are shared
+max_concurrent_downloads = 5
+
+[privacy]
+proxy_url = "socks5://127.0.0.1:9050"
+
+[ui]
+enable_notifications = false
+theme = "system"              # colour theme; see Themes below
+"#;
+        let (_dir, path, result) = save_theme_into(before, "nord");
+        result.unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after,
+            before.replace(r#"theme = "system""#, r#"theme = "nord""#)
+        );
+        let config: Config = toml::from_str(&after).unwrap();
+        assert_eq!(config.ui.theme, "nord");
+        assert_eq!(config.general.download_dir, "~/dl");
+        assert_eq!(config.privacy.proxy_url, "socks5://127.0.0.1:9050");
+    }
+
+    #[test]
+    fn saving_a_theme_adds_the_key_or_the_table_when_missing() {
+        let (_dir, path, result) = save_theme_into("[ui]\nrefresh_rate_ms = 200\n", "dracula");
+        result.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[ui]\nrefresh_rate_ms = 200\ntheme = \"dracula\"\n"
+        );
+
+        let (_dir, path, result) = save_theme_into("[general]\ndownload_dir = \"~/dl\"\n", "nord");
+        result.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[general]\ndownload_dir = \"~/dl\"\n\n[ui]\ntheme = \"nord\"\n"
+        );
+
+        // An inline table is a table too.
+        let (_dir, path, result) = save_theme_into("ui = { refresh_rate_ms = 200 }\n", "nord");
+        result.unwrap();
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.ui.theme, "nord");
+        assert_eq!(config.ui.refresh_rate_ms, 200);
+    }
+
+    #[test]
+    fn saving_a_theme_leaves_a_file_that_does_not_parse_untouched() {
+        // The session is running on defaults because of this typo; writing
+        // defaults back would wipe the proxy the user is about to fix.
+        let before =
+            "[privacy]\nproxy_url = \"socks5://127.0.0.1:9050\"\n[ui\nrefresh_rate_ms = 100\n";
+        let (_dir, path, result) = save_theme_into(before, "nord");
+        let err = result.unwrap_err().to_string();
+        assert!(err.starts_with("config.toml line 3"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_parse_error_names_its_own_line_even_at_the_start_of_one() {
+        // The error span starts on line 3's first byte; the text before it
+        // ends in a newline, which a line count must not stop short at.
+        let (_dir, _path, result) = save_theme_into("[ui]\nrefresh_rate_ms = 100\n= 5\n", "nord");
+        let err = result.unwrap_err().to_string();
+        assert!(err.starts_with("config.toml line 3:"), "{err}");
+    }
+
+    #[test]
+    fn saving_a_theme_refuses_a_ui_key_that_is_not_a_table() {
+        let (_dir, path, result) = save_theme_into("ui = 5\n", "nord");
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ui = 5\n");
+    }
+
+    #[test]
+    fn saving_a_theme_recreates_a_deleted_config_with_just_the_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        save_theme_at(&path, "gruvbox").unwrap();
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.ui.theme, "gruvbox");
+        assert_eq!(config.network.listen_port, 6881, "the rest defaults");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_a_theme_keeps_a_private_config_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[privacy]\nproxy_url = \"socks5://u:p@host:1080\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        save_theme_at(&path, "nord").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_a_theme_writes_through_a_symlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles-config.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&real, "[ui]\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        save_theme_at(&link, "nord").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "[ui]\ntheme = \"nord\"\n"
+        );
     }
 }

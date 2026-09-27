@@ -5,7 +5,7 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame,
@@ -16,13 +16,14 @@ use crate::app::App;
 use crate::ui::util::centered_rect;
 
 pub fn render_palette(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
     let popup = centered_rect(55, 60, area);
     f.render_widget(Clear, popup);
 
     let block = Block::default()
         .title(" Command Palette ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.primary));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
     if inner.width == 0 || inner.height == 0 {
@@ -35,9 +36,9 @@ pub fn render_palette(f: &mut Frame, area: Rect, app: &mut App) {
         .split(inner);
 
     let input_line = Line::from(vec![
-        Span::styled(" > ", Style::default().fg(Color::Cyan)),
+        Span::styled(" > ", Style::default().fg(theme.primary)),
         Span::raw(app.palette.input.as_str()),
-        Span::styled("\u{2588}", Style::default().fg(Color::White)),
+        Span::styled("\u{2588}", Style::default().fg(theme.text)),
     ]);
     f.render_widget(Paragraph::new(input_line), chunks[0]);
 
@@ -45,7 +46,7 @@ pub fn render_palette(f: &mut Frame, area: Rect, app: &mut App) {
     if matches.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "No matching actions",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         )))
         .centered();
         f.render_widget(empty, chunks[1]);
@@ -62,7 +63,7 @@ pub fn render_palette(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|a| {
             Row::new(vec![
                 Cell::from(tui_description(a)),
-                Cell::from(keys_display(a)).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(keys_display(a)).style(Style::default().fg(theme.muted)),
             ])
         })
         .collect();
@@ -70,7 +71,7 @@ pub fn render_palette(f: &mut Frame, area: Rect, app: &mut App) {
     let table = Table::new(rows, [Constraint::Min(24), Constraint::Length(18)])
         .row_highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme.selection_bg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("\u{25b6} ");

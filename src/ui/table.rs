@@ -1,15 +1,16 @@
 use ratatui::{
     layout::Constraint,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Row, Table},
     Frame,
 };
 
 use crate::app::App;
+use crate::theme::Theme;
 use crate::types::TorrentStatus;
 use crate::ui::layout::{format_eta, format_size, format_speed};
-use crate::ui::progress::{progress_color, render_progress_bar, SPINNER_FRAMES};
+use crate::ui::progress::{render_progress_bar, SPINNER_FRAMES};
 
 const HEADER_LABELS: [&str; 9] = [
     "#",
@@ -63,6 +64,7 @@ pub fn pending_strip_height(app: &App) -> Option<u16> {
 /// the UI said "Added" and then showed nothing at all: a magnet nobody was
 /// seeding simply vanished, and the user was left to wonder.
 pub fn render_pending_adds(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let theme = app.theme;
     let Some(network) = app.network_health.as_ref() else {
         return;
     };
@@ -73,9 +75,9 @@ pub fn render_pending_adds(f: &mut Frame, area: ratatui::layout::Rect, app: &App
         .map(|add| {
             let text = crate::health::pending_add_line(add, Some(network));
             let style = if add.secs >= crate::health::STALL_AFTER.as_secs() {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(theme.warning)
             } else {
-                Style::default().fg(Color::Magenta)
+                Style::default().fg(theme.accent)
             };
             Line::from(vec![
                 Span::styled(format!(" {} ", spinner), style),
@@ -93,12 +95,13 @@ pub fn render_pending_adds(f: &mut Frame, area: ratatui::layout::Rect, app: &App
                     network.pending_adds.len()
                 ))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme.muted)),
         );
     f.render_widget(widget, area);
 }
 
 pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let theme = app.theme;
     let sorted = app.sorted_torrents();
 
     if sorted.is_empty() {
@@ -111,13 +114,13 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         };
         let empty_msg = ratatui::widgets::Paragraph::new(Line::from(vec![Span::styled(
             msg,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         )]))
         .block(
             Block::default()
                 .title(" Downloads ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme.muted)),
         )
         .centered();
         f.render_widget(empty_msg, area);
@@ -140,7 +143,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         };
         Cell::from(label).style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.primary)
                 .add_modifier(Modifier::BOLD),
         )
     });
@@ -161,14 +164,14 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             };
 
             let (status_text, status_style) = if stalled_ids.contains(&torrent.id) {
-                stalled_cell_style()
+                stalled_cell_style(theme)
             } else {
-                status_cell_style(&torrent.status)
+                status_cell_style(&torrent.status, theme)
             };
 
             let progress_style = match torrent.status {
-                TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
-                _ => Style::default().fg(progress_color(percent)),
+                TorrentStatus::FetchingMetadata => Style::default().fg(theme.accent),
+                _ => Style::default().fg(theme.progress_color(percent)),
             };
 
             let id_text = if is_marked {
@@ -193,7 +196,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             ]);
 
             if is_marked {
-                row.style(Style::default().bg(Color::Indexed(236)))
+                row.style(Style::default().bg(theme.bg_element))
             } else {
                 row
             }
@@ -209,11 +212,11 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             Block::default()
                 .title(" Downloads ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme.muted)),
         )
         .row_highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme.selection_bg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("\u{25b6} ");
@@ -225,13 +228,13 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
 /// enforced inside librqbit's rate limiter, so there is no "Throttled"
 /// pseudo-status any more — a limited torrent simply shows Downloading (or
 /// Seeding) at a capped speed.
-pub fn status_cell_style(status: &TorrentStatus) -> (String, Style) {
+pub fn status_cell_style(status: &TorrentStatus, theme: Theme) -> (String, Style) {
     let style = match status {
-        TorrentStatus::Downloading => Style::default().fg(Color::Blue),
-        TorrentStatus::Seeding => Style::default().fg(Color::Green),
-        TorrentStatus::Paused => Style::default().fg(Color::Yellow),
-        TorrentStatus::FetchingMetadata => Style::default().fg(Color::Magenta),
-        TorrentStatus::Error(_) => Style::default().fg(Color::Red),
+        TorrentStatus::Downloading => Style::default().fg(theme.info),
+        TorrentStatus::Seeding => Style::default().fg(theme.success),
+        TorrentStatus::Paused => Style::default().fg(theme.warning),
+        TorrentStatus::FetchingMetadata => Style::default().fg(theme.accent),
+        TorrentStatus::Error(_) => Style::default().fg(theme.error),
     };
     (status.to_string(), style)
 }
@@ -241,10 +244,10 @@ pub fn status_cell_style(status: &TorrentStatus) -> (String, Style) {
 /// (sorting and filtering are unchanged); only the cell says otherwise. The
 /// glyph carries the state without colour, and red is shared with `Error`
 /// deliberately — both mean "not going to finish by itself".
-pub fn stalled_cell_style() -> (String, Style) {
+pub fn stalled_cell_style(theme: Theme) -> (String, Style) {
     (
         "\u{26a0} Stalled".to_string(),
-        Style::default().fg(Color::Red),
+        Style::default().fg(theme.error),
     )
 }
 
@@ -327,16 +330,18 @@ mod tests {
 
     #[test]
     fn downloading_is_blue() {
-        let (text, style) = status_cell_style(&TorrentStatus::Downloading);
+        let theme = Theme::system();
+        let (text, style) = status_cell_style(&TorrentStatus::Downloading, theme);
         assert_eq!(text, "Downloading");
-        assert_eq!(style, Style::default().fg(Color::Blue));
+        assert_eq!(style, Style::default().fg(theme.info));
     }
 
     #[test]
     fn seeding_is_green() {
-        let (text, style) = status_cell_style(&TorrentStatus::Seeding);
+        let theme = Theme::system();
+        let (text, style) = status_cell_style(&TorrentStatus::Seeding, theme);
         assert_eq!(text, "Seeding");
-        assert_eq!(style, Style::default().fg(Color::Green));
+        assert_eq!(style, Style::default().fg(theme.success));
     }
 
     #[test]
@@ -403,8 +408,37 @@ mod tests {
     }
 
     #[test]
+    fn a_chosen_theme_recolours_the_table() {
+        // Proves the theme actually flows from App into the renderer: the
+        // header is drawn in the theme's primary, so a custom theme must leave
+        // its primary in the buffer and the system cyan must not survive.
+        let mut app = App::new();
+        app.handle_state_push(vec![torrent(1)]);
+        app.set_theme("gruvbox");
+        let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        terminal
+            .draw(|f| render_table(f, f.area(), &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let primary = crate::theme::by_name("gruvbox").theme.primary;
+        assert!(
+            buf.content().iter().any(|c| c.fg == primary),
+            "header not drawn in the theme's primary"
+        );
+        assert!(
+            !buf.content()
+                .iter()
+                .any(|c| c.fg == ratatui::style::Color::Cyan),
+            "system cyan leaked through under a custom theme"
+        );
+    }
+
+    #[test]
     fn error_text_includes_message() {
-        let (text, _) = status_cell_style(&TorrentStatus::Error("disk full".to_string()));
+        let (text, _) = status_cell_style(
+            &TorrentStatus::Error("disk full".to_string()),
+            Theme::system(),
+        );
         assert!(text.contains("disk full"));
     }
 

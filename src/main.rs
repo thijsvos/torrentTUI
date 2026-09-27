@@ -30,6 +30,7 @@ mod instance;
 mod opener;
 mod player;
 mod search;
+mod theme;
 mod types;
 mod ui;
 
@@ -886,6 +887,9 @@ async fn run_app(
     app.search_config = config.search.clone();
     app.search_proxy_url = config.privacy.proxy_url().map(str::to_string);
     app.download_dir = config.general.download_dir.clone();
+    // An unknown id in the config falls back to `system` (see `theme::by_name`),
+    // so a stale or hand-edited value never stops the app from starting.
+    app.set_theme(&config.ui.theme);
 
     if let Some(msg) = config_warning {
         app.set_error(msg);
@@ -1052,12 +1056,12 @@ async fn run_app(
 
                 ui::layout::render_header(f, chunks[0], &app);
 
-                // While the palette overlay is open, the main area keeps
-                // showing the view it opened over.
-                let view_mode = if app.mode == AppMode::Palette {
-                    app.palette.return_mode.clone()
-                } else {
-                    app.mode.clone()
+                // While an overlay is open, the main area keeps showing the
+                // view it opened over.
+                let view_mode = match app.mode {
+                    AppMode::Palette => app.palette.return_mode.clone(),
+                    AppMode::ThemeSelect => app.theme_select.return_mode.clone(),
+                    _ => app.mode.clone(),
                 };
                 match view_mode {
                     AppMode::Detail => {
@@ -1092,7 +1096,7 @@ async fn run_app(
                         }
                     }
                 }
-                if app.mode == AppMode::Palette {
+                if app.mode == AppMode::Palette || app.mode == AppMode::ThemeSelect {
                     // Click hit-testing is Normal-mode-gated anyway, but keep
                     // the Detail precedent: no clicks onto a covered table.
                     app.table_area = None;
@@ -1100,10 +1104,10 @@ async fn run_app(
 
                 match app.mode {
                     AppMode::Input => {
-                        ui::input::render_input(f, chunks[2], &input_widget);
+                        ui::input::render_input(f, chunks[2], &input_widget, app.theme);
                     }
                     AppMode::Filter => {
-                        ui::layout::render_filter_bar(f, chunks[2], &app.filter_text);
+                        ui::layout::render_filter_bar(f, chunks[2], &app.filter_text, app.theme);
                     }
                     AppMode::ThrottleInput => {
                         ui::layout::render_throttle_bar(
@@ -1111,6 +1115,7 @@ async fn run_app(
                             chunks[2],
                             app.throttle_step,
                             &app.throttle_input_buf,
+                            app.theme,
                         );
                     }
                     // An active error outranks the input bar: the errors fired
@@ -1118,7 +1123,7 @@ async fn run_app(
                     // build failure) mean the search cannot proceed, and the
                     // status bar is the only widget that renders them.
                     AppMode::Search if app.error_message.is_none() => {
-                        ui::layout::render_search_bar(f, chunks[2], &app.search.input);
+                        ui::layout::render_search_bar(f, chunks[2], &app.search.input, app.theme);
                     }
                     _ => {
                         ui::layout::render_status_bar(f, chunks[2], &app);
@@ -1142,11 +1147,17 @@ async fn run_app(
                             f.area(),
                             &label,
                             app.watch_dir_configured,
+                            app.theme,
                         );
                     }
                 }
                 if app.mode == AppMode::ConfirmQuit {
-                    ui::dialogs::render_quit_dialog(f, f.area(), app.pending_add_count());
+                    ui::dialogs::render_quit_dialog(
+                        f,
+                        f.area(),
+                        app.pending_add_count(),
+                        app.theme,
+                    );
                 }
                 if app.mode == AppMode::ConfirmDetach {
                     ui::dialogs::render_detach_dialog(
@@ -1154,10 +1165,14 @@ async fn run_app(
                         f.area(),
                         app.torrents.len(),
                         app.http_api_base.is_some(),
+                        app.theme,
                     );
                 }
                 if app.mode == AppMode::Palette {
                     ui::palette::render_palette(f, f.area(), &mut app);
+                }
+                if app.mode == AppMode::ThemeSelect {
+                    ui::theme_select::render_theme_select(f, f.area(), &mut app);
                 }
             })?;
         }
@@ -1253,6 +1268,18 @@ async fn run_app(
                             AppMode::Search => handle_search_input_mode(&mut app, key, &search_tx, &mut search_client),
                             AppMode::SearchResults => handle_search_results_mode(&mut app, key, &cmd_tx, &search_tx, &mut search_client).await,
                             AppMode::Palette => handle_palette_mode(&mut app, key, &mut input_widget, &cmd_tx, &search_tx, &mut search_client).await,
+                            AppMode::ThemeSelect => {
+                                if let Some(id) = handle_theme_select_mode(&mut app, key) {
+                                    let name = theme::by_name(id).name;
+                                    // Only `[ui] theme` is written; see `save_theme`.
+                                    match config::Config::save_theme(id) {
+                                        Ok(()) => app.set_info(format!("Theme: {name}")),
+                                        Err(e) => app.set_error(format!(
+                                            "Theme {name} is on for this session but not saved: {e:#}"
+                                        )),
+                                    }
+                                }
+                            }
                         }
                         needs_render = true;
                     }
@@ -1562,6 +1589,7 @@ async fn handle_normal_mode(
         KeyCode::Char('r') => app.toggle_sort_reversed(),
         KeyCode::Char('/') => app.mode = AppMode::Filter,
         KeyCode::Char('t') => open_throttle(app),
+        KeyCode::Char('T') => app.open_theme_select(),
         KeyCode::Char(' ') => toggle_mark_and_advance(app),
         KeyCode::Char('v') => app.mark_all(),
         KeyCode::Char('V') => app.clear_marks(),
@@ -1741,6 +1769,7 @@ async fn handle_search_results_mode(
         KeyCode::Char(':') => {
             app.open_palette();
         }
+        KeyCode::Char('T') => app.open_theme_select(),
         KeyCode::Char('j') | KeyCode::Down => app.search_next(),
         KeyCode::Char('k') | KeyCode::Up => app.search_previous(),
         KeyCode::Tab => app.cycle_result_sort(),
@@ -1822,6 +1851,7 @@ async fn handle_detail_mode(
         KeyCode::Char(':') => {
             app.open_palette();
         }
+        KeyCode::Char('T') => app.open_theme_select(),
         KeyCode::Tab => cycle_detail_tab(app),
         KeyCode::Char('j') | KeyCode::Down => match app.detail_tab {
             DetailTab::Files => {
@@ -1967,6 +1997,7 @@ async fn execute_action(
         A::MarkAll => app.mark_all(),
         A::ClearMarks => app.clear_marks(),
         A::ToggleHelp => open_help(app),
+        A::SelectTheme => app.open_theme_select(),
         A::Detach => request_detach(app),
         A::Quit => request_quit(app),
         A::CycleTab => cycle_detail_tab(app),
@@ -2042,6 +2073,32 @@ fn handle_help_mode(app: &mut App, key: crossterm::event::KeyEvent) {
             app.help_scroll = app.help_scroll.saturating_sub(1);
         }
         _ => {}
+    }
+}
+
+/// Keys while the theme selector is open. The App applies the highlighted
+/// theme live, so moving the cursor previews it on the whole frame; Enter
+/// commits and returns the id so `run_app` can persist it, Esc restores the
+/// theme that was active when the selector opened.
+fn handle_theme_select_mode(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+) -> Option<&'static str> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.theme_select_cancel();
+            None
+        }
+        KeyCode::Enter => Some(app.theme_select_confirm()),
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.theme_select_move(1);
+            None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.theme_select_move(-1);
+            None
+        }
+        _ => None,
     }
 }
 
@@ -2716,6 +2773,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capital_t_opens_the_theme_selector_from_every_view_the_palette_offers_it_in() {
+        // The palette lists "Choose a colour theme" with its `T` key in all
+        // three views, so the key has to work in all three — and Esc must land
+        // back in the same view without touching the engine (leaving Detail
+        // would have to release its SetDetailTorrent materialization).
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut iw = InputWidget::new();
+
+        let mut app = App::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('T')), &tx).await;
+        assert_eq!(app.mode, AppMode::ThemeSelect);
+        assert_eq!(handle_theme_select_mode(&mut app, key(KeyCode::Esc)), None);
+        assert_eq!(app.mode, AppMode::Normal);
+
+        let mut app = App::new();
+        app.mode = AppMode::Detail;
+        handle_detail_mode(&mut app, key(KeyCode::Char('T')), &tx).await;
+        assert_eq!(app.mode, AppMode::ThemeSelect);
+        assert_eq!(handle_theme_select_mode(&mut app, key(KeyCode::Esc)), None);
+        assert_eq!(app.mode, AppMode::Detail);
+
+        let mut app = App::new();
+        app.mode = AppMode::SearchResults;
+        handle_search_results_mode(
+            &mut app,
+            key(KeyCode::Char('T')),
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.mode, AppMode::ThemeSelect);
+        assert_eq!(handle_theme_select_mode(&mut app, key(KeyCode::Esc)), None);
+        assert_eq!(app.mode, AppMode::SearchResults);
+
+        assert!(rx.try_recv().is_err(), "no engine command for a theme");
+    }
+
+    #[tokio::test]
+    async fn the_palette_theme_action_returns_to_the_view_under_the_palette() {
+        // Detail → palette → "Choose a colour theme" → Enter: the selector
+        // must come back to Detail, not to the palette it was launched from.
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut iw = InputWidget::new();
+        let mut app = App::new();
+        app.handle_state_push(vec![torrent(0, types::TorrentStatus::Downloading)]);
+        app.mode = AppMode::Detail;
+        assert!(app.open_palette());
+        for c in "colour theme".chars() {
+            handle_palette_mode(
+                &mut app,
+                key(KeyCode::Char(c)),
+                &mut iw,
+                &tx,
+                &search_tx,
+                &mut client,
+            )
+            .await;
+        }
+        handle_palette_mode(
+            &mut app,
+            key(KeyCode::Enter),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.mode, AppMode::ThemeSelect);
+        handle_theme_select_mode(&mut app, key(KeyCode::Down));
+        let picked = handle_theme_select_mode(&mut app, key(KeyCode::Enter));
+        assert_eq!(picked, Some(app.theme_name));
+        assert_ne!(app.theme_name, "system");
+        assert_eq!(app.mode, AppMode::Detail);
+    }
+
+    #[tokio::test]
     async fn palette_enter_runs_the_filtered_action() {
         // Type "pause all", Enter: the palette must dispatch the same
         // PauseAll the `P` key sends, and land back in Normal mode.
@@ -2826,10 +2964,10 @@ mod tests {
         app.search.query = "q".to_string();
         app.search.results = vec![search_result_fixture()];
         assert!(app.open_palette());
-        // Anchor "Download the selected result" (alphabetically third with
-        // an empty query, behind "Back…" and "Cycle result sort column";
-        // present because no search is in flight).
-        for _ in 0..2 {
+        // Anchor "Download the selected result" (present because no search is
+        // in flight), wherever the fuzzy list happens to put it.
+        let mut found = false;
+        for _ in 0..app.palette_matches().len() {
             handle_palette_mode(
                 &mut app,
                 ctrl(KeyCode::Char('j')),
@@ -2839,9 +2977,13 @@ mod tests {
                 &mut client,
             )
             .await;
+            let a = app.palette.anchor.expect("anchored");
+            if actions::tui_description(a).contains("Download") {
+                found = true;
+                break;
+            }
         }
-        let anchored = app.palette.anchor.expect("anchored");
-        assert!(actions::tui_description(anchored).contains("Download"));
+        assert!(found, "anchored 'Download the selected result'");
         // Background change: a retry starts, hiding DownloadResult.
         app.search.in_flight = true;
         handle_palette_mode(
