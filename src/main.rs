@@ -162,8 +162,51 @@ const HANDOFF_ACQUIRE_WAIT: std::time::Duration = std::time::Duration::from_secs
 /// before doing any real work.
 const HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Soft open-file limit this process aims for. The hard limit is still the
+/// ceiling; this only bounds how far we raise the soft one when the hard limit
+/// is effectively unlimited. Typed as `rlim_t` rather than `u64`: it is `i64`
+/// on FreeBSD and `u32` on 32-bit glibc, where a `u64` would not compile.
+#[cfg(unix)]
+const FILE_LIMIT_TARGET: libc::rlim_t = 1 << 20;
+
+/// Raise the process's `RLIMIT_NOFILE` soft limit towards the hard limit.
+///
+/// A process started from a terminal inherits a low soft limit (256 on macOS,
+/// 1024 on many Linux desktops), while the hard limit is usually far higher.
+/// Seed a handful of torrents and librqbit — one descriptor per open file —
+/// runs the process out of descriptors: the kernel starts returning `EMFILE`,
+/// the log fills with `Too many open files`, and the session stops making
+/// progress even though it never exited. Service managers paper over this with
+/// `SoftResourceLimits`, but someone running the binary by hand has no such
+/// wrapper. Raising the soft limit here is the same fix with no supervisor.
+///
+/// Best-effort: any failure leaves the inherited limit untouched.
+#[cfg(unix)]
+fn raise_file_limit() {
+    // SAFETY: getrlimit/setrlimit only read and write the `rlimit` we own.
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let target = limit.rlim_max.min(FILE_LIMIT_TARGET);
+        if limit.rlim_cur < target {
+            limit.rlim_cur = target;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_file_limit() {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Raise the descriptor ceiling before anything opens files: the engine and
+    // the session's persistence both need far more than the interactive
+    // default once torrents are seeded.
+    raise_file_limit();
+
     // Set up panic hook to restore terminal. Disable mouse capture too —
     // otherwise the user's terminal will keep emitting mouse-event escape
     // codes after a crash until they `reset(1)`.
@@ -2384,6 +2427,33 @@ mod tests {
 
     fn read_log(dir: &Path) -> String {
         std::fs::read_to_string(dir.join("torrenttui.log")).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raise_file_limit_lifts_the_soft_limit_to_the_target() {
+        // Raising a soft limit up to its hard limit always succeeds on Unix, so
+        // the result is deterministic: max(inherited soft, min(hard, target)).
+        let mut before: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: getrlimit writes only the struct we pass it.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) },
+            0
+        );
+
+        raise_file_limit();
+
+        let mut after: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) },
+            0
+        );
+        let target = before.rlim_max.min(FILE_LIMIT_TARGET);
+        assert_eq!(after.rlim_cur, before.rlim_cur.max(target));
+        assert!(
+            after.rlim_cur >= before.rlim_cur,
+            "the soft limit must never drop"
+        );
     }
 
     #[test]
