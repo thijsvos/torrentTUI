@@ -164,9 +164,10 @@ const HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Soft open-file limit this process aims for. The hard limit is still the
 /// ceiling; this only bounds how far we raise the soft one when the hard limit
-/// is effectively unlimited.
+/// is effectively unlimited. Typed as `rlim_t` rather than `u64`: it is `i64`
+/// on FreeBSD and `u32` on 32-bit glibc, where a `u64` would not compile.
 #[cfg(unix)]
-const FILE_LIMIT_TARGET: u64 = 1 << 20;
+const FILE_LIMIT_TARGET: libc::rlim_t = 1 << 20;
 
 /// Raise the process's `RLIMIT_NOFILE` soft limit towards the hard limit.
 ///
