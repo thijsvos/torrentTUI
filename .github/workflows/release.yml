@@ -148,8 +148,17 @@ jobs:
       # on main at build time shaped an artifact that then received a provenance
       # attestation. This rev is what main pointed at on 2026-08-19, so the pin
       # changes nothing about today's output; it just stops it drifting.
+      #
+      # RUSTFLAGS is cleared for this step only. The workflow-wide -D warnings
+      # exists to lint our code, but `cargo install` applies it to cross's own
+      # sources too, so a new stable rustc warning in cross (e.g.
+      # semicolon_in_expressions_from_non_local_macros on its eyre::bail!
+      # calls) failed the v0.18.1 release. Warnings never change the binary,
+      # and our own code is still held to -D warnings by the test job above.
       - name: Install cross (Linux aarch64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          RUSTFLAGS: ""
         run: |
           cargo install cross --locked \
             --git https://github.com/cross-rs/cross \
