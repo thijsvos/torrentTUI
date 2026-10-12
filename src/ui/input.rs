@@ -15,8 +15,11 @@ const PLACEHOLDER: &str = "magnet:?xt=urn:btih:... or /path/to/file.torrent";
 /// paste of the wrong clipboard buffer from growing the string unbounded.
 const MAX_INPUT_CHARS: usize = 4096;
 
+/// A single-line, append-only text buffer: the add bar, and the add picker's
+/// filter and folder fields.
 pub struct InputWidget {
     buffer: String,
+    cap: usize,
 }
 
 impl Default for InputWidget {
@@ -27,8 +30,14 @@ impl Default for InputWidget {
 
 impl InputWidget {
     pub fn new() -> Self {
+        Self::with_cap(MAX_INPUT_CHARS)
+    }
+
+    /// A buffer holding at most `cap` characters.
+    pub fn with_cap(cap: usize) -> Self {
         Self {
             buffer: String::new(),
+            cap,
         }
     }
 
@@ -36,15 +45,26 @@ impl InputWidget {
         self.buffer.clone()
     }
 
+    pub fn as_str(&self) -> &str {
+        &self.buffer
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Replace the contents, through the same filter and cap as typing.
+    pub fn set(&mut self, s: &str) {
+        self.buffer.clear();
+        self.push_str(s);
+    }
+
     pub fn clear(&mut self) {
         self.buffer.clear();
     }
 
     pub fn push(&mut self, c: char) {
-        // Reject control chars (e.g. \x1b from an OSC sequence, \x07 BEL,
-        // raw newlines from a multi-line paste). Tabs are also dropped here
-        // since the input is a single-line magnet/path.
-        if c.is_control() || self.buffer.chars().count() >= MAX_INPUT_CHARS {
+        if !accepts(c) || self.buffer.chars().count() >= self.cap {
             return;
         }
         self.buffer.push(c);
@@ -58,10 +78,10 @@ impl InputWidget {
     pub fn push_str(&mut self, s: &str) {
         let mut len = self.buffer.chars().count();
         for c in s.chars() {
-            if len >= MAX_INPUT_CHARS {
+            if len >= self.cap {
                 break;
             }
-            if c.is_control() {
+            if !accepts(c) {
                 continue;
             }
             self.buffer.push(c);
@@ -74,8 +94,22 @@ impl InputWidget {
     }
 }
 
-pub fn render_input(f: &mut Frame, area: Rect, input: &InputWidget, theme: Theme) {
-    let title = " Add Torrent (magnet link or .torrent path) ";
+/// Reject control chars (e.g. \x1b from an OSC sequence, \x07 BEL, raw
+/// newlines from a multi-line paste; tabs too, every field is single-line)
+/// and bidi controls, which could make a path or link display as something
+/// other than what it is — the same rule the other text buffers apply.
+fn accepts(c: char) -> bool {
+    !c.is_control() && !crate::ui::util::is_bidi_control(c)
+}
+
+/// The add bar. `pick` is the `A` flavour, which goes on to the add picker
+/// instead of adding straight away.
+pub fn render_input(f: &mut Frame, area: Rect, input: &InputWidget, pick: bool, theme: Theme) {
+    let title = if pick {
+        " Add Torrent, choosing files next (magnet link or .torrent path) "
+    } else {
+        " Add Torrent (magnet link or .torrent path) "
+    };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)

@@ -22,6 +22,7 @@
 //! state the UI has not drained yet.
 
 mod actions;
+mod add_picker;
 mod app;
 mod config;
 mod engine;
@@ -37,6 +38,7 @@ mod ui;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use add_picker::{AddPickerState, Focus, Picker};
 use anyhow::Result;
 use app::App;
 use clap::Parser;
@@ -55,7 +57,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing_subscriber::{prelude::*, EnvFilter};
-use types::{AppMode, DetailTab};
+use types::{AppMode, DetailTab, PreviewOutcome, PreviewResult};
 use ui::input::{validate_magnet, validate_torrent_source, InputWidget};
 
 /// Speed-limit cap in KB/s: ⌊10⁹ / 1024⌋, ≈953 MiB/s. The binding constraint
@@ -586,6 +588,8 @@ async fn run_headless(
                 // Once a second, and nobody is watching; the TUI shows it on
                 // take-over from its own fresh pushes.
                 EngineInfo::Network(_) => {}
+                // Only the add picker asks for previews, and it is TUI-only.
+                EngineInfo::Preview(_) => {}
             },
             joined = &mut engine_handle => {
                 engine_result = match joined {
@@ -947,6 +951,9 @@ async fn run_app(
     // Free-space probe results. Depth 1: only the newest reading matters, and
     // a full channel just means a probe is still in flight.
     let (disk_tx, mut disk_rx) = mpsc::channel::<Option<u64>>(1);
+    // Add-picker folder probes. Each result names its folder, so one for a
+    // folder the user has since typed past is dropped on arrival.
+    let (probe_tx, mut probe_rx) = mpsc::channel::<add_picker::FolderProbe>(4);
     // Indexer-search outcomes from UI-spawned tasks. Generation filtering in
     // App drops anything from a superseded query, so depth just needs to hold
     // a small backlog of stale sends.
@@ -1089,6 +1096,9 @@ async fn run_app(
         while let Ok(outcome) = search_rx.try_recv() {
             needs_render |= app.apply_search_outcome(outcome);
         }
+        while let Ok(probe) = probe_rx.try_recv() {
+            needs_render |= apply_folder_probe(&mut app, probe);
+        }
 
         app.clear_expired_messages();
 
@@ -1104,6 +1114,7 @@ async fn run_app(
                 let view_mode = match app.mode {
                     AppMode::Palette => app.palette.return_mode.clone(),
                     AppMode::ThemeSelect => app.theme_select.return_mode.clone(),
+                    AppMode::AddPicker => AppMode::Normal,
                     _ => app.mode.clone(),
                 };
                 match view_mode {
@@ -1139,7 +1150,10 @@ async fn run_app(
                         }
                     }
                 }
-                if app.mode == AppMode::Palette || app.mode == AppMode::ThemeSelect {
+                if matches!(
+                    app.mode,
+                    AppMode::Palette | AppMode::ThemeSelect | AppMode::AddPicker
+                ) {
                     // Click hit-testing is Normal-mode-gated anyway, but keep
                     // the Detail precedent: no clicks onto a covered table.
                     app.table_area = None;
@@ -1147,7 +1161,13 @@ async fn run_app(
 
                 match app.mode {
                     AppMode::Input => {
-                        ui::input::render_input(f, chunks[2], &input_widget, app.theme);
+                        ui::input::render_input(
+                            f,
+                            chunks[2],
+                            &input_widget,
+                            app.input_pick,
+                            app.theme,
+                        );
                     }
                     AppMode::Filter => {
                         ui::layout::render_filter_bar(f, chunks[2], &app.filter_text, app.theme);
@@ -1217,6 +1237,9 @@ async fn run_app(
                 if app.mode == AppMode::ThemeSelect {
                     ui::theme_select::render_theme_select(f, f.area(), &mut app);
                 }
+                if app.mode == AppMode::AddPicker {
+                    ui::add_picker::render_add_picker(f, f.area(), &mut app);
+                }
             })?;
         }
 
@@ -1253,6 +1276,11 @@ async fn run_app(
                             // skipping the clear there leaked per-tick
                             // file/peer materialization in the engine.
                             let was_detail = app.in_detail_view();
+                            // The quit dialog replaces the picker; stop a
+                            // preview still resolving rather than orphan it.
+                            if app.mode == AppMode::AddPicker {
+                                close_add_picker(&mut app, &cmd_tx).await;
+                            }
                             if app.mode == AppMode::ConfirmQuit {
                                 app.should_quit = true;
                             } else {
@@ -1311,6 +1339,7 @@ async fn run_app(
                             AppMode::Search => handle_search_input_mode(&mut app, key, &search_tx, &mut search_client),
                             AppMode::SearchResults => handle_search_results_mode(&mut app, key, &cmd_tx, &search_tx, &mut search_client).await,
                             AppMode::Palette => handle_palette_mode(&mut app, key, &mut input_widget, &cmd_tx, &search_tx, &mut search_client).await,
+                            AppMode::AddPicker => handle_add_picker_mode(&mut app, key, &cmd_tx).await,
                             AppMode::ThemeSelect => {
                                 if let Some(id) = handle_theme_select_mode(&mut app, key) {
                                     let name = theme::by_name(id).name;
@@ -1346,6 +1375,10 @@ async fn run_app(
                         for c in s.chars() {
                             app.search_push_char(c);
                         }
+                        needs_render = true;
+                    }
+                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::AddPicker => {
+                        add_picker_paste(&mut app, &s);
                         needs_render = true;
                     }
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::Palette => {
@@ -1410,6 +1443,9 @@ async fn run_app(
             Some(outcome) = search_rx.recv() => {
                 needs_render |= app.apply_search_outcome(outcome);
             }
+            Some(probe) = probe_rx.recv() => {
+                needs_render |= apply_folder_probe(&mut app, probe);
+            }
             _ = frame_interval.tick() => {
                 // Only burn a render frame when something actually animates.
                 // Disk-space refresh is internally throttled to ~5s.
@@ -1425,13 +1461,23 @@ async fn run_app(
                     });
                 }
                 let disk_changed = prev_disk != app.free_disk_space;
+                // Same off-the-reactor rule for the add picker's folder.
+                if let Some(folder) = add_picker_probe_due(&mut app) {
+                    let tx = probe_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.try_send(add_picker::probe_folder(folder));
+                    });
+                }
 
                 // A torrent crossing the stall threshold produces no new
                 // snapshot (that is what stalling means), so the clock has to
                 // be checked here, on the frame tick.
                 let stall_changed = app.refresh_stall_flags(std::time::Instant::now());
 
-                if app.has_fetching_metadata() || app.search_spinner_active() {
+                if app.has_fetching_metadata()
+                    || app.search_spinner_active()
+                    || matches!(app.add_picker, Some(AddPickerState::Resolving { .. }))
+                {
                     app.tick_spinner();
                     needs_render = true;
                 } else if disk_changed
@@ -1465,7 +1511,14 @@ fn request_quit(app: &mut App) {
 
 fn open_add_input(app: &mut App, input_widget: &mut InputWidget) {
     app.mode = AppMode::Input;
+    app.input_pick = false;
     input_widget.clear();
+}
+
+/// `A`: the same add bar, going on to the add picker instead of adding.
+fn open_pick_input(app: &mut App, input_widget: &mut InputWidget) {
+    open_add_input(app, input_widget);
+    app.input_pick = true;
 }
 
 /// The search buffer is deliberately not cleared: coming back to search
@@ -1614,6 +1667,7 @@ async fn handle_normal_mode(
         KeyCode::Char('j') | KeyCode::Down => app.next(),
         KeyCode::Char('k') | KeyCode::Up => app.previous(),
         KeyCode::Char('a') => open_add_input(app, input_widget),
+        KeyCode::Char('A') => open_pick_input(app, input_widget),
         KeyCode::Char('s') => open_search_input(app),
         KeyCode::Char('o') => handle_open_folder(app),
         KeyCode::Char(':') => {
@@ -1656,6 +1710,10 @@ async fn handle_input_mode(
             // if we expand it ourselves.
             let value = config::expand_tilde(input_widget.value().trim());
             match validate_torrent_source(&value) {
+                Ok(()) if app.input_pick => {
+                    let label = engine::torrent::pending_add_label(&value);
+                    start_preview(app, value, label, cmd_tx).await;
+                }
                 Ok(()) => {
                     // A magnet has nothing to show until a peer answers;
                     // say so. A .torrent carries its metadata and lands in
@@ -2005,6 +2063,206 @@ async fn apply_file_selection(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand
     }
 }
 
+// ---------------------------------------------------------------------------
+// The add picker. State and rules are in `add_picker`; these route keys and
+// engine answers to it, and carry its result to the engine.
+// ---------------------------------------------------------------------------
+
+/// Ask the engine for a torrent's file list and open the picker's "fetching"
+/// box. Each preview gets a fresh ticket so a late answer for a picker that
+/// has since closed is recognised and dropped.
+async fn start_preview(
+    app: &mut App,
+    source: String,
+    label: String,
+    cmd_tx: &mpsc::Sender<EngineCommand>,
+) {
+    app.preview_ticket += 1;
+    let ticket = app.preview_ticket;
+    if let Err(e) = cmd_tx
+        .send(EngineCommand::PreviewTorrent { ticket, source })
+        .await
+    {
+        tracing::error!("engine channel send failed: {e}");
+        app.set_error("Engine stopped responding".to_string());
+        app.mode = AppMode::Normal;
+        return;
+    }
+    app.add_picker = Some(AddPickerState::Resolving {
+        ticket,
+        label,
+        since: std::time::Instant::now(),
+    });
+    app.mode = AppMode::AddPicker;
+}
+
+/// Close the picker without adding. A preview still resolving is stopped,
+/// so the swarm is not asked for metadata nobody will look at.
+async fn close_add_picker(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    if let Some(AddPickerState::Resolving { ticket, .. }) = app.add_picker.take() {
+        send_cmd(cmd_tx, EngineCommand::CancelPreview(ticket), app).await;
+    }
+    app.mode = AppMode::Normal;
+}
+
+/// Enter in the picker: add with the chosen files and folder, or say why not
+/// and stay open so it can be fixed.
+async fn confirm_add_picker(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    let Some(AddPickerState::Ready(picker)) = app.add_picker.as_mut() else {
+        return;
+    };
+    let done = match picker.confirm() {
+        Ok(done) => done,
+        Err(why) => {
+            picker.message = Some(why);
+            return;
+        }
+    };
+    app.add_picker = None;
+    app.mode = AppMode::Normal;
+    // The engine reports "✓ Added" itself once the torrent exists.
+    send_cmd(
+        cmd_tx,
+        EngineCommand::AddPrepared {
+            prepared: done.prepared,
+            only_files: done.only_files,
+            output_folder: done.output_folder,
+        },
+        app,
+    )
+    .await;
+}
+
+/// The engine's answer to `PreviewTorrent`, if it is for the open picker.
+fn apply_preview(app: &mut App, outcome: PreviewOutcome) {
+    let waiting = matches!(
+        &app.add_picker,
+        Some(AddPickerState::Resolving { ticket, .. }) if *ticket == outcome.ticket
+    );
+    if !waiting {
+        return;
+    }
+    match outcome.result {
+        Ok(PreviewResult::Ready(preview)) => {
+            let picker = Picker::new(*preview, &app.download_dir);
+            app.add_picker = Some(AddPickerState::Ready(Box::new(picker)));
+        }
+        Ok(PreviewResult::AlreadyInList(name)) => {
+            app.add_picker = None;
+            app.mode = AppMode::Normal;
+            app.set_info(format!("\"{name}\" is already in your list"));
+        }
+        Err(why) => {
+            app.add_picker = None;
+            app.mode = AppMode::Normal;
+            app.set_error(why);
+        }
+    }
+}
+
+fn add_picker_probe_due(app: &mut App) -> Option<PathBuf> {
+    match app.add_picker.as_mut() {
+        Some(AddPickerState::Ready(picker)) => picker.probe_due(std::time::Instant::now()),
+        _ => None,
+    }
+}
+
+fn apply_folder_probe(app: &mut App, probe: add_picker::FolderProbe) -> bool {
+    match app.add_picker.as_mut() {
+        Some(AddPickerState::Ready(picker)) => picker.apply_probe(probe),
+        _ => false,
+    }
+}
+
+fn add_picker_paste(app: &mut App, s: &str) {
+    if let Some(AddPickerState::Ready(picker)) = app.add_picker.as_mut() {
+        match picker.focus {
+            Focus::Filter => picker.filter_push_str(s),
+            Focus::Folder => picker.folder_push_str(s),
+            Focus::List => {}
+        }
+    }
+}
+
+/// What a key in the picker asks of the code around it.
+enum PickerKey {
+    Stay,
+    Cancel,
+    Confirm,
+}
+
+async fn handle_add_picker_mode(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    cmd_tx: &mpsc::Sender<EngineCommand>,
+) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let outcome = match app.add_picker.as_mut() {
+        None => PickerKey::Cancel,
+        Some(AddPickerState::Resolving { .. }) => match key.code {
+            KeyCode::Esc => PickerKey::Cancel,
+            _ => PickerKey::Stay,
+        },
+        Some(AddPickerState::Ready(picker)) => {
+            // A refusal or a completion list answers one keypress.
+            picker.message = None;
+            picker_key(picker, key.code, ctrl)
+        }
+    };
+    match outcome {
+        PickerKey::Stay => {}
+        PickerKey::Cancel => close_add_picker(app, cmd_tx).await,
+        PickerKey::Confirm => confirm_add_picker(app, cmd_tx).await,
+    }
+}
+
+fn picker_key(picker: &mut Picker, code: KeyCode, ctrl: bool) -> PickerKey {
+    match picker.focus {
+        Focus::List => match code {
+            KeyCode::Char('j') | KeyCode::Down => picker.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => picker.move_by(-1),
+            KeyCode::Char('g') | KeyCode::Home => picker.top(),
+            KeyCode::Char('G') | KeyCode::End => picker.bottom(),
+            KeyCode::PageDown => picker.page(1),
+            KeyCode::PageUp => picker.page(-1),
+            KeyCode::Char(' ') => picker.toggle_current(),
+            KeyCode::Char('a') => picker.set_visible(true),
+            KeyCode::Char('n') => picker.set_visible(false),
+            KeyCode::Char('i') => picker.invert_visible(),
+            KeyCode::Char('r') => picker.restore(),
+            KeyCode::Char('s') => picker.cycle_sort(),
+            KeyCode::Char('/') => picker.focus = Focus::Filter,
+            KeyCode::Tab | KeyCode::BackTab => picker.focus = Focus::Folder,
+            KeyCode::Enter => return PickerKey::Confirm,
+            // First Esc drops a filter, the next one closes.
+            KeyCode::Esc if !picker.filter.is_empty() => picker.filter_clear(),
+            KeyCode::Esc => return PickerKey::Cancel,
+            _ => {}
+        },
+        Focus::Filter => match code {
+            KeyCode::Esc => {
+                picker.filter_clear();
+                picker.focus = Focus::List;
+            }
+            KeyCode::Enter | KeyCode::Down | KeyCode::Tab => picker.focus = Focus::List,
+            KeyCode::Backspace => picker.filter_pop(),
+            KeyCode::Char('u') if ctrl => picker.filter_clear(),
+            KeyCode::Char(c) if !ctrl => picker.filter_push(c),
+            _ => {}
+        },
+        Focus::Folder => match code {
+            KeyCode::Esc | KeyCode::BackTab => picker.focus = Focus::List,
+            KeyCode::Enter => return PickerKey::Confirm,
+            KeyCode::Tab => picker.complete_folder(add_picker::list_subdirs),
+            KeyCode::Backspace => picker.folder_pop(),
+            KeyCode::Char('u') if ctrl => picker.folder_clear(),
+            KeyCode::Char(c) if !ctrl => picker.folder_push(c),
+            _ => {}
+        },
+    }
+    PickerKey::Stay
+}
+
 /// Route a palette-chosen action to the same function its keybinding calls.
 /// The palette has already closed (mode restored) by the time this runs, so
 /// mode transitions inside the actions behave exactly as if the key was
@@ -2020,6 +2278,7 @@ async fn execute_action(
     use actions::ActionId as A;
     match id {
         A::AddTorrent => open_add_input(app, input_widget),
+        A::AddTorrentPick => open_pick_input(app, input_widget),
         A::OpenSearch => open_search_input(app),
         A::PauseToggle => pause_toggle(app, cmd_tx).await,
         A::PauseAll => pause_all(app, cmd_tx).await,
@@ -2348,6 +2607,7 @@ fn apply_engine_info(app: &mut App, info: EngineInfo) {
         EngineInfo::Network(health) => {
             app.network_health = Some(health);
         }
+        EngineInfo::Preview(outcome) => apply_preview(app, outcome),
     }
 }
 
@@ -2831,6 +3091,228 @@ mod tests {
         let mut iw = InputWidget::new();
         handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('a')), &tx).await;
         assert_eq!(app.mode, AppMode::Input);
+    }
+
+    // -- the add picker (`A`) -------------------------------------------
+
+    const MAGNET: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Show";
+
+    fn ready_preview() -> types::TorrentPreview {
+        let files = ["Show/e01.mkv", "Show/e02.mkv", "extras.txt"]
+            .iter()
+            .enumerate()
+            .map(|(i, path)| types::PreviewFile {
+                index: i,
+                components: path.split('/').map(str::to_string).collect(),
+                path: path.to_string(),
+                size: 100,
+            })
+            .collect();
+        types::TorrentPreview {
+            name: "Show".to_string(),
+            files,
+            preselected: None,
+            subfolder: Some(PathBuf::from("Show")),
+            prepared: types::PreparedTorrent {
+                bytes: vec![1],
+                initial_peers: Vec::new(),
+                stripped_udp: 0,
+            },
+        }
+    }
+
+    /// `A`, type a magnet, Enter: the engine is asked for a preview and the
+    /// picker waits for it. Returns the ticket it waits on.
+    async fn open_picker(
+        app: &mut App,
+        tx: &mpsc::Sender<EngineCommand>,
+        rx: &mut mpsc::Receiver<EngineCommand>,
+    ) -> u64 {
+        let mut iw = InputWidget::new();
+        handle_normal_mode(app, &mut iw, key(KeyCode::Char('A')), tx).await;
+        assert_eq!(app.mode, AppMode::Input);
+        assert!(app.input_pick);
+        iw.push_str(MAGNET);
+        handle_input_mode(app, &mut iw, key(KeyCode::Enter), tx).await;
+        assert_eq!(app.mode, AppMode::AddPicker);
+        match rx.try_recv().expect("a command") {
+            EngineCommand::PreviewTorrent { ticket, source } => {
+                assert_eq!(source, MAGNET);
+                ticket
+            }
+            other => panic!("expected PreviewTorrent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_a_still_adds_straight_away() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        // `A` first, then `a`: the flavour must not stick.
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('A')), &tx).await;
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Esc), &tx).await;
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('a')), &tx).await;
+        assert!(!app.input_pick);
+        iw.push_str(MAGNET);
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Enter), &tx).await;
+        assert!(matches!(
+            rx.try_recv().expect("a command"),
+            EngineCommand::AddTorrent(_)
+        ));
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn the_picker_opens_on_its_own_preview_only() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        app.download_dir = "/dl".to_string();
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+
+        // An answer for an earlier, closed picker is ignored.
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket: ticket - 1,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        assert!(matches!(
+            app.add_picker,
+            Some(AddPickerState::Resolving { .. })
+        ));
+
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        assert!(matches!(app.add_picker, Some(AddPickerState::Ready(_))));
+        assert_eq!(app.mode, AppMode::AddPicker);
+    }
+
+    #[tokio::test]
+    async fn esc_while_fetching_cancels_the_preview() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+        handle_add_picker_mode(&mut app, key(KeyCode::Esc), &tx).await;
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.add_picker.is_none());
+        match rx.try_recv().expect("a command") {
+            EngineCommand::CancelPreview(t) => assert_eq!(t, ticket),
+            other => panic!("expected CancelPreview, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn already_in_the_list_closes_with_a_note() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::AlreadyInList("Show".to_string())),
+            },
+        );
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.add_picker.is_none());
+        assert!(app
+            .info_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("already"));
+    }
+
+    #[tokio::test]
+    async fn enter_adds_the_chosen_files_into_the_chosen_folder() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        app.download_dir = "/dl".to_string();
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        // Deselect extras.txt, then pick a folder relative to the download dir.
+        handle_add_picker_mode(&mut app, key(KeyCode::Char('G')), &tx).await;
+        handle_add_picker_mode(&mut app, key(KeyCode::Char(' ')), &tx).await;
+        handle_add_picker_mode(&mut app, key(KeyCode::Tab), &tx).await;
+        handle_add_picker_mode(&mut app, ctrl(KeyCode::Char('u')), &tx).await;
+        for c in "tv".chars() {
+            handle_add_picker_mode(&mut app, key(KeyCode::Char(c)), &tx).await;
+        }
+        handle_add_picker_mode(&mut app, key(KeyCode::Enter), &tx).await;
+        assert_eq!(app.mode, AppMode::Normal);
+        match rx.try_recv().expect("a command") {
+            EngineCommand::AddPrepared {
+                only_files,
+                output_folder,
+                ..
+            } => {
+                assert_eq!(only_files, vec![0, 1]);
+                assert_eq!(output_folder, PathBuf::from("/dl/tv/Show"));
+            }
+            other => panic!("expected AddPrepared, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_with_nothing_selected_stays_open_and_says_why() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        handle_add_picker_mode(&mut app, key(KeyCode::Char('n')), &tx).await;
+        handle_add_picker_mode(&mut app, key(KeyCode::Enter), &tx).await;
+        assert_eq!(app.mode, AppMode::AddPicker);
+        assert!(rx.try_recv().is_err(), "nothing is sent");
+        match &app.add_picker {
+            Some(AddPickerState::Ready(p)) => {
+                assert!(p.message.as_deref().unwrap_or("").contains("at least one"))
+            }
+            _ => panic!("picker should still be open"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_in_the_filter_does_not_trigger_list_keys() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        handle_add_picker_mode(&mut app, key(KeyCode::Char('/')), &tx).await;
+        // `n` would deselect everything in the list; here it is a letter.
+        for c in "e0n".chars() {
+            handle_add_picker_mode(&mut app, key(KeyCode::Char(c)), &tx).await;
+        }
+        match &app.add_picker {
+            Some(AddPickerState::Ready(p)) => {
+                assert_eq!(p.filter.as_str(), "e0n");
+                assert_eq!(p.selected_count(), 3);
+            }
+            _ => panic!("picker should be open"),
+        }
     }
 
     #[tokio::test]

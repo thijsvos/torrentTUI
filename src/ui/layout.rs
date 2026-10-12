@@ -158,6 +158,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
             "type to filter  Enter:run  \u{2191}/\u{2193}:navigate  Esc:close".to_string()
         }
         AppMode::ThemeSelect => "\u{2191}/\u{2193}:preview  Enter:apply  Esc:cancel".to_string(),
+        AppMode::AddPicker => add_picker_hints(app).to_string(),
     };
 
     // Build right-aligned speed section
@@ -361,6 +362,22 @@ pub fn format_speed(bytes_per_sec: u64) -> String {
     }
     let gb = mb / 1024.0;
     format!("{:.2} GB/s", gb)
+}
+
+/// The add picker's keys depend on which part of it has focus.
+fn add_picker_hints(app: &App) -> &'static str {
+    use crate::add_picker::{AddPickerState, Focus};
+    match &app.add_picker {
+        Some(AddPickerState::Ready(picker)) => match picker.focus {
+            Focus::List => {
+                "Space:toggle  a/n/i:all/none/invert  r:reset  s:sort  /:filter  Tab:folder  \
+                 Enter:add  Esc:cancel"
+            }
+            Focus::Filter => "type to filter  Enter:back to files  Esc:clear",
+            Focus::Folder => "Tab:complete  Ctrl+U:clear  Esc:back to files  Enter:add",
+        },
+        _ => "Esc:cancel",
+    }
 }
 
 /// Format a byte count for display, with the same 1024-per-step, KB-labelled

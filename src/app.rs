@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::actions::{fuzzy_score, palette_scope, tui_description, ActionInfo, Scope, ACTIONS};
+use crate::add_picker::AddPickerState;
 use crate::config::{PlayerConfig, SearchConfig};
 use crate::health;
 use crate::search::{SearchOutcome, SearchResult};
@@ -364,6 +365,14 @@ pub struct App {
     pub theme_name: &'static str,
     /// Theme-selector overlay state; see [`ThemeSelectState`].
     pub theme_select: ThemeSelectState,
+    /// The add picker, while it is open; see [`crate::add_picker`].
+    pub add_picker: Option<AddPickerState>,
+    /// Last ticket handed to `EngineCommand::PreviewTorrent`. Each preview
+    /// gets a new one, so an answer for a picker that has since closed never
+    /// opens in a later one.
+    pub preview_ticket: u64,
+    /// Whether the add bar is the `A` flavour, which goes on to the picker.
+    pub input_pick: bool,
     /// Scroll offset of the help overlay. The registry-driven table outgrew
     /// a 24-line terminal, so the overlay scrolls; reset when help opens and
     /// clamped against the visible height by the renderer.
@@ -444,6 +453,9 @@ impl App {
             theme: Theme::system(),
             theme_name: "system",
             theme_select: ThemeSelectState::new(),
+            add_picker: None,
+            preview_ticket: 0,
+            input_pick: false,
             help_scroll: 0,
             progress_marks: HashMap::new(),
             stalled_ids: HashSet::new(),

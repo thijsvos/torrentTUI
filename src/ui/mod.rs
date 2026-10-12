@@ -8,6 +8,7 @@
 //! there are no stateful widgets, so drawing order is fully determined by
 //! `run_app`.
 
+pub mod add_picker;
 pub mod detail;
 pub mod dialogs;
 pub mod help;

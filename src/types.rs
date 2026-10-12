@@ -271,6 +271,79 @@ pub struct PendingAdd {
     pub tracker_note: Option<String>,
 }
 
+/// One file of a torrent that has not been added yet, as the add picker
+/// shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewFile {
+    /// librqbit's file index, which is what `only_files` takes. BEP 47
+    /// padding files are left out of the preview, so these can skip.
+    pub index: usize,
+    /// Path segments inside the torrent, each through `sanitize_display`.
+    /// Segments rather than one string, so no consumer has to guess whether
+    /// a separator came from the torrent or from the OS.
+    pub components: Vec<String>,
+    /// `components` joined with `/`, for display and fuzzy matching.
+    pub path: String,
+    pub size: u64,
+}
+
+/// What it takes to add a previewed torrent without asking the swarm for its
+/// metadata a second time. Opaque to the UI, which only carries it back.
+#[derive(Clone)]
+pub struct PreparedTorrent {
+    /// A complete `.torrent`. For a magnet librqbit builds it from the info
+    /// dict plus the magnet's trackers, after the proxy-mode udp strip, so
+    /// adding it again announces nowhere the magnet would not have.
+    pub(crate) bytes: Vec<u8>,
+    /// Peers met while resolving, handed back so they are not lost.
+    pub(crate) initial_peers: Vec<std::net::SocketAddr>,
+    /// How many `udp://` trackers the proxy-mode strip removed, for the
+    /// doctor once the torrent exists.
+    pub(crate) stripped_udp: usize,
+}
+
+/// By hand: the derived one would print up to 10 MiB of torrent bytes into
+/// every `{:?}` of a command.
+impl fmt::Debug for PreparedTorrent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedTorrent")
+            .field("bytes", &self.bytes.len())
+            .field("initial_peers", &self.initial_peers.len())
+            .field("stripped_udp", &self.stripped_udp)
+            .finish()
+    }
+}
+
+/// A torrent's contents, fetched without starting it.
+#[derive(Debug, Clone)]
+pub struct TorrentPreview {
+    pub name: String,
+    pub files: Vec<PreviewFile>,
+    /// Indices a magnet's `so=` parameter asked for; `None` means all.
+    pub preselected: Option<Vec<usize>>,
+    /// The folder librqbit would put this torrent in under the download
+    /// directory (`<name>` for multi-file torrents), or `None` when its
+    /// files go straight into it. Joined onto whatever folder the user picks,
+    /// so a chosen folder gets the same layout as the default one.
+    pub subfolder: Option<std::path::PathBuf>,
+    pub prepared: PreparedTorrent,
+}
+
+#[derive(Debug, Clone)]
+pub enum PreviewResult {
+    Ready(Box<TorrentPreview>),
+    /// The torrent is already in the session, under this name.
+    AlreadyInList(String),
+}
+
+/// The answer to `EngineCommand::PreviewTorrent`. `ticket` is the one the UI
+/// sent, so an answer to a picker that has since closed can be recognised.
+#[derive(Debug, Clone)]
+pub struct PreviewOutcome {
+    pub ticket: u64,
+    pub result: Result<PreviewResult, String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DhtHealth {
     /// Nodes in the IPv4 routing table. Zero for the first seconds after
@@ -364,6 +437,11 @@ pub enum AppMode {
     /// underneath (see `palette_scope`); the mode to return to lives in
     /// `App::theme_select`.
     ThemeSelect,
+    /// The add picker (`A`): fetching a torrent's file list, then choosing
+    /// its files and save folder before it starts. A text-input mode as far
+    /// as the palette and global keys are concerned; state in
+    /// `App::add_picker`.
+    AddPicker,
 }
 
 #[repr(u8)]

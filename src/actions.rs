@@ -23,6 +23,7 @@ use crate::types::{AppMode, DetailTab};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionId {
     AddTorrent,
+    AddTorrentPick,
     OpenSearch,
     PauseToggle,
     PauseAll,
@@ -153,6 +154,19 @@ pub const ACTIONS: &[ActionInfo] = &[
         short: None,
         hint: Some("a:add"),
         hint_when_empty: true,
+        in_palette: true,
+        available: always,
+    },
+    ActionInfo {
+        id: Some(ActionId::AddTorrentPick),
+        scope: Scope::Normal,
+        section: Section::Main,
+        keys: "`A`",
+        description: "Add, choosing which files to download and where to save them first",
+        short: Some("Add, choosing files and folder first"),
+        // The Normal hint line already clips at 80 columns.
+        hint: None,
+        hint_when_empty: false,
         in_palette: true,
         available: always,
     },
@@ -740,6 +754,7 @@ mod tests {
             AppMode::ConfirmDelete,
             AppMode::ConfirmQuit,
             AppMode::Palette,
+            AppMode::AddPicker,
         ] {
             assert_eq!(palette_scope(&mode), None, "{mode:?}");
         }

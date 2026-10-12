@@ -28,7 +28,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 - **Sorting & filtering** — sort by any column, search torrents by name
 - **Bandwidth limits** — session-wide download/upload rate limits, applied smoothly by librqbit's token-bucket limiter and adjustable live with `t`
 - **Privacy pack** — SOCKS5 proxy with honest lockdown (no DHT/UDP leaking around it), PeerGuardian IP blocklists, and VPN interface binding; see [Privacy](#privacy)
-- **Selective file download** — choose which files to download from multi-file torrents
+- **Selective file download** — press `A` to pick which files to download and where to save them *before* anything starts; change the selection later in the Files tab
 - **Reveal in file manager** — press `o` to open the selected torrent's data in Finder, Explorer, or your Linux file manager
 - **Detail view** — inspect torrent info, individual file progress, and peer details
 - **Why is it slow?** — press `w` and the Health tab says *why* a torrent is stalled (no way to find peers, peers unreachable, swarm has no seeders, your own cap) and what to change; see [the Health tab](#why-is-it-slow--the-health-tab)
@@ -125,6 +125,7 @@ torrenttui --stop
 |-----|--------|
 | `:` / `Ctrl+P` | Open the command palette (fuzzy-search every action) |
 | `a` | Add magnet link or .torrent file |
+| `A` | Add, choosing which files to download and where to save them first |
 | `s` | Search torrent indexers |
 | `p` | Pause/unpause selected (or all marked) torrents |
 | `P` | Pause/unpause all torrents |
@@ -165,6 +166,55 @@ The palette, the `?` help overlay, the status-bar hints, and the keybinding
 tables in this README all come from one action registry in the source
 (`src/actions.rs`) — a test regenerates these tables from it, so the
 documentation cannot drift from the real bindings.
+
+### Choosing files and a folder before downloading
+
+`a` adds a torrent and starts it at once, with every file, in `download_dir`.
+`A` asks first. Paste the magnet or `.torrent` path as usual; TorrentTUI then
+fetches the file list *without* starting the download (for a magnet that takes
+as long as finding a peer that has it — `Esc` cancels) and opens a picker:
+
+- tick the files you want; filter the list to work on part of it — type
+  `season 2`, press `a`, and that season is in;
+- choose the folder — `~/` and absolute paths work, a plain name like `tv`
+  means a `tv` folder inside `download_dir`, and `Tab` completes folder names;
+- see what the selection needs next to what that folder's disk has free.
+
+`Enter` adds it. A multi-file torrent still gets its own subfolder inside the
+folder you chose, just as it would in `download_dir`.
+
+| Key | Action |
+|-----|--------|
+| `Space` | Toggle the file under the cursor |
+| `a` / `n` / `i` | Select all / none / invert — of the files the filter shows |
+| `r` | Back to the selection the picker opened with |
+| `s` | Sort by torrent order, size, or name |
+| `/` | Filter the files (`Enter` back to the list, `Esc` clears) |
+| `j` / `k`, `g` / `G`, `PgUp` / `PgDn` | Move, jump to top / bottom, page |
+| `Tab` | Edit the save folder (`Tab` there completes, `Ctrl+U` clears, `Esc` goes back) |
+| `Enter` | Add with these files, into this folder |
+| `Esc` | Clear the filter, or cancel |
+
+The filter matches file paths containing what you typed. When nothing does,
+it falls back to fuzzy matching and the count says `(fuzzy)` — worth a look
+before pressing `a`, since the bulk keys act on whatever the list shows.
+
+Good to know:
+
+- **The folder is per torrent and is remembered across restarts**, but it is
+  fixed once the torrent is added: librqbit has no way to move a torrent's
+  data afterwards. The file selection is not fixed — change it any time in the
+  detail view's Files tab.
+- **The proxy is not a per-torrent choice.** `[privacy]` applies to the whole
+  session, and has to: DHT and the listener belong to the session, so a
+  torrent "outside" the proxy would still be announced from your real address.
+  See [Privacy](#privacy).
+- Unticked files can still show up on disk, empty or partly written: librqbit
+  creates every file of a torrent, and a piece that straddles a ticked and an
+  unticked file is written whole. That is how BitTorrent works, not a leak of
+  the selection.
+- Adds that do not go through the keyboard — the CLI argument, a magnet handed
+  to a running session, the watch folder — still add straight away.
 
 ### Search
 
@@ -398,7 +448,9 @@ see a reconnect; fastresume means nothing is re-hashed.
 **Only one instance can own the session.** A second `torrenttui` refuses and
 names the pid of the first. This is not tidiness: librqbit's session state is
 guarded only inside a single process, so two instances writing the same
-`session.json` and the same fastresume files silently lose torrents. Before this
+`session.json` and the same fastresume files silently lose torrents. (If what
+you wanted a second instance for was a different download folder: `A` chooses
+the folder per torrent.) Before this
 existed, a second launch started anyway.
 
 **Handing work to a running session.** `torrenttui "magnet:?..."` while a

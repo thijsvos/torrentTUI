@@ -19,8 +19,9 @@ use crate::config::Config;
 use crate::engine::health_capture::HealthCapture;
 use crate::engine::watch;
 use crate::types::{
-    ConnectHealth, DhtHealth, FileInfo, NetworkHealth, PeerBreakdown, PeerInfo, TorrentHealth,
-    TorrentInfo, TorrentStatus, TrackerInfo, TransportStats,
+    ConnectHealth, DhtHealth, FileInfo, NetworkHealth, PeerBreakdown, PeerInfo, PreparedTorrent,
+    PreviewFile, PreviewOutcome, PreviewResult, TorrentHealth, TorrentInfo, TorrentPreview,
+    TorrentStatus, TrackerInfo, TransportStats,
 };
 use crate::ui::util::sanitize_display;
 use anyhow::{Context, Result};
@@ -32,9 +33,10 @@ use librqbit::{
     limits::LimitsConfig,
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions, DhtSessionConfig,
     ListenerMode, ListenerOptions, ManagedTorrent, ManagedTorrentState, Session, SessionOptions,
-    SessionPersistenceConfig, TorrentStatsState,
+    SessionPersistenceConfig, TorrentStatsState, ValidatedTorrentMetaV1Info,
 };
 use librqbit_dualstack_sockets::{BindOpts, TcpListener};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::num::NonZeroU32;
@@ -159,6 +161,10 @@ pub enum EngineInfo {
     /// `NETWORK_PUSH_EVERY_TICKS` ticks with `try_send`: a dropped one is
     /// superseded a second later.
     Network(NetworkHealth),
+    /// The answer to `EngineCommand::PreviewTorrent`. Sent with `send`, never
+    /// `try_send`: unlike `Network`, nothing supersedes it, and a dropped one
+    /// would leave the add picker waiting forever.
+    Preview(PreviewOutcome),
 }
 
 /// The active privacy posture, as applied at session creation.
@@ -209,6 +215,20 @@ pub enum EngineCommand {
         id: usize,
         file_indices: Vec<usize>,
     },
+    /// Fetch a torrent's file list without starting it, for the add picker.
+    /// Answered with `EngineInfo::Preview` carrying the same `ticket`.
+    PreviewTorrent {
+        ticket: u64,
+        source: String,
+    },
+    /// The picker closed before its preview arrived: stop resolving.
+    CancelPreview(u64),
+    /// Add a previewed torrent with the files and folder the user chose.
+    AddPrepared {
+        prepared: PreparedTorrent,
+        only_files: Vec<usize>,
+        output_folder: PathBuf,
+    },
     /// Which torrent the UI is showing in Detail mode, or `None` when leaving
     /// Detail. The engine populates the heavy
     /// `files` / `peers` fields only for that torrent, dropping per-tick
@@ -258,6 +278,13 @@ pub struct TorrentEngine {
     /// visible trace of a magnet nobody is seeding.
     pending_adds: std::sync::Mutex<HashMap<u64, PendingEntry>>,
     next_pending_ticket: std::sync::atomic::AtomicU64,
+    /// The session's default output folder, to tell the subfolder librqbit
+    /// picks for a previewed torrent apart from the folder it sits in.
+    download_dir: PathBuf,
+    /// Previews still resolving, keyed by the UI's ticket, so
+    /// `CancelPreview` can stop one. Each task removes its own entry when it
+    /// ends, however it ends — see `PreviewTaskGuard`.
+    preview_tasks: std::sync::Mutex<HashMap<u64, tokio::task::AbortHandle>>,
 }
 
 /// What the engine knows about an add before librqbit has created the
@@ -475,7 +502,7 @@ impl TorrentEngine {
             capture.mark_upnp_pending();
         }
 
-        let session = Session::new_with_opts(download_dir, opts)
+        let session = Session::new_with_opts(download_dir.clone(), opts)
             .await
             .context("starting torrent session (check the [privacy] settings if any are set)")?;
 
@@ -506,6 +533,8 @@ impl TorrentEngine {
             started_at: Instant::now(),
             pending_adds: std::sync::Mutex::new(HashMap::new()),
             next_pending_ticket: std::sync::atomic::AtomicU64::new(0),
+            download_dir,
+            preview_tasks: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -632,21 +661,7 @@ impl TorrentEngine {
     /// and size-capped before reading, so a symlink pointing at something
     /// enormous cannot be read into memory.
     pub async fn add_torrent(&self, source: &str) -> Result<(usize, ManagedTorrentHandle, bool)> {
-        let source = source.trim();
-        let add_torrent = if source.starts_with("magnet:?") {
-            AddTorrent::from_url(source)
-        } else {
-            // Treat as .torrent file path. Cap size to avoid a malicious
-            // symlink turning the read into an OOM.
-            let meta = tokio::fs::metadata(source).await?;
-            anyhow::ensure!(
-                meta.len() <= MAX_TORRENT_FILE_SIZE,
-                ".torrent file too large (>{} bytes)",
-                MAX_TORRENT_FILE_SIZE
-            );
-            let bytes = tokio::fs::read(source).await?;
-            AddTorrent::from_bytes(bytes)
-        };
+        let add_torrent = read_add_source(source).await?;
 
         // `overwrite` lets librqbit open files that already exist. Without it
         // adding a torrent whose data is already on disk fails outright with
@@ -668,14 +683,112 @@ impl TorrentEngine {
                 }),
             )
             .await?;
+        added_handle(response)
+    }
 
-        match response {
-            AddTorrentResponse::Added(id, handle) => Ok((id, handle, false)),
-            AddTorrentResponse::AlreadyManaged(id, handle) => Ok((id, handle, true)),
-            AddTorrentResponse::ListOnly(_) => {
-                anyhow::bail!("Torrent was list-only")
+    /// Fetch a torrent's file list without adding it (librqbit's
+    /// `list_only`), for the add picker. For a magnet this waits on the swarm
+    /// exactly as `add_torrent` would; for a `.torrent` it touches no network.
+    pub async fn preview_torrent(
+        &self,
+        source: &str,
+        stripped_udp: usize,
+    ) -> Result<PreviewResult> {
+        // librqbit answers `list_only` *before* it checks for duplicates, so
+        // a magnet already in the list would be resolved from the swarm for
+        // nothing. Its hash is in the link: ask the session first.
+        if source.starts_with("magnet:?") {
+            let known = librqbit::Magnet::parse(source)
+                .ok()
+                .and_then(|m| m.as_id20())
+                .and_then(|hash| self.managed_name(hash));
+            if let Some(name) = known {
+                return Ok(PreviewResult::AlreadyInList(name));
             }
         }
+        let add_torrent = read_add_source(source).await?;
+        let response = self
+            .session
+            .add_torrent(
+                add_torrent,
+                Some(AddTorrentOptions {
+                    list_only: true,
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let listed = match response {
+            AddTorrentResponse::ListOnly(listed) => listed,
+            // Not something `list_only` returns; if it ever does, the torrent
+            // exists and there is nothing left to choose.
+            AddTorrentResponse::Added(_, handle)
+            | AddTorrentResponse::AlreadyManaged(_, handle) => {
+                return Ok(PreviewResult::AlreadyInList(display_name(&handle)));
+            }
+        };
+        // A `.torrent` file's hash is only known now.
+        if let Some(name) = self.managed_name(listed.info_hash) {
+            return Ok(PreviewResult::AlreadyInList(name));
+        }
+        let subfolder = listed
+            .output_folder
+            .strip_prefix(&self.download_dir)
+            .ok()
+            .filter(|rel| !rel.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+        Ok(PreviewResult::Ready(Box::new(TorrentPreview {
+            name: sanitize_display(&listed.info.name().unwrap_or(Cow::Borrowed("Unknown"))),
+            files: preview_files(&listed.info),
+            preselected: listed.only_files,
+            subfolder,
+            prepared: PreparedTorrent {
+                bytes: listed.torrent_bytes.to_vec(),
+                initial_peers: listed.seen_peers,
+                stripped_udp,
+            },
+        })))
+    }
+
+    /// Add a previewed torrent with the user's choices. From the bytes the
+    /// preview kept, so the swarm is not asked for metadata twice, and with
+    /// the peers met while resolving so they are not lost. librqbit persists
+    /// `output_folder` and `only_files` with the torrent, so both survive a
+    /// restart, and creates the folder if it does not exist yet.
+    pub async fn add_prepared(
+        &self,
+        prepared: PreparedTorrent,
+        only_files: Vec<usize>,
+        output_folder: &Path,
+    ) -> Result<(usize, ManagedTorrentHandle, bool)> {
+        anyhow::ensure!(!only_files.is_empty(), "no files selected");
+        let output_folder = output_folder
+            .to_str()
+            .context("the save folder is not valid UTF-8")?
+            .to_string();
+        let response = self
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(prepared.bytes),
+                Some(AddTorrentOptions {
+                    // See `add_torrent`.
+                    overwrite: true,
+                    only_files: Some(only_files),
+                    output_folder: Some(output_folder),
+                    initial_peers: (!prepared.initial_peers.is_empty())
+                        .then_some(prepared.initial_peers),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        added_handle(response)
+    }
+
+    /// The display name of the torrent with this hash, if the session has it.
+    fn managed_name(&self, hash: Id20) -> Option<String> {
+        self.session
+            .get(TorrentIdOrHash::Hash(hash))
+            .map(|handle| display_name(&handle))
     }
 
     /// Pause a torrent in the session. A plain passthrough — since speed
@@ -1310,6 +1423,62 @@ pub(crate) fn strip_udp_trackers(magnet: &str) -> StrippedMagnet {
     }
 }
 
+/// Read a user-supplied source into librqbit's add request: a magnet as is,
+/// anything else as a `.torrent` path. The file is size-capped before it is
+/// read, so a symlink pointing at something enormous cannot be read into
+/// memory.
+async fn read_add_source(source: &str) -> Result<AddTorrent<'static>> {
+    let source = source.trim();
+    if source.starts_with("magnet:?") {
+        return Ok(AddTorrent::from_url(source.to_string()));
+    }
+    let meta = tokio::fs::metadata(source).await?;
+    anyhow::ensure!(
+        meta.len() <= MAX_TORRENT_FILE_SIZE,
+        ".torrent file too large (>{} bytes)",
+        MAX_TORRENT_FILE_SIZE
+    );
+    Ok(AddTorrent::from_bytes(tokio::fs::read(source).await?))
+}
+
+/// `(id, handle, already_managed)` from an add that was not `list_only`.
+fn added_handle(response: AddTorrentResponse) -> Result<(usize, ManagedTorrentHandle, bool)> {
+    match response {
+        AddTorrentResponse::Added(id, handle) => Ok((id, handle, false)),
+        AddTorrentResponse::AlreadyManaged(id, handle) => Ok((id, handle, true)),
+        AddTorrentResponse::ListOnly(_) => {
+            anyhow::bail!("Torrent was list-only")
+        }
+    }
+}
+
+fn display_name(handle: &ManagedTorrentHandle) -> String {
+    sanitize_display(&handle.name().unwrap_or_else(|| "Unknown".to_string()))
+}
+
+/// The picker's view of a torrent's files. Padding files (BEP 47) are
+/// alignment filler librqbit never writes, so they are left out — but every
+/// other file keeps librqbit's own index, which is what `only_files` takes.
+fn preview_files<B: AsRef<[u8]>>(info: &ValidatedTorrentMetaV1Info<B>) -> Vec<PreviewFile> {
+    info.iter_file_details()
+        .enumerate()
+        .filter(|(_, details)| !details.attrs().padding)
+        .map(|(index, details)| {
+            let components: Vec<String> = details
+                .filename
+                .iter_components()
+                .map(|part| sanitize_display(&part))
+                .collect();
+            PreviewFile {
+                index,
+                path: components.join("/"),
+                components,
+                size: details.len,
+            }
+        })
+        .collect()
+}
+
 /// Longest label a pending add gets in the UI.
 const MAX_PENDING_LABEL_CHARS: usize = 40;
 
@@ -1385,6 +1554,129 @@ pub(crate) fn pending_add_label(source: &str) -> String {
 /// it is the direct result of stripping the udp trackers, and the doctor's
 /// explanation is more useful than the bare message.
 const NO_DISCOVERY_ERROR: &str = "no known way to resolve peers";
+
+/// Proxy mode: drop `udp://` trackers from a magnet before it reaches
+/// librqbit (see `strip_udp_trackers`), warning when that leaves it
+/// trackerless — with DHT also off in this mode there is no discovery path
+/// left. The one filter every UI add path goes through, previews included.
+/// Returns the source to hand on and how many trackers were dropped.
+async fn prepare_source(
+    engine: &TorrentEngine,
+    source: String,
+    msg_tx: &mpsc::Sender<String>,
+) -> (String, usize) {
+    if !(engine.proxy_active() && source.starts_with("magnet:?")) {
+        return (source, 0);
+    }
+    let stripped = strip_udp_trackers(&source);
+    if stripped.removed > 0 && stripped.trackers_left == 0 {
+        let _ = msg_tx
+            .send(
+                "\u{26a0} Proxy mode: magnet had only udp:// trackers \
+                 (unusable through a SOCKS5 proxy) — it may not find peers"
+                    .to_string(),
+            )
+            .await;
+    }
+    (stripped.magnet, stripped.removed)
+}
+
+/// Tell the user how an add ended. Shared by `AddTorrent` and `AddPrepared`,
+/// so both say the same things in the same words.
+async fn report_add_outcome(
+    engine: &TorrentEngine,
+    msg_tx: &mpsc::Sender<String>,
+    finished_tx: &mpsc::Sender<usize>,
+    outcome: Result<(usize, ManagedTorrentHandle, bool)>,
+    stripped_udp: usize,
+) {
+    match outcome {
+        Ok((id, handle, already_managed)) => {
+            // Recorded by hash once the add resolves — the only moment both
+            // the strip count and the hash are in one place. The doctor reads
+            // it to explain a torrent that has "no trackers" under the proxy
+            // lockdown.
+            engine
+                .capture
+                .note_stripped_udp(&handle.info_hash().as_string(), stripped_udp);
+            let stats = handle.stats();
+            let name = display_name(&handle);
+            if already_managed || stats.finished {
+                let _ = msg_tx
+                    .send(format!("\"{}\" already downloaded", name))
+                    .await;
+                if stats.finished {
+                    // Suppresses a duplicate completion notice back in the
+                    // loop.
+                    let _ = finished_tx.send(id).await;
+                }
+            } else {
+                tracing::info!("Added torrent {}", id);
+                // The only "added" the UI ever says: the torrent exists now,
+                // with a row.
+                let _ = msg_tx.send(format!("\u{2713} Added \"{}\"", name)).await;
+            }
+        }
+        Err(e) => {
+            let msg = add_error_message(engine, &e, stripped_udp);
+            let _ = msg_tx.send(msg).await;
+            tracing::error!("Failed to add torrent: {}", e);
+        }
+    }
+}
+
+/// The message for a failed add or preview. librqbit refuses a magnet it has
+/// no way to resolve; under the proxy lockdown that is the udp-tracker strip
+/// plus DHT off — say so, and what to do about it.
+fn add_error_message(engine: &TorrentEngine, e: &anyhow::Error, stripped_udp: usize) -> String {
+    if format!("{e:#}").contains(NO_DISCOVERY_ERROR) && engine.proxy_active() {
+        format!(
+            "\u{26a0} Cannot resolve this magnet: proxy lockdown turns DHT off and \
+             stripped {} udp:// tracker(s). Add an http(s) tracker (&tr=https://…) or \
+             unset privacy.proxy_url (restart required)",
+            stripped_udp
+        )
+    } else {
+        format!("Failed to add torrent: {}", e)
+    }
+}
+
+/// The message for a magnet that hit `METADATA_TIMEOUT`, from its pending
+/// entry as it stood when the wait ended.
+fn gave_up_message(gave_up: Option<crate::types::PendingAdd>, dht_enabled: bool) -> String {
+    let why = gave_up
+        .as_ref()
+        .map(|p| give_up_reason(p, dht_enabled))
+        .unwrap_or_default();
+    let label = gave_up.map(|p| p.label).unwrap_or_default();
+    format!(
+        "\u{26a0} Gave up on \"{}\" after {} min: no peer sent its metadata{}",
+        label,
+        METADATA_TIMEOUT.as_secs() / 60,
+        why
+    )
+}
+
+/// Clears a preview task's bookkeeping when the task ends, however it ends.
+/// `CancelPreview` aborts the task, which drops its future mid-await — cleanup
+/// written after that await would never run and would leave a "Resolving"
+/// row behind for good.
+struct PreviewTaskGuard {
+    engine: Arc<TorrentEngine>,
+    ticket: u64,
+    pending: u64,
+}
+
+impl Drop for PreviewTaskGuard {
+    fn drop(&mut self) {
+        self.engine.end_pending_add(self.pending);
+        self.engine
+            .preview_tasks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.ticket);
+    }
+}
 
 /// The tail of the give-up message: what the discovery sources were doing
 /// while nobody answered. Empty when there is nothing specific to say.
@@ -1847,25 +2139,7 @@ pub async fn run_engine(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(EngineCommand::AddTorrent(source)) => {
-                        // Proxy mode: drop udp:// trackers before the magnet
-                        // reaches librqbit (see strip_udp_trackers). Warn when
-                        // that leaves the magnet trackerless — with DHT also
-                        // off in this mode there is no discovery path left.
-                        let (source, stripped_udp) = if engine.proxy_active() && source.starts_with("magnet:?") {
-                            let stripped = strip_udp_trackers(&source);
-                            if stripped.removed > 0 && stripped.trackers_left == 0 {
-                                let _ = msg_tx
-                                    .send(
-                                        "\u{26a0} Proxy mode: magnet had only udp:// trackers \
-                                         (unusable through a SOCKS5 proxy) — it may not find peers"
-                                            .to_string(),
-                                    )
-                                    .await;
-                            }
-                            (stripped.magnet, stripped.removed)
-                        } else {
-                            (source, 0)
-                        };
+                        let (source, stripped_udp) = prepare_source(&engine, source, &msg_tx).await;
                         // Off the command loop, deliberately. For a magnet,
                         // `add_torrent` does not return until librqbit has
                         // resolved its metadata from the swarm — seconds
@@ -1895,81 +2169,90 @@ pub async fn run_engine(
                                 Err(_) => engine.pending_add(ticket),
                             };
                             engine.end_pending_add(ticket);
-                            let outcome = match outcome {
-                                Ok(outcome) => outcome,
+                            match outcome {
+                                Ok(outcome) => {
+                                    report_add_outcome(&engine, &msg_tx, &finished_tx, outcome, stripped_udp)
+                                        .await;
+                                }
                                 Err(_) => {
-                                    let why = gave_up
-                                        .as_ref()
-                                        .map(|p| give_up_reason(p, dht_enabled))
-                                        .unwrap_or_default();
-                                    let label = gave_up.map(|p| p.label).unwrap_or_default();
-                                    let msg = format!(
-                                        "\u{26a0} Gave up on \"{}\" after {} min: no peer sent its \
-                                         metadata{}",
-                                        label,
-                                        METADATA_TIMEOUT.as_secs() / 60,
-                                        why
-                                    );
+                                    let msg = gave_up_message(gave_up, dht_enabled);
                                     tracing::warn!("{msg}");
                                     let _ = msg_tx.send(msg).await;
-                                    return;
-                                }
-                            };
-                            match outcome {
-                                Ok((id, handle, already_managed)) => {
-                                    // Recorded by hash once the add resolves —
-                                    // the only moment both the strip count and
-                                    // the hash are in one place. The doctor
-                                    // reads it to explain a torrent that has
-                                    // "no trackers" under the proxy lockdown.
-                                    engine
-                                        .capture
-                                        .note_stripped_udp(&handle.info_hash().as_string(), stripped_udp);
-                                    let stats = handle.stats();
-                                    let raw =
-                                        handle.name().unwrap_or_else(|| "Unknown".to_string());
-                                    let name = sanitize_display(&raw);
-                                    if already_managed || stats.finished {
-                                        let _ = msg_tx
-                                            .send(format!("\"{}\" already downloaded", name))
-                                            .await;
-                                        if stats.finished {
-                                            // Suppresses a duplicate completion
-                                            // notice back in the loop.
-                                            let _ = finished_tx.send(id).await;
-                                        }
-                                    } else {
-                                        tracing::info!("Added torrent {}", id);
-                                        // The only "added" the UI ever says:
-                                        // the torrent exists now, with a row.
-                                        let _ = msg_tx
-                                            .send(format!("\u{2713} Added \"{}\"", name))
-                                            .await;
-                                    }
-                                }
-                                Err(e) => {
-                                    let text = format!("{e:#}");
-                                    // librqbit refuses a magnet it has no way
-                                    // to resolve. Under the proxy lockdown
-                                    // that is the udp-tracker strip plus DHT
-                                    // off — say so, and what to do about it.
-                                    let msg = if text.contains(NO_DISCOVERY_ERROR)
-                                        && engine.proxy_active()
-                                    {
-                                        format!(
-                                            "\u{26a0} Cannot resolve this magnet: proxy lockdown \
-                                             turns DHT off and stripped {} udp:// tracker(s). Add \
-                                             an http(s) tracker (&tr=https://…) or unset \
-                                             privacy.proxy_url (restart required)",
-                                            stripped_udp
-                                        )
-                                    } else {
-                                        format!("Failed to add torrent: {}", e)
-                                    };
-                                    let _ = msg_tx.send(msg).await;
-                                    tracing::error!("Failed to add torrent: {}", e);
                                 }
                             }
+                        });
+                    }
+                    Some(EngineCommand::PreviewTorrent { ticket, source }) => {
+                        let (source, stripped_udp) = prepare_source(&engine, source, &msg_tx).await;
+                        // Off the loop for the same reason as `AddTorrent`, and
+                        // registered as a pending add so the doctor can explain
+                        // a slow magnet the same way.
+                        let task_engine = engine.clone();
+                        let info_tx = info_tx.clone();
+                        let pending = engine.begin_pending_add(&source);
+                        let dht_enabled = engine.session().get_dht().is_some();
+                        // Locked across the spawn, so the task's guard (which
+                        // takes this lock to remove the entry) cannot run
+                        // before the entry exists — a fast `.torrent` preview
+                        // would otherwise leave a stale handle behind.
+                        let mut tasks = engine
+                            .preview_tasks
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        let task = tokio::spawn(async move {
+                            let _guard = PreviewTaskGuard {
+                                engine: task_engine.clone(),
+                                ticket,
+                                pending,
+                            };
+                            let engine = task_engine;
+                            let outcome = tokio::time::timeout(
+                                METADATA_TIMEOUT,
+                                engine.preview_torrent(&source, stripped_udp),
+                            )
+                            .await;
+                            let result = match outcome {
+                                Ok(Ok(preview)) => Ok(preview),
+                                Ok(Err(e)) => {
+                                    tracing::error!("Failed to preview torrent: {e:#}");
+                                    Err(add_error_message(&engine, &e, stripped_udp))
+                                }
+                                Err(_) => {
+                                    let msg = gave_up_message(engine.pending_add(pending), dht_enabled);
+                                    tracing::warn!("{msg}");
+                                    Err(msg)
+                                }
+                            };
+                            let _ = info_tx
+                                .send(EngineInfo::Preview(PreviewOutcome { ticket, result }))
+                                .await;
+                        });
+                        tasks.insert(ticket, task.abort_handle());
+                    }
+                    Some(EngineCommand::CancelPreview(ticket)) => {
+                        let task = engine
+                            .preview_tasks
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&ticket);
+                        // Dropping the future stops librqbit's resolution; the
+                        // task's guard clears the pending entry.
+                        if let Some(task) = task {
+                            task.abort();
+                        }
+                    }
+                    Some(EngineCommand::AddPrepared { prepared, only_files, output_folder }) => {
+                        // No metadata to wait for, but librqbit still opens
+                        // (and may create) files before it answers.
+                        let engine = engine.clone();
+                        let msg_tx = msg_tx.clone();
+                        let finished_tx = finished_tx.clone();
+                        tokio::spawn(async move {
+                            let stripped_udp = prepared.stripped_udp;
+                            let outcome = engine
+                                .add_prepared(prepared, only_files, &output_folder)
+                                .await;
+                            report_add_outcome(&engine, &msg_tx, &finished_tx, outcome, stripped_udp).await;
                         });
                     }
                     Some(EngineCommand::Pause(id)) => {
@@ -2201,6 +2484,36 @@ pub async fn run_engine(
 
 #[cfg(test)]
 mod tests {
+    /// A multi-file `.torrent` with a BEP 47 padding file between its two
+    /// real files, bencoded by hand (keys sorted, as the format requires).
+    fn padded_torrent() -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(b"d4:infod5:filesl");
+        t.extend_from_slice(b"d6:lengthi10e4:pathl3:dir5:a.txtee");
+        t.extend_from_slice(b"d4:attr1:p6:lengthi6e4:pathl4:.pad1:6ee");
+        t.extend_from_slice(b"d6:lengthi7e4:pathl5:b.binee");
+        t.extend_from_slice(b"e4:name4:Test12:piece lengthi16384e6:pieces20:");
+        t.extend_from_slice(&[0u8; 20]);
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    #[test]
+    fn preview_files_skip_padding_and_keep_librqbit_indices() {
+        let bytes = padded_torrent();
+        let meta = librqbit::torrent_from_bytes(&bytes).expect("parses");
+        let info = meta.info.data.validate().expect("valid");
+        let files = super::preview_files(&info);
+        assert_eq!(files.len(), 2, "the padding file is left out");
+        assert_eq!(files[0].index, 0);
+        assert_eq!(files[0].components, vec!["dir", "a.txt"]);
+        assert_eq!(files[0].path, "dir/a.txt");
+        assert_eq!(files[0].size, 10);
+        // Index 1 was the padding file; only_files must still say 2.
+        assert_eq!(files[1].index, 2);
+        assert_eq!(files[1].path, "b.bin");
+    }
+
     use super::*;
 
     #[test]
