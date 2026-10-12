@@ -26,10 +26,12 @@ mod add_picker;
 mod app;
 mod config;
 mod engine;
+mod file_tree;
 mod health;
 mod instance;
 mod opener;
 mod player;
+mod recent_dirs;
 mod search;
 mod theme;
 mod types;
@@ -936,6 +938,7 @@ async fn run_app(
     // Absolute, as librqbit resolves it: the add picker joins relative
     // folders onto this, and must not do it to a relative one twice.
     app.download_dir = add_picker::absolute_dir(&config.general.download_dir);
+    app.recent_dirs = recent_dirs::RecentDirs::load(session_dir);
     // An unknown id in the config falls back to `system` (see `theme::by_name`),
     // so a stale or hand-edited value never stops the app from starting.
     app.set_theme(&config.ui.theme);
@@ -1116,7 +1119,7 @@ async fn run_app(
                 let view_mode = match app.mode {
                     AppMode::Palette => app.palette.return_mode.clone(),
                     AppMode::ThemeSelect => app.theme_select.return_mode.clone(),
-                    AppMode::AddPicker => AppMode::Normal,
+                    AppMode::AddPicker => app.add_picker_return.clone(),
                     _ => app.mode.clone(),
                 };
                 match view_mode {
@@ -1714,7 +1717,7 @@ async fn handle_input_mode(
             match validate_torrent_source(&value) {
                 Ok(()) if app.input_pick => {
                     let label = engine::torrent::pending_add_label(&value);
-                    start_preview(app, value, label, cmd_tx).await;
+                    start_preview(app, value, label, AppMode::Normal, None, cmd_tx).await;
                 }
                 Ok(()) => {
                     // A magnet has nothing to show until a peer answers;
@@ -1880,6 +1883,7 @@ async fn handle_search_results_mode(
         KeyCode::Char('R') => app.reverse_result_sort(),
         KeyCode::Char('r') => retry_search(app, search_tx, search_client),
         KeyCode::Enter => download_selected_result(app, cmd_tx).await,
+        KeyCode::Char('A') => pick_selected_result(app, cmd_tx).await,
         _ => {}
     }
 }
@@ -1894,19 +1898,17 @@ fn retry_search(
     }
 }
 
-/// Add the highlighted search result through the same `AddTorrent` path as
-/// the manual flow.
-async fn download_selected_result(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+/// The highlighted search result as `(info hash, title, magnet)`, or `None`
+/// with the reason already on the status bar. Shared by Enter and `A`, so
+/// both refuse the same things.
+fn selected_result_magnet(app: &mut App) -> Option<(String, String, String)> {
     if app.search.in_flight {
-        return;
+        return None;
     }
     // Borrow-scope the read like handle_stream_keypress does.
-    let picked = app
+    let (info_hash, title) = app
         .selected_search_result()
-        .map(|r| (r.info_hash.clone(), r.title.clone()));
-    let Some((info_hash, title)) = picked else {
-        return;
-    };
+        .map(|r| (r.info_hash.clone(), r.title.clone()))?;
     // Block a re-send only while the torrent is actually in the
     // session: after a delete (or a failed add) the hash is still in
     // `added` for the ✓ mark, but Enter must work again. In the brief
@@ -1915,7 +1917,7 @@ async fn download_selected_result(app: &mut App, cmd_tx: &mpsc::Sender<EngineCom
     // answers "already downloaded" — that backstop is the design.
     if app.search.added.contains(&info_hash) && app.torrent_in_session(&info_hash) {
         app.set_info(format!("Already added: {}", title));
-        return;
+        return None;
     }
     let magnet = search::build_magnet(&info_hash, &title);
     // Belt-and-braces: the same gate the manual flow uses. Parse-time
@@ -1923,8 +1925,17 @@ async fn download_selected_result(app: &mut App, cmd_tx: &mpsc::Sender<EngineCom
     // invariant broke, and then an error beats a corrupt command.
     if let Err(e) = validate_magnet(&magnet) {
         app.set_error(e);
-        return;
+        return None;
     }
+    Some((info_hash, title, magnet))
+}
+
+/// Add the highlighted search result through the same `AddTorrent` path as
+/// the manual flow.
+async fn download_selected_result(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    let Some((info_hash, title, magnet)) = selected_result_magnet(app) else {
+        return;
+    };
     send_cmd(cmd_tx, EngineCommand::AddTorrent(magnet), app).await;
     app.search.added.insert(info_hash);
     // Stay in the results for multi-grab. Not "Added": a magnet is only a
@@ -1933,6 +1944,23 @@ async fn download_selected_result(app: &mut App, cmd_tx: &mpsc::Sender<EngineCom
     // "Added" itself when the row exists; until then the list shows it
     // under "Resolving".
     app.set_info(resolving_notice(&title));
+}
+
+/// `A` on a search result: the add picker, coming back to the results.
+async fn pick_selected_result(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    let Some((info_hash, title, magnet)) = selected_result_magnet(app) else {
+        return;
+    };
+    let label = crate::ui::util::truncate(&title, 40);
+    start_preview(
+        app,
+        magnet,
+        label,
+        AppMode::SearchResults,
+        Some((info_hash, title)),
+        cmd_tx,
+    )
+    .await;
 }
 
 /// What the UI says when a magnet has been handed to the engine: what is
@@ -2072,11 +2100,14 @@ async fn apply_file_selection(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand
 
 /// Ask the engine for a torrent's file list and open the picker's "fetching"
 /// box. Each preview gets a fresh ticket so a late answer for a picker that
-/// has since closed is recognised and dropped.
+/// has since closed is recognised and dropped. `return_to` is where closing
+/// the picker goes back to; `result` is the search result it was opened on.
 async fn start_preview(
     app: &mut App,
     source: String,
     label: String,
+    return_to: AppMode,
+    result: Option<(String, String)>,
     cmd_tx: &mpsc::Sender<EngineCommand>,
 ) {
     app.preview_ticket += 1;
@@ -2087,7 +2118,7 @@ async fn start_preview(
     {
         tracing::error!("engine channel send failed: {e}");
         app.set_error("Engine stopped responding".to_string());
-        app.mode = AppMode::Normal;
+        app.mode = return_to;
         return;
     }
     app.add_picker = Some(AddPickerState::Resolving {
@@ -2095,16 +2126,26 @@ async fn start_preview(
         label,
         since: std::time::Instant::now(),
     });
+    app.add_picker_return = return_to;
+    app.add_picker_result = result;
     app.mode = AppMode::AddPicker;
+}
+
+/// Drop the picker and go back to where it was opened from.
+fn leave_add_picker(app: &mut App) {
+    app.add_picker = None;
+    app.add_picker_result = None;
+    app.mode = std::mem::replace(&mut app.add_picker_return, AppMode::Normal);
 }
 
 /// Close the picker without adding. A preview still resolving is stopped,
 /// so the swarm is not asked for metadata nobody will look at.
 async fn close_add_picker(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
-    if let Some(AddPickerState::Resolving { ticket, .. }) = app.add_picker.take() {
+    if let Some(AddPickerState::Resolving { ticket, .. }) = &app.add_picker {
+        let ticket = *ticket;
         send_cmd(cmd_tx, EngineCommand::CancelPreview(ticket), app).await;
     }
-    app.mode = AppMode::Normal;
+    leave_add_picker(app);
 }
 
 /// Enter in the picker: add with the chosen files and folder, or say why not
@@ -2120,8 +2161,16 @@ async fn confirm_add_picker(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>)
             return;
         }
     };
-    app.add_picker = None;
-    app.mode = AppMode::Normal;
+    if let Some((info_hash, _)) = app.add_picker_result.take() {
+        // The ✓ in the results, as Enter would have set it.
+        app.search.added.insert(info_hash);
+    }
+    leave_add_picker(app);
+    app.recent_dirs.push(&done.folder_typed, &app.download_dir);
+    if let Err(e) = app.recent_dirs.save() {
+        // Only the `↑` convenience is lost; the add itself goes ahead.
+        tracing::warn!("saving recent folders failed: {e}");
+    }
     // The engine reports "✓ Added" itself once the torrent exists.
     send_cmd(
         cmd_tx,
@@ -2146,17 +2195,19 @@ fn apply_preview(app: &mut App, outcome: PreviewOutcome) {
     }
     match outcome.result {
         Ok(PreviewResult::Ready(preview)) => {
-            let picker = Picker::new(*preview, &app.download_dir);
+            let recents = app.recent_dirs.list().to_vec();
+            let picker = Picker::new(*preview, &app.download_dir, recents);
             app.add_picker = Some(AddPickerState::Ready(Box::new(picker)));
         }
         Ok(PreviewResult::AlreadyInList(name)) => {
-            app.add_picker = None;
-            app.mode = AppMode::Normal;
+            if let Some((info_hash, _)) = app.add_picker_result.take() {
+                app.search.added.insert(info_hash);
+            }
+            leave_add_picker(app);
             app.set_info(format!("\"{name}\" is already in your list"));
         }
         Err(why) => {
-            app.add_picker = None;
-            app.mode = AppMode::Normal;
+            leave_add_picker(app);
             app.set_error(why);
         }
     }
@@ -2233,6 +2284,9 @@ fn picker_key(picker: &mut Picker, code: KeyCode, ctrl: bool) -> PickerKey {
             KeyCode::Char('i') => picker.invert_visible(),
             KeyCode::Char('r') => picker.restore(),
             KeyCode::Char('s') => picker.cycle_sort(),
+            KeyCode::Char('t') => picker.toggle_view(),
+            KeyCode::Char('l') | KeyCode::Right => picker.expand_current(),
+            KeyCode::Char('h') | KeyCode::Left => picker.collapse_current(),
             KeyCode::Char('/') => picker.focus = Focus::Filter,
             KeyCode::Tab | KeyCode::BackTab => picker.focus = Focus::Folder,
             KeyCode::Enter => return PickerKey::Confirm,
@@ -2256,6 +2310,8 @@ fn picker_key(picker: &mut Picker, code: KeyCode, ctrl: bool) -> PickerKey {
             KeyCode::Esc | KeyCode::BackTab => picker.focus = Focus::List,
             KeyCode::Enter => return PickerKey::Confirm,
             KeyCode::Tab => picker.complete_folder(add_picker::list_subdirs),
+            KeyCode::Up => picker.recent_older(),
+            KeyCode::Down => picker.recent_newer(),
             KeyCode::Backspace => picker.folder_pop(),
             KeyCode::Char('u') if ctrl => picker.folder_clear(),
             KeyCode::Char(c) if !ctrl => picker.folder_push(c),
@@ -2308,6 +2364,7 @@ async fn execute_action(
         A::StreamFile => handle_stream_keypress(app),
         A::DetailBack => detail_back(app, cmd_tx).await,
         A::DownloadResult => download_selected_result(app, cmd_tx).await,
+        A::PickResult => pick_selected_result(app, cmd_tx).await,
         A::EditQuery => app.mode = AppMode::Search,
         A::RetrySearch => retry_search(app, search_tx, search_client),
         A::CycleResultSort => app.cycle_result_sort(),
@@ -3813,6 +3870,113 @@ mod tests {
         assert!(app.search.sort_reversed, "R flips the direction");
         // Sorting stays in the results view; nothing reaches the engine.
         assert_eq!(app.mode, AppMode::SearchResults);
+    }
+
+    /// `A` on the fixture result, answered with a ready preview. Returns the
+    /// app in the picker, opened over the results.
+    async fn picker_from_search(
+        tx: &mpsc::Sender<EngineCommand>,
+        rx: &mut mpsc::Receiver<EngineCommand>,
+    ) -> App {
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.download_dir = "/dl".to_string();
+        app.mode = AppMode::SearchResults;
+        app.search.results = vec![search_result_fixture()];
+        handle_search_results_mode(
+            &mut app,
+            key(KeyCode::Char('A')),
+            tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.mode, AppMode::AddPicker);
+        let ticket = match rx.try_recv().expect("a command") {
+            EngineCommand::PreviewTorrent { ticket, source } => {
+                assert!(source.contains(&search_result_fixture().info_hash));
+                assert!(validate_magnet(&source).is_ok());
+                ticket
+            }
+            other => panic!("expected PreviewTorrent, got {other:?}"),
+        };
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        app
+    }
+
+    #[tokio::test]
+    async fn a_on_a_search_result_adds_through_the_picker_and_comes_back() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = picker_from_search(&tx, &mut rx).await;
+        assert!(app.in_search_view(), "the results stay underneath");
+        handle_add_picker_mode(&mut app, key(KeyCode::Enter), &tx).await;
+        assert!(matches!(
+            rx.try_recv().expect("a command"),
+            EngineCommand::AddPrepared { .. }
+        ));
+        assert_eq!(app.mode, AppMode::SearchResults, "back to the results");
+        assert!(app
+            .search
+            .added
+            .contains(&search_result_fixture().info_hash));
+    }
+
+    #[tokio::test]
+    async fn esc_from_a_search_picker_returns_without_marking() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = picker_from_search(&tx, &mut rx).await;
+        handle_add_picker_mode(&mut app, key(KeyCode::Esc), &tx).await;
+        assert_eq!(app.mode, AppMode::SearchResults);
+        assert!(app.search.added.is_empty());
+        assert!(rx.try_recv().is_err(), "nothing to cancel once ready");
+        // And the next `A` from the plain list goes back to the list.
+        assert_eq!(app.add_picker_return, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn confirming_remembers_the_folder_for_next_time() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        app.download_dir = "/dl".to_string();
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        handle_add_picker_mode(&mut app, key(KeyCode::Tab), &tx).await;
+        handle_add_picker_mode(&mut app, ctrl(KeyCode::Char('u')), &tx).await;
+        for c in "/srv/tv".chars() {
+            handle_add_picker_mode(&mut app, key(KeyCode::Char(c)), &tx).await;
+        }
+        handle_add_picker_mode(&mut app, key(KeyCode::Enter), &tx).await;
+        assert_eq!(app.recent_dirs.list(), ["/srv/tv"]);
+
+        // The next picker offers it with ↑.
+        let _ = rx.try_recv();
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        handle_add_picker_mode(&mut app, key(KeyCode::Tab), &tx).await;
+        handle_add_picker_mode(&mut app, key(KeyCode::Up), &tx).await;
+        match &app.add_picker {
+            Some(AddPickerState::Ready(p)) => assert_eq!(p.folder.as_str(), "/srv/tv"),
+            _ => panic!("picker should be open"),
+        }
     }
 
     #[tokio::test]

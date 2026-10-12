@@ -26,6 +26,7 @@ use crate::actions::{fuzzy_score, palette_scope, tui_description, ActionInfo, Sc
 use crate::add_picker::AddPickerState;
 use crate::config::{PlayerConfig, SearchConfig};
 use crate::health;
+use crate::recent_dirs::RecentDirs;
 use crate::search::{SearchOutcome, SearchResult};
 use crate::theme::{self, Theme};
 use crate::types::{AppMode, DetailTab, NetworkHealth, SortColumn, TorrentInfo, TorrentStatus};
@@ -373,6 +374,14 @@ pub struct App {
     pub preview_ticket: u64,
     /// Whether the add bar is the `A` flavour, which goes on to the picker.
     pub input_pick: bool,
+    /// The mode the picker returns to: the torrent list, or the search
+    /// results it was opened from.
+    pub add_picker_return: AppMode,
+    /// `(info hash, title)` of the search result the picker is adding, so
+    /// confirming can mark it added the way Enter does.
+    pub add_picker_result: Option<(String, String)>,
+    /// Save folders the picker was confirmed with; see [`RecentDirs`].
+    pub recent_dirs: RecentDirs,
     /// Scroll offset of the help overlay. The registry-driven table outgrew
     /// a 24-line terminal, so the overlay scrolls; reset when help opens and
     /// clamped against the visible height by the renderer.
@@ -456,6 +465,9 @@ impl App {
             add_picker: None,
             preview_ticket: 0,
             input_pick: false,
+            add_picker_return: AppMode::Normal,
+            add_picker_result: None,
+            recent_dirs: RecentDirs::default(),
             help_scroll: 0,
             progress_marks: HashMap::new(),
             stalled_ids: HashSet::new(),
@@ -1311,6 +1323,7 @@ impl App {
             AppMode::Search | AppMode::SearchResults => return true,
             AppMode::Palette => self.palette.return_mode.clone(),
             AppMode::ThemeSelect => self.theme_select.return_mode.clone(),
+            AppMode::AddPicker => self.add_picker_return.clone(),
             _ => return false,
         };
         matches!(underlying, AppMode::Search | AppMode::SearchResults)

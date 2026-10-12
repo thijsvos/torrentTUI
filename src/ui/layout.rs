@@ -370,10 +370,13 @@ fn add_picker_hints(app: &App) -> &'static str {
     match &app.add_picker {
         Some(AddPickerState::Ready(picker)) => match picker.focus {
             Focus::List => {
-                "Space:toggle  a/n/i:all/none/invert  r:reset  s:sort  /:filter  Tab:folder  \
-                 Enter:add  Esc:cancel"
+                "Space:toggle  a/n/i:all/none/invert  /:filter  Tab:folder  Enter:add  \
+                 t:tree/flat  h/l:fold  s:sort  r:reset  Esc:cancel"
             }
             Focus::Filter => "type to filter  Enter:back to files  Esc:clear",
+            Focus::Folder if picker.has_recents() => {
+                "Tab:complete  \u{2191}/\u{2193}:recent  Ctrl+U:clear  Esc:back to files  Enter:add"
+            }
             Focus::Folder => "Tab:complete  Ctrl+U:clear  Esc:back to files  Enter:add",
         },
         _ => "Esc:cancel",

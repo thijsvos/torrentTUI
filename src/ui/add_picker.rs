@@ -17,8 +17,9 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::add_picker::{AddPickerState, Focus, Picker};
+use crate::add_picker::{AddPickerState, Focus, Picker, View};
 use crate::app::App;
+use crate::file_tree::Check;
 use crate::theme::Theme;
 use crate::ui::layout::format_size;
 use crate::ui::util::truncate;
@@ -196,26 +197,49 @@ fn render_files(f: &mut Frame, area: Rect, picker: &mut Picker, theme: Theme) {
     }
     // Highlight symbol (2) + checkbox (3) + size (10) + two column gaps.
     let path_width = (area.width as usize).saturating_sub(17).max(3);
-    let rows: Vec<Row> = picker
-        .visible()
-        .iter()
-        .map(|&pos| {
-            let file = &picker.files[pos];
-            let on = picker.is_selected(pos);
-            let (check, check_style) = if on {
-                ("[\u{2713}]", Style::default().fg(theme.success))
-            } else {
-                ("[ ]", Style::default().fg(theme.muted))
-            };
-            let ink = if on { theme.text } else { theme.text_dim };
-            Row::new(vec![
-                Cell::from(check).style(check_style),
-                Cell::from(truncate(&file.path, path_width)).style(Style::default().fg(ink)),
-                Cell::from(Line::from(format_size(file.size)).right_aligned())
-                    .style(Style::default().fg(theme.muted)),
-            ])
-        })
-        .collect();
+    let rows: Vec<Row> = match picker.view {
+        View::Flat => picker
+            .visible()
+            .iter()
+            .map(|&pos| {
+                let file = &picker.files[pos];
+                let check = if picker.is_selected(pos) {
+                    Check::All
+                } else {
+                    Check::None
+                };
+                file_row(check, truncate(&file.path, path_width), file.size, theme)
+            })
+            .collect(),
+        View::Tree => picker
+            .tree_rows()
+            .iter()
+            .map(|row| {
+                let node = picker.tree.node(row.node);
+                let indent = "  ".repeat(row.depth);
+                let (check, label) = if node.is_dir() {
+                    let fold = if picker.is_expanded(row.node) {
+                        "\u{25be}"
+                    } else {
+                        "\u{25b8}"
+                    };
+                    (
+                        picker.check(row.node),
+                        format!("{indent}{fold} {}/", node.name),
+                    )
+                } else {
+                    let pos = node.file.unwrap_or_default();
+                    let check = if picker.is_selected(pos) {
+                        Check::All
+                    } else {
+                        Check::None
+                    };
+                    (check, format!("{indent}  {}", node.name))
+                };
+                file_row(check, truncate(&label, path_width), node.size, theme)
+            })
+            .collect(),
+    };
     // The cursor row stands out only while the list has the keys, so it is
     // clear which part of the picker typing goes to.
     let highlight = if picker.focus == Focus::List {
@@ -236,6 +260,26 @@ fn render_files(f: &mut Frame, area: Rect, picker: &mut Picker, theme: Theme) {
     .row_highlight_style(highlight)
     .highlight_symbol("\u{25b6} ");
     f.render_stateful_widget(table, area, &mut picker.table_state);
+}
+
+fn file_row(check: Check, label: String, size: u64, theme: Theme) -> Row<'static> {
+    let (mark, mark_style) = match check {
+        Check::All => ("[\u{2713}]", Style::default().fg(theme.success)),
+        // Part of a folder: neither ticked nor empty.
+        Check::Some => ("[~]", Style::default().fg(theme.warning)),
+        Check::None => ("[ ]", Style::default().fg(theme.muted)),
+    };
+    let ink = if check == Check::None {
+        theme.text_dim
+    } else {
+        theme.text
+    };
+    Row::new(vec![
+        Cell::from(mark).style(mark_style),
+        Cell::from(label).style(Style::default().fg(ink)),
+        Cell::from(Line::from(format_size(size)).right_aligned())
+            .style(Style::default().fg(theme.muted)),
+    ])
 }
 
 /// The last `width` columns of `s`, with a leading `…` when cut: the end of
@@ -263,7 +307,13 @@ fn folder_line(picker: &Picker, width: usize, theme: Theme) -> Line<'static> {
     } else {
         Style::default().fg(theme.muted)
     };
-    let room = width.saturating_sub(12).max(4);
+    // Measured first: a long path is cut to make room for it, not the
+    // other way round.
+    let recent = picker
+        .recent_position()
+        .map(|(n, of)| format!("  recent {n}/{of}"))
+        .unwrap_or_default();
+    let room = width.saturating_sub(12 + recent.len()).max(4);
     let mut spans = vec![
         Span::styled(" Save to: ", label_style),
         Span::styled(
@@ -274,6 +324,7 @@ fn folder_line(picker: &Picker, width: usize, theme: Theme) -> Line<'static> {
     if focused {
         spans.push(Span::styled(CURSOR, Style::default().fg(theme.text)));
     }
+    spans.push(Span::styled(recent, Style::default().fg(theme.muted)));
     Line::from(spans)
 }
 
@@ -380,7 +431,11 @@ mod tests {
             },
         };
         let mut app = App::new();
-        app.add_picker = Some(AddPickerState::Ready(Box::new(Picker::new(preview, "/dl"))));
+        app.add_picker = Some(AddPickerState::Ready(Box::new(Picker::new(
+            preview,
+            "/dl",
+            Vec::new(),
+        ))));
         app
     }
 
@@ -398,13 +453,50 @@ mod tests {
         let text = screen(&mut app, 100, 30);
         assert!(text.contains("Add \u{b7} The Show"), "{text}");
         assert!(text.contains("3 files"), "{text}");
-        let row = |name: &str| text.lines().find(|l| l.contains(name)).unwrap_or_default();
-        assert!(row("Season 1/e01.mkv").contains("[\u{2713}]"), "{text}");
-        assert!(row("notes.txt").contains("[ ]"), "{text}");
         assert!(text.contains("Save to: /dl"), "{text}");
         assert!(text.contains("/dl/The Show"), "{text}");
         assert!(text.contains("Selected 2/3 files"), "{text}");
         assert!(text.contains("1.00 GB free"), "{text}");
+
+        // Opens in the tree: the folder row, its files indented under it.
+        let row = |text: &str, name: &str| {
+            text.lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(
+            row(&text, "\u{25be} Season 1/").contains("[\u{2713}]"),
+            "{text}"
+        );
+        assert!(row(&text, "e02.mkv").contains("[\u{2713}]"), "{text}");
+        assert!(row(&text, "notes.txt").contains("[ ]"), "{text}");
+
+        // The flat list shows full paths.
+        if let Some(AddPickerState::Ready(p)) = app.add_picker.as_mut() {
+            p.toggle_view();
+        }
+        let text = screen(&mut app, 100, 30);
+        assert!(
+            row(&text, "Season 1/e01.mkv").contains("[\u{2713}]"),
+            "{text}"
+        );
+        assert!(row(&text, "notes.txt").contains("[ ]"), "{text}");
+    }
+
+    #[test]
+    fn a_partly_selected_folder_shows_a_tilde() {
+        let mut app = ready_app();
+        if let Some(AddPickerState::Ready(p)) = app.add_picker.as_mut() {
+            p.move_by(1); // Season 1/e01.mkv
+            p.toggle_current();
+        }
+        let text = screen(&mut app, 100, 30);
+        let line = text
+            .lines()
+            .find(|l| l.contains("Season 1/"))
+            .unwrap_or_default();
+        assert!(line.contains("[~]"), "{text}");
     }
 
     #[test]
@@ -447,6 +539,34 @@ mod tests {
             since: Instant::now(),
         });
         screen(&mut app, 12, 5);
+    }
+
+    #[test]
+    fn a_long_recent_folder_still_shows_its_position() {
+        let long = format!("/{}", "deep/".repeat(40));
+        let preview = TorrentPreview {
+            name: "x".to_string(),
+            files: vec![PreviewFile {
+                index: 0,
+                components: vec!["a.iso".to_string()],
+                path: "a.iso".to_string(),
+                size: 1,
+            }],
+            preselected: None,
+            subfolder: None,
+            prepared: PreparedTorrent {
+                bytes: Vec::new(),
+                initial_peers: Vec::new(),
+                stripped_udp: 0,
+            },
+        };
+        let mut picker = Picker::new(preview, "/dl", vec![long]);
+        picker.focus = Focus::Folder;
+        picker.recent_older();
+        let mut app = App::new();
+        app.add_picker = Some(AddPickerState::Ready(Box::new(picker)));
+        let text = screen(&mut app, 100, 30);
+        assert!(text.contains("recent 1/1"), "{text}");
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! The only filesystem access is in [`list_subdirs`] (Tab completion) and in
 //! [`Picker::confirm`]'s last-moment check, both on an explicit keypress.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use ratatui::widgets::TableState;
 
 use crate::actions::fuzzy_score;
 use crate::config::expand_tilde;
+use crate::file_tree::{Check, FileTree, NodeId, TreeRow};
 use crate::types::{PreparedTorrent, PreviewFile, TorrentPreview};
 use crate::ui::input::InputWidget;
 
@@ -63,6 +65,15 @@ pub enum Focus {
     Folder,
 }
 
+/// How the file list is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// One row per file, full paths.
+    Flat,
+    /// Folders that open and close; one row can stand for a whole season.
+    Tree,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerSort {
     /// The order the torrent lists its files in.
@@ -99,6 +110,9 @@ pub struct Confirmed {
     /// Where the torrent's files go: the chosen folder plus the torrent's own
     /// subfolder, as librqbit would have laid it out in the download dir.
     pub output_folder: PathBuf,
+    /// The folder as typed, before the subfolder is joined — what goes into
+    /// the recent-folders list, so the same base can be picked again.
+    pub folder_typed: String,
 }
 
 /// The free-space reading for one folder.
@@ -150,8 +164,26 @@ pub struct Picker {
     pub page_size: usize,
     /// Positions in `files`, in display order: filtered and sorted.
     visible: Vec<usize>,
+    /// `visible` as a set while a filter is active: what the tree shows and
+    /// what folder keys act on.
+    matches: Option<HashSet<usize>>,
     /// The filter fell back to fuzzy matching (nothing contains the text).
     pub fuzzy: bool,
+    pub view: View,
+    pub tree: FileTree,
+    /// Open folders in the tree view.
+    expanded: HashSet<NodeId>,
+    /// The tree as currently shown.
+    tree_rows: Vec<TreeRow>,
+    /// The tree row under the cursor, by node — stable across re-filtering
+    /// for the same reason `anchor` is.
+    tree_anchor: Option<NodeId>,
+    /// Recent save folders, newest first, for `↑`/`↓` in the folder field.
+    recents: Vec<String>,
+    /// Which recent folder the field shows, while stepping through them.
+    recent_at: Option<usize>,
+    /// What was typed before `↑` started stepping, for `↓` to come back to.
+    draft: String,
     /// Position in `files` of the row under the cursor. Tracked by item, not
     /// row number, so re-filtering never slides another file under it.
     anchor: Option<usize>,
@@ -168,7 +200,7 @@ pub struct Picker {
 }
 
 impl Picker {
-    pub fn new(preview: TorrentPreview, download_dir: &str) -> Self {
+    pub fn new(preview: TorrentPreview, download_dir: &str, recents: Vec<String>) -> Self {
         let selected: Vec<bool> = match &preview.preselected {
             Some(wanted) => preview
                 .files
@@ -179,6 +211,15 @@ impl Picker {
         };
         let mut folder = InputWidget::with_cap(MAX_FOLDER_CHARS);
         folder.set(download_dir);
+        let tree = FileTree::build(&preview.files);
+        // Top-level folders open, deeper ones closed: a season pack shows its
+        // seasons and their episodes, a huge archive does not unfold at once.
+        let expanded: HashSet<NodeId> = tree.root_dirs().collect();
+        let view = if tree.has_folders() {
+            View::Tree
+        } else {
+            View::Flat
+        };
         let mut picker = Self {
             name: preview.name,
             initial: selected.clone(),
@@ -191,7 +232,16 @@ impl Picker {
             table_state: TableState::default(),
             page_size: 10,
             visible: Vec::new(),
+            matches: None,
             fuzzy: false,
+            view,
+            tree,
+            expanded,
+            tree_rows: Vec::new(),
+            tree_anchor: None,
+            recents,
+            recent_at: None,
+            draft: String::new(),
             anchor: None,
             subfolder: preview.subfolder,
             download_dir: download_dir.to_string(),
@@ -249,15 +299,130 @@ impl Picker {
             }
         }
         self.visible = order;
+        self.matches = (!query.is_empty()).then(|| self.visible.iter().copied().collect());
         if !self.anchor.is_some_and(|a| self.visible.contains(&a)) {
             self.anchor = self.visible.first().copied();
+        }
+        self.refresh_tree_rows();
+    }
+
+    fn refresh_tree_rows(&mut self) {
+        self.tree_rows = self
+            .tree
+            .rows(&self.expanded, self.matches.as_ref(), self.sort);
+        if !self
+            .tree_anchor
+            .is_some_and(|a| self.tree_rows.iter().any(|r| r.node == a))
+        {
+            self.tree_anchor = self.tree_rows.first().map(|r| r.node);
         }
         self.sync_table_state();
     }
 
+    pub fn tree_rows(&self) -> &[TreeRow] {
+        &self.tree_rows
+    }
+
+    /// A folder's checkbox in the tree, for the files the filter shows.
+    pub fn check(&self, node: NodeId) -> Check {
+        self.tree.check(node, &self.selected, self.matches.as_ref())
+    }
+
+    pub fn is_expanded(&self, node: NodeId) -> bool {
+        self.matches.is_some() || self.expanded.contains(&node)
+    }
+
+    /// `t`: switch between the flat list and the tree, keeping the cursor on
+    /// the same file (or, coming from a folder, on its first file shown).
+    pub fn toggle_view(&mut self) {
+        match self.view {
+            View::Flat => {
+                self.view = View::Tree;
+                if let Some(leaf) = self.anchor.and_then(|pos| self.tree.leaf(pos)) {
+                    // Open the way to it, or the cursor would land on a
+                    // hidden row.
+                    let mut at = self.tree.node(leaf).parent;
+                    while let Some(dir) = at {
+                        self.expanded.insert(dir);
+                        at = self.tree.node(dir).parent;
+                    }
+                    self.tree_anchor = Some(leaf);
+                }
+                self.refresh_tree_rows();
+            }
+            View::Tree => {
+                self.view = View::Flat;
+                if let Some(node) = self.tree_anchor {
+                    let visible = &self.visible;
+                    if let Some(&pos) = self
+                        .tree
+                        .node(node)
+                        .files
+                        .iter()
+                        .find(|p| visible.contains(p))
+                    {
+                        self.anchor = Some(pos);
+                    }
+                }
+                self.sync_table_state();
+            }
+        }
+    }
+
+    /// `l`/`→`: open the folder under the cursor.
+    pub fn expand_current(&mut self) {
+        if let Some(node) = self.tree_folder_under_cursor() {
+            self.expanded.insert(node);
+            self.refresh_tree_rows();
+        }
+    }
+
+    /// `h`/`←`: close the folder under the cursor, or step out to the folder
+    /// containing it.
+    pub fn collapse_current(&mut self) {
+        if self.view != View::Tree {
+            return;
+        }
+        let Some(node) = self.tree_anchor else {
+            return;
+        };
+        // While filtering every folder is shown open, so there is nothing to
+        // close; stepping out still works.
+        if self.matches.is_none() && self.tree.node(node).is_dir() && self.expanded.remove(&node) {
+            self.refresh_tree_rows();
+            return;
+        }
+        if let Some(parent) = self.tree.node(node).parent {
+            self.tree_anchor = Some(parent);
+            self.sync_table_state();
+        }
+    }
+
+    fn tree_folder_under_cursor(&self) -> Option<NodeId> {
+        if self.view != View::Tree {
+            return None;
+        }
+        self.tree_anchor.filter(|&n| self.tree.node(n).is_dir())
+    }
+
     fn cursor_row(&self) -> Option<usize> {
-        let anchor = self.anchor?;
-        self.visible.iter().position(|&i| i == anchor)
+        match self.view {
+            View::Flat => {
+                let anchor = self.anchor?;
+                self.visible.iter().position(|&i| i == anchor)
+            }
+            View::Tree => {
+                let anchor = self.tree_anchor?;
+                self.tree_rows.iter().position(|r| r.node == anchor)
+            }
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        match self.view {
+            View::Flat => self.visible.len(),
+            View::Tree => self.tree_rows.len(),
+        }
     }
 
     fn sync_table_state(&mut self) {
@@ -272,20 +437,33 @@ impl Picker {
     }
 
     fn move_to_row(&mut self, row: usize) {
-        if let Some(&pos) = self.visible.get(row) {
-            self.anchor = Some(pos);
-            self.sync_table_state();
+        match self.view {
+            View::Flat => {
+                if let Some(&pos) = self.visible.get(row) {
+                    self.anchor = Some(pos);
+                }
+            }
+            View::Tree => {
+                if let Some(r) = self.tree_rows.get(row) {
+                    self.tree_anchor = Some(r.node);
+                    // Keep the flat cursor alongside, for a later `t`.
+                    if let Some(pos) = self.tree.node(r.node).file {
+                        self.anchor = Some(pos);
+                    }
+                }
+            }
         }
+        self.sync_table_state();
     }
 
     /// Move the cursor by `delta` rows, clamped to the list.
     pub fn move_by(&mut self, delta: isize) {
-        if self.visible.is_empty() {
+        let count = self.row_count();
+        if count == 0 {
             return;
         }
         let row = self.cursor_row().unwrap_or(0) as isize;
-        let last = self.visible.len() as isize - 1;
-        self.move_to_row((row + delta).clamp(0, last) as usize);
+        self.move_to_row((row + delta).clamp(0, count as isize - 1) as usize);
     }
 
     pub fn page(&mut self, pages: isize) {
@@ -297,10 +475,23 @@ impl Picker {
     }
 
     pub fn bottom(&mut self) {
-        self.move_to_row(self.visible.len().saturating_sub(1));
+        self.move_to_row(self.row_count().saturating_sub(1));
     }
 
+    /// Space. On a folder: select every file under it (that the filter
+    /// shows), or deselect them all when they already are.
     pub fn toggle_current(&mut self) {
+        if self.view == View::Tree {
+            let Some(node) = self.tree_anchor else {
+                return;
+            };
+            let files = self.tree.files_in_view(node, self.matches.as_ref());
+            let on = !files.iter().all(|&f| self.selected[f]);
+            for f in files {
+                self.selected[f] = on;
+            }
+            return;
+        }
         if let Some(flag) = self.anchor.and_then(|pos| self.selected.get_mut(pos)) {
             *flag = !*flag;
         }
@@ -388,30 +579,78 @@ impl Picker {
         self.message = None;
     }
 
+    /// Typing makes the shown folder the user's own text again.
+    fn folder_edited(&mut self) {
+        self.recent_at = None;
+        self.folder_changed();
+    }
+
     pub fn folder_push(&mut self, c: char) {
         self.folder.push(c);
-        self.folder_changed();
+        self.folder_edited();
     }
 
     pub fn folder_push_str(&mut self, s: &str) {
         self.folder.push_str(s);
-        self.folder_changed();
+        self.folder_edited();
     }
 
     pub fn folder_pop(&mut self) {
         self.folder.pop();
-        self.folder_changed();
+        self.folder_edited();
     }
 
     pub fn folder_clear(&mut self) {
         self.folder.clear();
+        self.folder_edited();
+    }
+
+    /// Replace the folder outright, as a completion does.
+    pub fn folder_set(&mut self, s: &str) {
+        self.folder.set(s);
+        self.folder_edited();
+    }
+
+    /// `↑` in the folder field: the next older recent folder.
+    pub fn recent_older(&mut self) {
+        let next = self.recent_at.map_or(0, |i| i + 1);
+        let Some(dir) = self.recents.get(next).cloned() else {
+            return;
+        };
+        if self.recent_at.is_none() {
+            self.draft = self.folder.value();
+        }
+        self.recent_at = Some(next);
+        self.folder.set(&dir);
         self.folder_changed();
     }
 
-    /// Replace the folder outright (a completion or a recent folder).
-    pub fn folder_set(&mut self, s: &str) {
-        self.folder.set(s);
-        self.folder_changed();
+    /// `↓`: the next newer one, and after the newest, back to what was typed.
+    pub fn recent_newer(&mut self) {
+        match self.recent_at {
+            None => {}
+            Some(0) => {
+                self.recent_at = None;
+                let draft = std::mem::take(&mut self.draft);
+                self.folder.set(&draft);
+                self.folder_changed();
+            }
+            Some(i) => {
+                self.recent_at = Some(i - 1);
+                let dir = self.recents[i - 1].clone();
+                self.folder.set(&dir);
+                self.folder_changed();
+            }
+        }
+    }
+
+    pub fn has_recents(&self) -> bool {
+        !self.recents.is_empty()
+    }
+
+    /// `(n, of)` while the field shows the `n`th recent folder, 1-based.
+    pub fn recent_position(&self) -> Option<(usize, usize)> {
+        self.recent_at.map(|i| (i + 1, self.recents.len()))
     }
 
     /// The chosen folder, resolved: `~` expanded, and a relative path taken
@@ -499,6 +738,7 @@ impl Picker {
             prepared,
             only_files,
             output_folder,
+            folder_typed: self.folder.as_str().trim().to_string(),
         })
     }
 }
@@ -676,7 +916,8 @@ mod tests {
         }
     }
 
-    fn picker() -> Picker {
+    /// Opens in the tree, since the files sit in folders.
+    fn tree_picker() -> Picker {
         Picker::new(
             preview(vec![
                 file(0, "Season 1/e01.mkv", 300),
@@ -686,7 +927,155 @@ mod tests {
                 file(4, "notes.txt", 1),
             ]),
             "/dl",
+            Vec::new(),
         )
+    }
+
+    /// The same files in the flat list, where most rules are easiest to see.
+    fn picker() -> Picker {
+        let mut p = tree_picker();
+        assert_eq!(p.view, View::Tree);
+        p.toggle_view();
+        p.top();
+        p
+    }
+
+    fn tree_labels(p: &Picker) -> Vec<String> {
+        p.tree_rows()
+            .iter()
+            .map(|r| format!("{}{}", "  ".repeat(r.depth), p.tree.node(r.node).name))
+            .collect()
+    }
+
+    fn cursor_label(p: &Picker) -> String {
+        let row = p.table_state.selected().expect("a cursor");
+        tree_labels(p)[row].trim().to_string()
+    }
+
+    #[test]
+    fn opens_in_the_tree_with_top_level_folders_open() {
+        let p = tree_picker();
+        assert_eq!(
+            tree_labels(&p),
+            vec![
+                "Season 1",
+                "  e01.mkv",
+                "  e02.mkv",
+                "Season 2",
+                "  e01.mkv",
+                "notes.txt"
+            ]
+        );
+        let flat = Picker::new(preview(vec![file(0, "a.iso", 1)]), "/dl", Vec::new());
+        assert_eq!(flat.view, View::Flat, "nothing to fold");
+    }
+
+    #[test]
+    fn space_on_a_folder_takes_the_whole_folder_and_then_releases_it() {
+        let mut p = tree_picker();
+        assert_eq!(cursor_label(&p), "Season 1");
+        p.toggle_current();
+        assert_eq!(p.only_files(), vec![2, 4], "all of season 1 off");
+        p.move_by(1);
+        p.toggle_current(); // e01 back on
+        p.move_by(-1);
+        assert_eq!(p.check(p.tree_rows()[0].node), Check::Some);
+        p.toggle_current(); // part-selected folder: select it all
+        assert_eq!(p.only_files(), vec![0, 1, 2, 4]);
+    }
+
+    #[test]
+    fn folder_keys_open_close_and_step_out() {
+        let mut p = tree_picker();
+        p.collapse_current(); // close Season 1
+        assert_eq!(
+            tree_labels(&p),
+            vec!["Season 1", "Season 2", "  e01.mkv", "notes.txt"]
+        );
+        p.expand_current();
+        p.move_by(2); // Season 1/e02.mkv
+        assert_eq!(cursor_label(&p), "e02.mkv");
+        p.collapse_current(); // on a file: up to its folder
+        assert_eq!(cursor_label(&p), "Season 1");
+    }
+
+    #[test]
+    fn a_filter_in_the_tree_shows_matches_and_folder_space_takes_only_those() {
+        let mut p = tree_picker();
+        p.filter_push_str("e01");
+        assert_eq!(
+            tree_labels(&p),
+            vec!["Season 1", "  e01.mkv", "Season 2", "  e01.mkv"]
+        );
+        // Space on Season 1 acts on the e01 shown, not on the hidden e02.
+        p.top();
+        p.toggle_current();
+        assert_eq!(p.only_files(), vec![1, 2, 4]);
+        // And the bulk keys act on the matches here too.
+        p.set_visible(false);
+        assert_eq!(p.only_files(), vec![1, 4]);
+    }
+
+    #[test]
+    fn switching_views_keeps_the_file_under_the_cursor() {
+        let mut p = picker();
+        p.move_by(2); // Season 2/e01.mkv in the flat list
+        p.toggle_view();
+        assert_eq!(p.view, View::Tree);
+        assert_eq!(cursor_label(&p), "e01.mkv");
+        let row = p.table_state.selected().unwrap();
+        assert_eq!(p.tree.node(p.tree_rows()[row].node).file, Some(2));
+        p.toggle_view();
+        assert_eq!(p.current(), Some(2));
+    }
+
+    #[test]
+    fn switching_to_the_tree_opens_the_way_to_a_file_in_a_closed_folder() {
+        let mut p = tree_picker();
+        p.move_by(3); // Season 2
+        p.collapse_current();
+        p.toggle_view(); // flat; cursor on Season 2's first file
+        assert_eq!(p.current(), Some(2));
+        p.toggle_view();
+        assert_eq!(
+            cursor_label(&p),
+            "e01.mkv",
+            "Season 2 was reopened to show it"
+        );
+    }
+
+    #[test]
+    fn up_and_down_step_through_recent_folders_and_back() {
+        let mut p = Picker::new(
+            preview(vec![file(0, "a.iso", 1)]),
+            "/dl",
+            vec!["/srv/tv".to_string(), "~/films".to_string()],
+        );
+        p.folder_set("/my/draft");
+        p.recent_older();
+        assert_eq!(p.folder.as_str(), "/srv/tv");
+        assert_eq!(p.recent_position(), Some((1, 2)));
+        p.recent_older();
+        assert_eq!(p.folder.as_str(), "~/films");
+        p.recent_older(); // no older one
+        assert_eq!(p.folder.as_str(), "~/films");
+        p.recent_newer();
+        p.recent_newer();
+        assert_eq!(p.folder.as_str(), "/my/draft", "back to what was typed");
+        assert_eq!(p.recent_position(), None);
+        p.recent_older();
+        p.folder_push('x'); // editing it makes it the user's own
+        assert_eq!(p.recent_position(), None);
+        assert_eq!(p.folder.as_str(), "/srv/tvx");
+    }
+
+    #[test]
+    fn confirm_reports_the_folder_as_typed() {
+        let mut p = picker();
+        p.folder_set(" ~/tv ");
+        let done = p.confirm().unwrap();
+        assert_eq!(done.folder_typed, "~/tv");
+        assert!(done.output_folder.ends_with("tv/Show"));
     }
 
     fn visible_paths(p: &Picker) -> Vec<&str> {
@@ -711,7 +1100,7 @@ mod tests {
     fn a_magnet_preselection_is_the_starting_point_and_what_r_restores() {
         let mut pv = preview(vec![file(0, "a", 1), file(1, "b", 1), file(5, "c", 1)]);
         pv.preselected = Some(vec![5]);
-        let mut p = Picker::new(pv, "/dl");
+        let mut p = Picker::new(pv, "/dl", Vec::new());
         assert_eq!(p.only_files(), vec![5]);
         p.set_visible(true);
         assert_eq!(p.only_files(), vec![0, 1, 5]);
@@ -864,7 +1253,7 @@ mod tests {
 
         let mut single = preview(vec![file(0, "one.iso", 9)]);
         single.subfolder = None;
-        let mut p = Picker::new(single, "/dl");
+        let mut p = Picker::new(single, "/dl", Vec::new());
         p.folder_set("/srv/media");
         assert_eq!(p.output_folder(), Ok(PathBuf::from("/srv/media")));
     }
@@ -966,7 +1355,7 @@ mod tests {
         assert_eq!(absolute_dir("/srv/dl"), "/srv/dl");
         let mut preview = preview(vec![file(0, "a.iso", 1)]);
         preview.subfolder = None;
-        let p = Picker::new(preview, &absolute_dir("dl"));
+        let p = Picker::new(preview, &absolute_dir("dl"), Vec::new());
         assert_eq!(p.output_folder().unwrap(), cwd.join("dl"));
     }
 

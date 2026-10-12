@@ -174,10 +174,13 @@ documentation cannot drift from the real bindings.
 fetches the file list *without* starting the download (for a magnet that takes
 as long as finding a peer that has it — `Esc` cancels) and opens a picker:
 
-- tick the files you want; filter the list to work on part of it — type
-  `season 2`, press `a`, and that season is in;
+- tick the files you want — in a folder tree, where `Space` on a folder takes
+  the whole folder (`t` switches to a flat list of full paths); or filter the
+  list to work on part of it — type `season 2`, press `a`, and that season is
+  in;
 - choose the folder — `~/` and absolute paths work, a plain name like `tv`
-  means a `tv` folder inside `download_dir`, and `Tab` completes folder names;
+  means a `tv` folder inside `download_dir`, `Tab` completes folder names, and
+  `↑` brings back folders you saved into before;
 - see what the selection needs next to what that folder's disk has free.
 
 `Enter` adds it. A multi-file torrent still gets its own subfolder inside the
@@ -185,17 +188,20 @@ folder you chose, just as it would in `download_dir`.
 
 | Key | Action |
 |-----|--------|
-| `Space` | Toggle the file under the cursor |
+| `Space` | Toggle the file under the cursor — or every file in the folder under it |
 | `a` / `n` / `i` | Select all / none / invert — of the files the filter shows |
+| `t` | Switch between the folder tree and a flat list |
+| `l` / `h` (or `→` / `←`) | Open / close a folder (on a file, `h` steps out to its folder) |
 | `r` | Back to the selection the picker opened with |
 | `s` | Sort by torrent order, size, or name |
 | `/` | Filter the files (`Enter` back to the list, `Esc` clears) |
 | `j` / `k`, `g` / `G`, `PgUp` / `PgDn` | Move, jump to top / bottom, page |
-| `Tab` | Edit the save folder (`Tab` there completes, `Ctrl+U` clears, `Esc` goes back) |
+| `Tab` | Edit the save folder (`Tab` there completes, `↑` / `↓` step through recent folders, `Ctrl+U` clears, `Esc` goes back) |
 | `Enter` | Add with these files, into this folder |
 | `Esc` | Clear the filter, or cancel |
 
-The filter matches file paths containing what you typed. When nothing does,
+A folder's box reads `[~]` when only some of its files are ticked. The
+filter matches file paths containing what you typed. When nothing does,
 it falls back to fuzzy matching and the count says `(fuzzy)` — worth a look
 before pressing `a`, since the bulk keys act on whatever the list shows.
 
@@ -213,6 +219,11 @@ Good to know:
   creates every file of a torrent, and a piece that straddles a ticked and an
   unticked file is written whole. That is how BitTorrent works, not a leak of
   the selection.
+- `A` works on a search result too: choose its files and folder, and `Enter`
+  takes you back to the results.
+- The recent folders (the last ten) are kept in `recent_folders.json` next to
+  the session state, which already records every torrent's folder. Delete the
+  file to clear the list.
 - Adds that do not go through the keyboard — the CLI argument, a magnet handed
   to a running session, the watch folder — still add straight away.
 
@@ -223,7 +234,9 @@ Press `s`, type what you're looking for (e.g. `arch linux iso`), and hit
 (The Pirate Bay) and [torrents-csv](https://torrents-csv.com) — merges and
 dedups the results, and lists them by seeder count — press `Tab` to sort by
 size, title, or leechers instead. Press `Enter` on a result
-and it starts downloading immediately; the magnet link is built locally from
+and it starts downloading immediately — or `A` to choose its files and save
+folder first ([the add picker](#choosing-files-and-a-folder-before-downloading));
+the magnet link is built locally from
 the result's info hash, so nothing is copied or pasted. No Prowlarr, Jackett,
 accounts, or API keys involved. Both providers can be toggled off in
 `[search]` — see [Configuration](#configuration) and [Privacy](#privacy).
@@ -231,6 +244,7 @@ accounts, or API keys involved. Both providers can be toggled off in
 | Key | Action |
 |-----|--------|
 | `Enter` | Download the selected result (stays in results for multi-grab) |
+| `A` | Choose files and save folder, then download the selected result |
 | `j` / `k` (or `↓` / `↑`) | Move selection down/up |
 | `Tab` | Cycle sort column (Seeders → Size → Title → Leechers) |
 | `R` | Reverse sort order |
