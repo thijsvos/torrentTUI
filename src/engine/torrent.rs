@@ -832,6 +832,10 @@ impl TorrentEngine {
                     .map(|p| p.to_string_lossy().into_owned());
 
                 let files = if is_detail {
+                    // `None` is librqbit's "every file"; read under its own
+                    // lock, so take it once rather than per file.
+                    let only_files: Option<HashSet<usize>> =
+                        handle.only_files().map(|v| v.into_iter().collect());
                     handle
                         .with_metadata(|meta| {
                             meta.file_infos
@@ -845,6 +849,9 @@ impl TorrentEngine {
                                         ),
                                         size_bytes: fi.len,
                                         progress_bytes: progress,
+                                        selected: only_files
+                                            .as_ref()
+                                            .is_none_or(|only| only.contains(&i)),
                                     }
                                 })
                                 .collect::<Vec<_>>()

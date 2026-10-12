@@ -1124,19 +1124,23 @@ mod tests {
                 name: "disc.iso".to_string(),
                 size_bytes: 1024,
                 progress_bytes: 512,
+                selected: true,
             },
             FileInfo {
                 name: "notes.txt".to_string(),
                 size_bytes: 100,
                 progress_bytes: 100,
+                selected: false,
             },
         ];
         let mut app = app_showing(t, DetailTab::Files);
         let text = draw(&mut app, 120, 30);
         assert!(text.contains("disc.iso"), "{text}");
         assert!(text.contains("notes.txt"), "{text}");
-        // Both selected by default, so both checkboxes are ticked.
-        assert!(text.contains("[\u{2713}]"), "checkbox missing: {text}");
+        // The checkboxes follow the engine's report, not a UI default.
+        let row = |name: &str| text.lines().find(|l| l.contains(name)).unwrap_or_default();
+        assert!(row("disc.iso").contains("[\u{2713}]"), "{text}");
+        assert!(row("notes.txt").contains("[ ]"), "{text}");
     }
 
     #[test]
@@ -1262,6 +1266,7 @@ mod tests {
                 name: format!("file-{:03}.bin", i),
                 size_bytes: 1024,
                 progress_bytes: (i * 8) as u64,
+                selected: true,
             })
             .collect()
     }
@@ -1352,6 +1357,7 @@ mod tests {
             name: "disc.iso".to_string(),
             size_bytes: 1024,
             progress_bytes: 512,
+            selected: true,
         }];
         t.peers = peers(5);
         t.trackers = vec![tracker(

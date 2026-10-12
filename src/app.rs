@@ -15,7 +15,7 @@
 //! the fields directly.
 //!
 //! `torrents` is replaced wholesale on every push, so state keyed by torrent id
-//! (`marked_ids`, `deselected_files`) can outlive the torrent it refers to.
+//! (`marked_ids`, `pending_file_selection`) can outlive the torrent it refers to.
 //! `prune_stale_state` is what stops that accumulating, and `handle_state_push`
 //! is the one entry point that runs it.
 
@@ -52,6 +52,42 @@ const MAX_PALETTE_QUERY_CHARS: usize = 64;
 /// without a cap a stray paste of the wrong clipboard buffer grows
 /// `filter_text` without limit.
 const MAX_FILTER_CHARS: usize = 200;
+
+/// How long a sent file selection overrides the engine's report. The echo
+/// normally lands on the next push (100 ms); this only bounds how long a
+/// change the engine rejected keeps showing as applied.
+const PENDING_SELECTION_TTL: Duration = Duration::from_secs(3);
+
+const NO_FILES_YET: &str = "No files to select yet (still fetching metadata)";
+const LAST_FILE: &str = "At least one file must stay selected";
+
+/// A file selection sent to the engine and not yet seen in a push.
+#[derive(Debug, Clone)]
+pub struct PendingSelection {
+    pub files: Vec<bool>,
+    sent: Instant,
+}
+
+impl PendingSelection {
+    pub fn new(files: Vec<bool>) -> Self {
+        Self {
+            files,
+            sent: Instant::now(),
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.sent.elapsed() < PENDING_SELECTION_TTL
+    }
+}
+
+fn selected_indices(files: &[bool]) -> Vec<usize> {
+    files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &on)| on.then_some(i))
+        .collect()
+}
 
 /// State for the command-palette overlay. Ephemeral by design: opening the
 /// palette resets the filter, so it always starts from "show me everything".
@@ -257,11 +293,13 @@ pub struct App {
     /// Detail mode, which is what makes clicks inert there.
     pub table_area: Option<ratatui::layout::Rect>,
     pub detail_file_index: usize,
-    /// Per torrent id, the file indices the user has *deselected*. Stored
-    /// negatively so a torrent whose metadata has not arrived yet — and which
-    /// therefore has no known file count — still defaults to "download
-    /// everything". Pruned by `prune_stale_state`.
-    pub deselected_files: HashMap<usize, HashSet<usize>>,
+    /// Per torrent id, a file selection sent to the engine that the engine has
+    /// not echoed back yet. The engine's `FileInfo::selected` is the truth;
+    /// this only bridges the gap until the next push shows the change, so a
+    /// second toggle builds on the first instead of on a stale snapshot.
+    /// Dropped once a push agrees, after `PENDING_SELECTION_TTL`, or when the
+    /// torrent goes away — see `prune_stale_state`.
+    pub pending_file_selection: HashMap<usize, PendingSelection>,
     pub marked_ids: HashSet<usize>,
     pub detail_peer_index: usize,
     /// Top peer-row index currently visible in the Peers tab. The renderer
@@ -385,7 +423,7 @@ impl App {
             speed_limit_upload_kbps: 0,
             table_area: None,
             detail_file_index: 0,
-            deselected_files: HashMap::new(),
+            pending_file_selection: HashMap::new(),
             marked_ids: HashSet::new(),
             detail_peer_index: 0,
             detail_peer_scroll_offset: 0,
@@ -572,6 +610,10 @@ impl App {
                 || a.peers_total != b.peers_total
                 || a.eta_seconds != b.eta_seconds
                 || a.files.len() != b.files.len()
+                || a.files
+                    .iter()
+                    .zip(&b.files)
+                    .any(|(x, y)| x.selected != y.selected)
                 || a.peers.len() != b.peers.len()
                 || a.health != b.health
                 || a.trackers != b.trackers
@@ -965,10 +1007,21 @@ impl App {
                 .get(id)
                 .is_some_and(|name| identities.get(id).is_none_or(|prev| prev == name))
         });
-        self.deselected_files.retain(|id, _| {
-            current
+        let torrents = &self.torrents;
+        self.pending_file_selection.retain(|id, pending| {
+            let same_torrent = current
                 .get(id)
-                .is_some_and(|name| identities.get(id).is_none_or(|prev| prev == name))
+                .is_some_and(|name| identities.get(id).is_none_or(|prev| prev == name));
+            // Echoed back: the engine's flags now say the same thing.
+            let confirmed = torrents.iter().find(|t| t.id == *id).is_some_and(|t| {
+                !t.files.is_empty()
+                    && t.files.len() == pending.files.len()
+                    && t.files
+                        .iter()
+                        .zip(&pending.files)
+                        .all(|(f, &p)| f.selected == p)
+            });
+            same_torrent && !confirmed && pending.is_fresh()
         });
         // A recycled id must not inherit the old torrent's stall clock either.
         self.progress_marks.retain(|id, _| {
@@ -1427,31 +1480,72 @@ impl App {
         entry.id
     }
 
-    /// Whether a file is included in the download. Returns `true` for torrents
-    /// and indices this has never seen, because selection is tracked as the set
-    /// of *exclusions* — so an out-of-range `file_index` also reports selected.
-    /// Bound the index against the torrent's real file count before trusting
-    /// it.
-    pub fn is_file_selected(&self, torrent_id: usize, file_index: usize) -> bool {
-        !self
-            .deselected_files
+    /// The file selection as the user currently sees it: a pending change if
+    /// one is in flight, otherwise what the engine reported. `None` while the
+    /// torrent has no file list (not the Detail target, or no metadata yet).
+    fn file_selection(&self, torrent_id: usize) -> Option<Vec<bool>> {
+        if let Some(pending) = self
+            .pending_file_selection
             .get(&torrent_id)
-            .is_some_and(|s| s.contains(&file_index))
-    }
-
-    pub fn toggle_file_selection(&mut self, torrent_id: usize, file_index: usize) {
-        let set = self.deselected_files.entry(torrent_id).or_default();
-        if set.contains(&file_index) {
-            set.remove(&file_index);
-        } else {
-            set.insert(file_index);
+            .filter(|p| p.is_fresh())
+        {
+            return Some(pending.files.clone());
         }
+        let torrent = self.torrents.iter().find(|t| t.id == torrent_id)?;
+        (!torrent.files.is_empty()).then(|| torrent.files.iter().map(|f| f.selected).collect())
     }
 
-    pub fn selected_file_indices(&self, torrent_id: usize, total_files: usize) -> Vec<usize> {
-        (0..total_files)
-            .filter(|i| self.is_file_selected(torrent_id, *i))
-            .collect()
+    /// Whether a file is included in the download. Unknown torrents and
+    /// out-of-range indices report `true` — librqbit's own default — so bound
+    /// the index against the torrent's real file count before trusting it.
+    pub fn is_file_selected(&self, torrent_id: usize, file_index: usize) -> bool {
+        // Per row per frame, so no `file_selection` clone here.
+        if let Some(pending) = self
+            .pending_file_selection
+            .get(&torrent_id)
+            .filter(|p| p.is_fresh())
+        {
+            return pending.files.get(file_index).copied().unwrap_or(true);
+        }
+        self.torrents
+            .iter()
+            .find(|t| t.id == torrent_id)
+            .and_then(|t| t.files.get(file_index))
+            .is_none_or(|f| f.selected)
+    }
+
+    /// Flip one file and return the full set of indices to send. Refuses
+    /// (`Err` with the reason, nothing changed) when that would leave no file
+    /// selected: an empty `only_files` is not "pause", it is a torrent that
+    /// sits at 100% of nothing.
+    pub fn toggle_file_selection(
+        &mut self,
+        torrent_id: usize,
+        file_index: usize,
+    ) -> Result<Vec<usize>, &'static str> {
+        let mut files = self.file_selection(torrent_id).ok_or(NO_FILES_YET)?;
+        let Some(flag) = files.get_mut(file_index) else {
+            return Err(NO_FILES_YET);
+        };
+        *flag = !*flag;
+        let indices = selected_indices(&files);
+        if indices.is_empty() {
+            return Err(LAST_FILE);
+        }
+        self.pending_file_selection
+            .insert(torrent_id, PendingSelection::new(files));
+        Ok(indices)
+    }
+
+    /// The indices currently selected, for re-sending with `S`. Same refusals
+    /// as [`App::toggle_file_selection`].
+    pub fn selected_file_indices(&self, torrent_id: usize) -> Result<Vec<usize>, &'static str> {
+        let files = self.file_selection(torrent_id).ok_or(NO_FILES_YET)?;
+        let indices = selected_indices(&files);
+        if indices.is_empty() {
+            return Err(LAST_FILE);
+        }
+        Ok(indices)
     }
 
     /// Whether the free-space figure is due for a refresh (at most once every
@@ -1750,7 +1844,8 @@ mod tests {
             TorrentStatus::Downloading,
         )]);
         app.marked_ids.insert(7);
-        app.deselected_files.insert(7, HashSet::from([2, 5]));
+        app.pending_file_selection
+            .insert(7, PendingSelection::new(vec![true, true, false]));
 
         // Same id, different torrent.
         app.handle_state_push(vec![make_torrent(
@@ -1761,8 +1856,8 @@ mod tests {
         )]);
         assert!(!app.marked_ids.contains(&7), "mark must not survive");
         assert!(
-            !app.deselected_files.contains_key(&7),
-            "deselection must not survive"
+            !app.pending_file_selection.contains_key(&7),
+            "pending selection must not survive"
         );
         assert!(
             app.is_file_selected(7, 2),
@@ -1776,13 +1871,14 @@ mod tests {
         let rows = vec![make_torrent(7, "Same", 100, TorrentStatus::Downloading)];
         app.handle_state_push(rows.clone());
         app.marked_ids.insert(7);
-        app.deselected_files.insert(7, HashSet::from([1]));
+        app.pending_file_selection
+            .insert(7, PendingSelection::new(vec![true, false]));
 
         let mut moved = rows.clone();
         moved[0].downloaded_bytes += 10;
         app.handle_state_push(moved);
         assert!(app.marked_ids.contains(&7));
-        assert!(!app.is_file_selected(7, 1));
+        assert!(!app.is_file_selected(7, 1), "not echoed yet, still pending");
     }
 
     #[test]
@@ -2063,16 +2159,18 @@ mod tests {
         app.marked_ids.insert(1);
         app.marked_ids.insert(2);
         app.marked_ids.insert(99); // stale, no torrent with id 99
-        app.deselected_files.insert(2, HashSet::new());
-        app.deselected_files.insert(42, HashSet::new()); // stale
+        app.pending_file_selection
+            .insert(2, PendingSelection::new(vec![true]));
+        app.pending_file_selection
+            .insert(42, PendingSelection::new(vec![true])); // stale
 
         app.prune_stale_state();
 
         assert!(app.marked_ids.contains(&1));
         assert!(app.marked_ids.contains(&2));
         assert!(!app.marked_ids.contains(&99));
-        assert!(app.deselected_files.contains_key(&2));
-        assert!(!app.deselected_files.contains_key(&42));
+        assert!(app.pending_file_selection.contains_key(&2));
+        assert!(!app.pending_file_selection.contains_key(&42));
     }
 
     #[test]
@@ -2088,6 +2186,7 @@ mod tests {
             name: name.to_string(),
             size_bytes: 100,
             progress_bytes: 0,
+            selected: true,
         }
     }
 
@@ -2199,20 +2298,89 @@ mod tests {
         assert!(app.has_fetching_metadata());
     }
 
+    fn with_files(id: usize, selected: &[bool]) -> TorrentInfo {
+        let mut t = make_torrent(id, "Multi", 300, TorrentStatus::Downloading);
+        t.files = selected
+            .iter()
+            .enumerate()
+            .map(|(i, &on)| crate::types::FileInfo {
+                name: format!("f{i}"),
+                size_bytes: 100,
+                progress_bytes: 0,
+                selected: on,
+            })
+            .collect();
+        t
+    }
+
     #[test]
     fn file_selection_toggle_and_query() {
         let mut app = App::new();
-        // All files selected by default.
+        app.handle_state_push(vec![with_files(0, &[true, true, true])]);
         assert!(app.is_file_selected(0, 0));
-        assert_eq!(app.selected_file_indices(0, 3), vec![0, 1, 2]);
-        // Deselect file 1.
-        app.toggle_file_selection(0, 1);
+        assert_eq!(app.selected_file_indices(0), Ok(vec![0, 1, 2]));
+        // Deselect file 1: the overlay shows it before the engine echoes.
+        assert_eq!(app.toggle_file_selection(0, 1), Ok(vec![0, 2]));
         assert!(!app.is_file_selected(0, 1));
-        assert_eq!(app.selected_file_indices(0, 3), vec![0, 2]);
+        assert_eq!(app.selected_file_indices(0), Ok(vec![0, 2]));
         // Toggle it back.
-        app.toggle_file_selection(0, 1);
+        assert_eq!(app.toggle_file_selection(0, 1), Ok(vec![0, 1, 2]));
         assert!(app.is_file_selected(0, 1));
-        assert_eq!(app.selected_file_indices(0, 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn file_selection_starts_from_the_engine_not_from_everything() {
+        // The regression: after a restart the UI knew nothing, showed every
+        // file ticked, and the next toggle sent "all but this one" — quietly
+        // re-enabling the files librqbit had persisted as excluded.
+        let mut app = App::new();
+        app.handle_state_push(vec![with_files(0, &[true, false, false])]);
+        assert!(!app.is_file_selected(0, 1));
+        assert_eq!(app.toggle_file_selection(0, 2), Ok(vec![0, 2]));
+    }
+
+    #[test]
+    fn a_second_toggle_builds_on_the_first_before_the_echo() {
+        let mut app = App::new();
+        app.handle_state_push(vec![with_files(0, &[true, true, true])]);
+        assert_eq!(app.toggle_file_selection(0, 0), Ok(vec![1, 2]));
+        // A push from before the engine applied it must not undo file 0.
+        let mut stale = with_files(0, &[true, true, true]);
+        stale.downloaded_bytes += 1;
+        app.handle_state_push(vec![stale]);
+        assert_eq!(app.toggle_file_selection(0, 1), Ok(vec![2]));
+    }
+
+    #[test]
+    fn pending_selection_clears_once_the_engine_agrees() {
+        let mut app = App::new();
+        app.handle_state_push(vec![with_files(0, &[true, true])]);
+        app.toggle_file_selection(0, 1).unwrap();
+        app.handle_state_push(vec![with_files(0, &[true, false])]);
+        assert!(app.pending_file_selection.is_empty());
+        assert!(!app.is_file_selected(0, 1));
+    }
+
+    #[test]
+    fn the_last_selected_file_cannot_be_deselected() {
+        let mut app = App::new();
+        app.handle_state_push(vec![with_files(0, &[false, true])]);
+        assert_eq!(app.toggle_file_selection(0, 1), Err(LAST_FILE));
+        assert!(app.is_file_selected(0, 1), "a refusal changes nothing");
+        assert!(app.pending_file_selection.is_empty());
+    }
+
+    #[test]
+    fn no_file_list_means_nothing_to_toggle() {
+        let mut app = App::new();
+        app.handle_state_push(vec![make_torrent(
+            0,
+            "Magnet",
+            0,
+            TorrentStatus::Downloading,
+        )]);
+        assert_eq!(app.toggle_file_selection(0, 0), Err(NO_FILES_YET));
+        assert_eq!(app.selected_file_indices(0), Err(NO_FILES_YET));
     }
 
     #[test]

@@ -106,6 +106,11 @@ pub struct FileInfo {
     pub name: String,
     pub size_bytes: u64,
     pub progress_bytes: u64,
+    /// Whether librqbit is downloading this file — its persisted `only_files`,
+    /// read back on every push. The engine is the source of truth: a UI-side
+    /// copy forgot every deselection on restart, and the next toggle then
+    /// sent "everything but this one", re-enabling the forgotten files.
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone)]

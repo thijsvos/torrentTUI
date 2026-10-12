@@ -1964,46 +1964,44 @@ fn cycle_detail_tab(app: &mut App) {
 }
 
 async fn toggle_file_selection_key(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
-    if let Some(torrent) = app.selected_torrent() {
-        let torrent_id = torrent.id;
-        let file_count = torrent.files.len();
-        if app.detail_file_index < file_count {
-            app.toggle_file_selection(torrent_id, app.detail_file_index);
-            let selected = app.selected_file_indices(torrent_id, file_count);
+    let Some(torrent_id) = app.selected_torrent().map(|t| t.id) else {
+        return;
+    };
+    match app.toggle_file_selection(torrent_id, app.detail_file_index) {
+        Ok(file_indices) => {
             send_cmd(
                 cmd_tx,
                 EngineCommand::SetSelectedFiles {
                     id: torrent_id,
-                    file_indices: selected,
+                    file_indices,
                 },
                 app,
             )
             .await;
         }
+        Err(why) => app.set_info(why.to_string()),
     }
 }
 
 async fn apply_file_selection(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
-    if let Some(torrent) = app.selected_torrent() {
-        let torrent_id = torrent.id;
-        let total_files = torrent.files.len();
-        // Don't send an empty file selection — librqbit may interpret
-        // it as "deselect everything" and pause the torrent. This
-        // happens when the torrent briefly returns to FetchingMetadata.
-        if total_files == 0 {
-            app.set_info("No files to apply yet (still fetching metadata)".to_string());
-        } else {
-            let selected = app.selected_file_indices(torrent_id, total_files);
+    let Some(torrent_id) = app.selected_torrent().map(|t| t.id) else {
+        return;
+    };
+    // Never an empty set: librqbit would keep the torrent "downloading" zero
+    // files. Before metadata there is no list at all, and that refuses too.
+    match app.selected_file_indices(torrent_id) {
+        Ok(file_indices) => {
             send_cmd(
                 cmd_tx,
                 EngineCommand::SetSelectedFiles {
                     id: torrent_id,
-                    file_indices: selected,
+                    file_indices,
                 },
                 app,
             )
             .await;
         }
+        Err(why) => app.set_info(why.to_string()),
     }
 }
 
@@ -2743,6 +2741,53 @@ mod tests {
             content_path: None,
             health: types::TorrentHealth::default(),
         }
+    }
+
+    fn files_tab_on(selected: &[bool]) -> App {
+        let mut t = torrent(0, types::TorrentStatus::Downloading);
+        t.files = selected
+            .iter()
+            .enumerate()
+            .map(|(i, &on)| types::FileInfo {
+                name: format!("f{i}"),
+                size_bytes: 10,
+                progress_bytes: 0,
+                selected: on,
+            })
+            .collect();
+        let mut app = App::new();
+        app.handle_state_push(vec![t]);
+        app.mode = AppMode::Detail;
+        app.detail_tab = DetailTab::Files;
+        app
+    }
+
+    #[tokio::test]
+    async fn space_sends_the_engine_selection_plus_the_toggle() {
+        // File 2 was excluded in an earlier session; toggling file 0 must
+        // not quietly bring it back.
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = files_tab_on(&[true, true, false]);
+        handle_detail_mode(&mut app, key(KeyCode::Char(' ')), &tx).await;
+        match rx.try_recv().expect("a command") {
+            EngineCommand::SetSelectedFiles { id, file_indices } => {
+                assert_eq!(id, 0);
+                assert_eq!(file_indices, vec![1]);
+            }
+            other => panic!("expected SetSelectedFiles, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn space_on_the_last_selected_file_sends_nothing() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = files_tab_on(&[true, false]);
+        handle_detail_mode(&mut app, key(KeyCode::Char(' ')), &tx).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "an empty selection must not be sent"
+        );
+        assert!(app.is_file_selected(0, 0));
     }
 
     #[tokio::test]
