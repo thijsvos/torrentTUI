@@ -933,7 +933,9 @@ async fn run_app(
     app.watch_dir_configured = config.general.watch_dir.is_some();
     app.search_config = config.search.clone();
     app.search_proxy_url = config.privacy.proxy_url().map(str::to_string);
-    app.download_dir = config.general.download_dir.clone();
+    // Absolute, as librqbit resolves it: the add picker joins relative
+    // folders onto this, and must not do it to a relative one twice.
+    app.download_dir = add_picker::absolute_dir(&config.general.download_dir);
     // An unknown id in the config falls back to `system` (see `theme::by_name`),
     // so a stale or hand-edited value never stops the app from starting.
     app.set_theme(&config.ui.theme);

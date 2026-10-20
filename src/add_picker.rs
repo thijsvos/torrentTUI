@@ -119,7 +119,7 @@ pub struct FolderProbe {
 /// timeout.
 pub fn probe_folder(folder: PathBuf) -> FolderProbe {
     let exists = folder.exists();
-    let not_a_dir = exists && !folder.is_dir();
+    let not_a_dir = blocking_file(&folder).is_some();
     // A folder that does not exist yet will be created on the volume of
     // its nearest existing ancestor, so that is the volume to measure.
     let free = folder
@@ -484,11 +484,13 @@ impl Picker {
         if only_files.is_empty() {
             return Err(NOTHING_SELECTED.to_string());
         }
-        let base = self.folder_base()?;
-        if base.exists() && !base.is_dir() {
-            return Err(format!("{} is a file, not a folder", base.display()));
-        }
+        // The whole path, so a file above the chosen folder, or one sitting
+        // where the torrent's own subfolder goes, is caught here rather than
+        // by a failed add after the picker (and the selection) is gone.
         let output_folder = self.output_folder()?;
+        if let Some(file) = blocking_file(&output_folder) {
+            return Err(format!("{} is a file, not a folder", file.display()));
+        }
         let prepared = self
             .prepared
             .take()
@@ -499,6 +501,26 @@ impl Picker {
             output_folder,
         })
     }
+}
+
+/// The nearest part of `path` that exists, when it is not a folder — so no
+/// folder can be created at `path`. `exists()` alone misses a file further
+/// up: `notes.txt/tv` just reads as "does not exist yet".
+fn blocking_file(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|p| p.exists())
+        .filter(|p| !p.is_dir())
+}
+
+/// `dir` made absolute against the working directory, which is where
+/// librqbit puts a relative download dir. The picker resolves relative input
+/// against the download dir, so a relative one would be applied twice: the
+/// default `downloads` would mean `downloads/downloads`.
+pub fn absolute_dir(dir: &str) -> String {
+    std::path::absolute(dir)
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok())
+        .unwrap_or_else(|| dir.to_string())
 }
 
 /// See [`Picker::folder_base`].
@@ -911,6 +933,41 @@ mod tests {
         assert!(!probe.exists);
         assert!(!probe.not_a_dir);
         assert!(probe.free.is_some());
+    }
+
+    #[test]
+    fn a_file_anywhere_in_the_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let probe = probe_folder(file.join("tv"));
+        assert!(probe.not_a_dir, "a file above the folder");
+
+        let mut p = picker();
+        p.folder_set(&file.join("tv").to_string_lossy());
+        let err = p.confirm().unwrap_err();
+        assert!(err.contains("notes.txt"), "{err}");
+        assert!(p.prepared.is_some(), "nothing taken on a refusal");
+    }
+
+    #[test]
+    fn a_file_where_the_torrent_subfolder_goes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Show"), b"x").unwrap();
+        let mut p = picker();
+        p.folder_set(&dir.path().to_string_lossy());
+        assert!(p.confirm().unwrap_err().contains("Show"));
+    }
+
+    #[test]
+    fn a_relative_download_dir_is_made_absolute_once() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(absolute_dir("dl"), cwd.join("dl").to_string_lossy());
+        assert_eq!(absolute_dir("/srv/dl"), "/srv/dl");
+        let mut preview = preview(vec![file(0, "a.iso", 1)]);
+        preview.subfolder = None;
+        let p = Picker::new(preview, &absolute_dir("dl"));
+        assert_eq!(p.output_folder().unwrap(), cwd.join("dl"));
     }
 
     fn dirs(names: &'static [&'static str]) -> impl Fn(&Path) -> io::Result<Vec<String>> {

@@ -282,9 +282,10 @@ pub struct TorrentEngine {
     /// picks for a previewed torrent apart from the folder it sits in.
     download_dir: PathBuf,
     /// Previews still resolving, keyed by the UI's ticket, so
-    /// `CancelPreview` can stop one. Each task removes its own entry when it
-    /// ends, however it ends — see `PreviewTaskGuard`.
-    preview_tasks: std::sync::Mutex<HashMap<u64, tokio::task::AbortHandle>>,
+    /// `CancelPreview` can stop one: its abort handle and its pending-add
+    /// ticket. Each task removes its own entry when it ends, however it ends
+    /// — see `PreviewTaskGuard`.
+    preview_tasks: std::sync::Mutex<HashMap<u64, (tokio::task::AbortHandle, u64)>>,
 }
 
 /// What the engine knows about an add before librqbit has created the
@@ -1660,7 +1661,8 @@ fn gave_up_message(gave_up: Option<crate::types::PendingAdd>, dht_enabled: bool)
 /// Clears a preview task's bookkeeping when the task ends, however it ends.
 /// `CancelPreview` aborts the task, which drops its future mid-await — cleanup
 /// written after that await would never run and would leave a "Resolving"
-/// row behind for good.
+/// row behind for good. (A task aborted before its first poll never builds
+/// this guard; `CancelPreview` clears the pending entry for that case.)
 struct PreviewTaskGuard {
     engine: Arc<TorrentEngine>,
     ticket: u64,
@@ -2227,7 +2229,7 @@ pub async fn run_engine(
                                 .send(EngineInfo::Preview(PreviewOutcome { ticket, result }))
                                 .await;
                         });
-                        tasks.insert(ticket, task.abort_handle());
+                        tasks.insert(ticket, (task.abort_handle(), pending));
                     }
                     Some(EngineCommand::CancelPreview(ticket)) => {
                         let task = engine
@@ -2235,10 +2237,14 @@ pub async fn run_engine(
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .remove(&ticket);
-                        // Dropping the future stops librqbit's resolution; the
-                        // task's guard clears the pending entry.
-                        if let Some(task) = task {
+                        // Dropping the future stops librqbit's resolution. The
+                        // pending entry is cleared here as well as by the
+                        // task's guard: a task aborted before it first runs
+                        // (likely, since this loop has not yielded since the
+                        // spawn) never builds its guard.
+                        if let Some((task, pending)) = task {
                             task.abort();
+                            engine.end_pending_add(pending);
                         }
                     }
                     Some(EngineCommand::AddPrepared { prepared, only_files, output_folder }) => {
