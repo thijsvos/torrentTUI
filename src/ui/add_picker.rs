@@ -402,7 +402,9 @@ mod tests {
         assert!(row("Season 1/e01.mkv").contains("[\u{2713}]"), "{text}");
         assert!(row("notes.txt").contains("[ ]"), "{text}");
         assert!(text.contains("Save to: /dl"), "{text}");
-        assert!(text.contains("/dl/The Show"), "{text}");
+        // Joined with the platform's separator: `/dl\The Show` on Windows.
+        let final_path = std::path::Path::new("/dl").join("The Show");
+        assert!(text.contains(&final_path.display().to_string()), "{text}");
         assert!(text.contains("Selected 2/3 files"), "{text}");
         assert!(text.contains("1.00 GB free"), "{text}");
     }
