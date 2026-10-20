@@ -1352,7 +1352,9 @@ mod tests {
     fn a_relative_download_dir_is_made_absolute_once() {
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(absolute_dir("dl"), cwd.join("dl").to_string_lossy());
-        assert_eq!(absolute_dir("/srv/dl"), "/srv/dl");
+        // Already absolute on every platform (`/srv/dl` is not on Windows).
+        let already = cwd.join("srv").to_string_lossy().into_owned();
+        assert_eq!(absolute_dir(&already), already);
         let mut preview = preview(vec![file(0, "a.iso", 1)]);
         preview.subfolder = None;
         let p = Picker::new(preview, &absolute_dir("dl"), Vec::new());
