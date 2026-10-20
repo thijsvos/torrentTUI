@@ -41,17 +41,12 @@ pub struct RecentDirs {
     path: Option<PathBuf>,
 }
 
-/// The form two folder strings are compared in: `~` expanded, trailing
-/// separators dropped, so `~/tv/` and `/home/me/tv` are one entry.
-fn normalized(dir: &str) -> String {
-    let expanded = expand_tilde(dir.trim());
-    let trimmed = expanded.trim_end_matches(['/', std::path::MAIN_SEPARATOR]);
-    if trimmed.is_empty() {
-        // A filesystem root is all separators.
-        expanded
-    } else {
-        trimmed.to_string()
-    }
+/// The form two folder strings are compared in: `~` expanded, then compared
+/// as paths, which ignores trailing separators and (on Windows) treats `/`
+/// and `\` alike — so `~/tv/`, `/home/me/tv` and `C:\me/tv` vs `C:\me\tv`
+/// are one entry each.
+fn normalized(dir: &str) -> PathBuf {
+    PathBuf::from(expand_tilde(dir.trim()))
 }
 
 impl RecentDirs {
