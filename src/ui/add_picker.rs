@@ -21,10 +21,9 @@ use crate::add_picker::{AddPickerState, Focus, Picker, View};
 use crate::app::App;
 use crate::file_tree::Check;
 use crate::theme::Theme;
+use crate::ui::input::render_menu;
 use crate::ui::layout::format_size;
 use crate::ui::util::truncate;
-
-const CURSOR: &str = "\u{2588}";
 
 pub fn render_add_picker(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
@@ -135,7 +134,7 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &mut Picker, theme: Theme) {
         rows[0],
     );
 
-    f.render_widget(Paragraph::new(filter_line(picker, theme)), rows[1]);
+    f.render_widget(Paragraph::new(filter_line(picker, width, theme)), rows[1]);
     render_files(f, rows[2], picker, theme);
     f.render_widget(Paragraph::new(folder_line(picker, width, theme)), rows[3]);
     f.render_widget(Paragraph::new(output_line(picker, width, theme)), rows[4]);
@@ -149,37 +148,46 @@ fn render_picker(f: &mut Frame, area: Rect, picker: &mut Picker, theme: Theme) {
             rows[6],
         );
     }
+    if picker.focus == Focus::Folder {
+        if let Some(menu) = picker.folder.menu() {
+            render_menu(
+                f,
+                rows[3],
+                inner,
+                rows[3].x + FOLDER_LABEL.len() as u16,
+                menu,
+                theme,
+            );
+        }
+    }
 }
 
-fn filter_line(picker: &Picker, theme: Theme) -> Line<'static> {
-    let query = picker.filter.as_str();
+fn filter_line(picker: &Picker, width: usize, theme: Theme) -> Line<'static> {
     let focused = picker.focus == Focus::Filter;
-    if !focused && query.is_empty() {
+    if !focused && picker.filter.is_empty() {
         return Line::from(Span::styled(
             " / to filter",
             Style::default().fg(theme.muted),
         ));
     }
-    let mut spans = vec![
-        Span::styled(" / ", Style::default().fg(theme.primary)),
-        Span::styled(query.to_string(), Style::default().fg(theme.text)),
-    ];
-    if focused {
-        spans.push(Span::styled(CURSOR, Style::default().fg(theme.text)));
-    }
-    if !query.is_empty() {
-        spans.push(Span::styled(
-            format!(
-                "  {} of {} shown{}",
-                picker.visible().len(),
-                picker.files.len(),
-                // The bulk keys act on these, so say when they are a loose
-                // match rather than files containing the text.
-                if picker.fuzzy { " (fuzzy)" } else { "" }
-            ),
-            Style::default().fg(theme.muted),
-        ));
-    }
+    // Measured first, like the folder line's: the query scrolls to make room.
+    let count = if picker.filter.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  {} of {} shown{}",
+            picker.visible().len(),
+            picker.files.len(),
+            // The bulk keys act on these, so say when they are a loose
+            // match rather than files containing the text.
+            if picker.fuzzy { " (fuzzy)" } else { "" }
+        )
+    };
+    let room = width.saturating_sub(3 + count.len()).max(4);
+    let text = Style::default().fg(theme.text);
+    let mut spans = vec![Span::styled(" / ", Style::default().fg(theme.primary))];
+    spans.extend(picker.filter.spans(room, text, focused.then_some(text)));
+    spans.push(Span::styled(count, Style::default().fg(theme.muted)));
     Line::from(spans)
 }
 
@@ -298,6 +306,9 @@ fn tail(s: &str, width: usize) -> String {
     s.to_string()
 }
 
+/// Where the folder field starts on its line.
+const FOLDER_LABEL: &str = " Save to: ";
+
 fn folder_line(picker: &Picker, width: usize, theme: Theme) -> Line<'static> {
     let focused = picker.focus == Focus::Folder;
     let label_style = if focused {
@@ -313,17 +324,12 @@ fn folder_line(picker: &Picker, width: usize, theme: Theme) -> Line<'static> {
         .recent_position()
         .map(|(n, of)| format!("  recent {n}/{of}"))
         .unwrap_or_default();
-    let room = width.saturating_sub(12 + recent.len()).max(4);
-    let mut spans = vec![
-        Span::styled(" Save to: ", label_style),
-        Span::styled(
-            tail(picker.folder.as_str(), room),
-            Style::default().fg(theme.text),
-        ),
-    ];
-    if focused {
-        spans.push(Span::styled(CURSOR, Style::default().fg(theme.text)));
-    }
+    let room = width
+        .saturating_sub(FOLDER_LABEL.len() + recent.len())
+        .max(4);
+    let text = Style::default().fg(theme.text);
+    let mut spans = vec![Span::styled(FOLDER_LABEL, label_style)];
+    spans.extend(picker.folder.spans(room, text, focused.then_some(text)));
     spans.push(Span::styled(recent, Style::default().fg(theme.muted)));
     Line::from(spans)
 }

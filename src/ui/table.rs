@@ -105,7 +105,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let sorted = app.sorted_torrents();
 
     if sorted.is_empty() {
-        let msg = if !app.filter_text.is_empty() {
+        let msg = if !app.filter_input.is_empty() {
             "No torrents match the current filter."
         } else if pending_strip_height(app).is_some() {
             "No torrents yet — the magnet below appears here once a peer sends its metadata."

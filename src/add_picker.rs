@@ -10,21 +10,24 @@
 //!
 //! Everything here is state and rules with no terminal and no engine, so it
 //! is tested directly; `ui::add_picker` draws it and `main` routes keys to it.
-//! The only filesystem access is in [`list_subdirs`] (Tab completion) and in
-//! [`Picker::confirm`]'s last-moment check, both on an explicit keypress.
+//! The only filesystem access is Tab completion (through
+//! [`crate::completion`]) and [`Picker::confirm`]'s last-moment check, both on
+//! an explicit keypress.
 
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crossterm::event::KeyEvent;
 use ratatui::widgets::TableState;
 
 use crate::actions::fuzzy_score;
+use crate::completion::{complete_path, Candidate};
 use crate::config::expand_tilde;
 use crate::file_tree::{Check, FileTree, NodeId, TreeRow};
 use crate::types::{PreparedTorrent, PreviewFile, TorrentPreview};
-use crate::ui::input::InputWidget;
+use crate::ui::input::{Edit, InputWidget, MenuKey};
 
 /// Cap on the filter query; file paths are bounded, so a longer needle can't
 /// match anything (mirrors the torrent table's `MAX_FILTER_CHARS`).
@@ -36,13 +39,6 @@ const MAX_FOLDER_CHARS: usize = 4096;
 /// How long the folder must sit unchanged before its free space is probed,
 /// so typing a path does not queue one `statvfs` per keystroke.
 const SPACE_PROBE_DELAY: Duration = Duration::from_millis(300);
-
-/// Directory entries read per Tab press. A completion over more than this is
-/// not one anybody is reading through.
-const MAX_COMPLETION_ENTRIES: usize = 5000;
-
-/// How many completion candidates the message line lists before "…".
-const MAX_SHOWN_CANDIDATES: usize = 8;
 
 const NOTHING_SELECTED: &str = "Select at least one file";
 
@@ -195,7 +191,7 @@ pub struct Picker {
     pub probe: Option<FolderProbe>,
     /// When the folder last changed; `None` once it has been probed.
     folder_changed_at: Option<Instant>,
-    /// A one-line note: a refusal, or Tab-completion candidates.
+    /// A one-line note: a refusal, or a completion that found nothing.
     pub message: Option<String>,
 }
 
@@ -552,19 +548,17 @@ impl Picker {
 
     // -- the filter -----------------------------------------------------
 
-    pub fn filter_push(&mut self, c: char) {
-        self.filter.push(c);
-        self.refresh_visible();
+    /// An editing key in the filter field.
+    pub fn filter_key(&mut self, key: KeyEvent) {
+        if self.filter.handle_key(key) == Edit::Changed {
+            self.refresh_visible();
+        }
     }
 
     pub fn filter_push_str(&mut self, s: &str) {
-        self.filter.push_str(s);
-        self.refresh_visible();
-    }
-
-    pub fn filter_pop(&mut self) {
-        self.filter.pop();
-        self.refresh_visible();
+        if self.filter.insert_str(s) {
+            self.refresh_visible();
+        }
     }
 
     pub fn filter_clear(&mut self) {
@@ -585,30 +579,34 @@ impl Picker {
         self.folder_changed();
     }
 
-    pub fn folder_push(&mut self, c: char) {
-        self.folder.push(c);
-        self.folder_edited();
+    /// An editing key in the folder field.
+    pub fn folder_key(&mut self, key: KeyEvent) {
+        if self.folder.handle_key(key) == Edit::Changed {
+            self.folder_edited();
+        }
     }
 
     pub fn folder_push_str(&mut self, s: &str) {
-        self.folder.push_str(s);
-        self.folder_edited();
+        if self.folder.insert_str(s) {
+            self.folder_edited();
+        }
     }
 
-    pub fn folder_pop(&mut self) {
-        self.folder.pop();
-        self.folder_edited();
-    }
-
-    pub fn folder_clear(&mut self) {
-        self.folder.clear();
-        self.folder_edited();
-    }
-
-    /// Replace the folder outright, as a completion does.
+    #[cfg(test)]
+    /// Replace the folder outright.
     pub fn folder_set(&mut self, s: &str) {
         self.folder.set(s);
         self.folder_edited();
+    }
+
+    /// A key while the folder's completion menu may be open; see
+    /// [`InputWidget::menu_key`].
+    pub fn folder_menu_key(&mut self, key: KeyEvent) -> MenuKey {
+        let outcome = self.folder.menu_key(key);
+        if outcome == MenuKey::Used {
+            self.folder_edited();
+        }
+        outcome
     }
 
     /// `↑` in the folder field: the next older recent folder.
@@ -695,23 +693,16 @@ impl Picker {
         self.probe.as_ref().filter(|p| p.folder == base)
     }
 
-    /// Tab in the folder field.
-    pub fn complete_folder(&mut self, list_dirs: impl Fn(&Path) -> io::Result<Vec<String>>) {
-        let done = complete_dir(self.folder.as_str(), &self.download_dir, list_dirs);
-        if let Some(input) = done.input {
-            self.folder_set(&input);
+    /// Tab in the folder field: complete the folder name before the cursor,
+    /// opening the menu when several fit.
+    pub fn complete_folder(&mut self, list_dirs: impl Fn(&Path) -> io::Result<Vec<Candidate>>) {
+        let done = complete_path(self.folder.before_cursor(), &self.download_dir, list_dirs);
+        let no_match = done.no_match;
+        self.folder.complete(done);
+        self.folder_edited();
+        if no_match {
+            self.message = Some("No matching folder".to_string());
         }
-        self.message = match done.candidates.len() {
-            0 if done.no_match => Some("No matching folder".to_string()),
-            0 | 1 => None,
-            n => {
-                let mut shown = done.candidates[..n.min(MAX_SHOWN_CANDIDATES)].join("  ");
-                if n > MAX_SHOWN_CANDIDATES {
-                    shown.push_str("  \u{2026}");
-                }
-                Some(shown)
-            }
-        };
     }
 
     // -- confirming -----------------------------------------------------
@@ -777,117 +768,10 @@ fn resolve_folder(input: &str, download_dir: &str) -> Result<PathBuf, String> {
     })
 }
 
-fn is_separator(c: char) -> bool {
-    c == '/' || (cfg!(windows) && c == '\\')
-}
-
-/// What a Tab press produced.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Completion {
-    /// The new field contents, when the completion moved it forward.
-    pub input: Option<String>,
-    /// Every matching name, when there is more than one.
-    pub candidates: Vec<String>,
-    /// Nothing in that folder starts with what was typed.
-    pub no_match: bool,
-}
-
-/// Shell-style completion of the last path segment against the directories
-/// `list_dirs` reports. A unique match completes with a trailing separator,
-/// ready for the next segment; several complete as far as they agree and are
-/// returned as candidates. What the user typed before the last segment is
-/// kept as typed — `~/Dow` becomes `~/Downloads/`, not `/home/me/Downloads/`.
-/// Hidden folders only show up once the segment starts with a `.`.
-pub fn complete_dir(
-    input: &str,
-    download_dir: &str,
-    list_dirs: impl Fn(&Path) -> io::Result<Vec<String>>,
-) -> Completion {
-    let (head, fragment) = match input.rfind(is_separator) {
-        Some(i) => input.split_at(i + 1),
-        None => ("", input),
-    };
-    // A bare `~` names a folder, but it is only a prefix once it has its
-    // separator.
-    if head.is_empty() && fragment == "~" {
-        return Completion {
-            input: Some(format!("~{}", std::path::MAIN_SEPARATOR)),
-            ..Default::default()
-        };
-    }
-    let dir = if head.is_empty() {
-        PathBuf::from(download_dir)
-    } else {
-        match resolve_folder(head, download_dir) {
-            Ok(dir) => dir,
-            Err(_) => return Completion::default(),
-        }
-    };
-    let Ok(names) = list_dirs(&dir) else {
-        return Completion {
-            no_match: true,
-            ..Default::default()
-        };
-    };
-    let mut matches: Vec<String> = names
-        .into_iter()
-        .filter(|name| name.starts_with(fragment))
-        .filter(|name| !name.starts_with('.') || fragment.starts_with('.'))
-        .collect();
-    matches.sort();
-    matches.dedup();
-    match matches.as_slice() {
-        [] => Completion {
-            no_match: true,
-            ..Default::default()
-        },
-        [only] => Completion {
-            input: Some(format!("{head}{only}{}", std::path::MAIN_SEPARATOR)),
-            ..Default::default()
-        },
-        [first, rest @ ..] => {
-            let common = rest.iter().fold(first.as_str(), |acc, name| {
-                let len = acc
-                    .char_indices()
-                    .zip(name.chars())
-                    .take_while(|((_, a), b)| a == b)
-                    .last()
-                    .map_or(0, |((i, a), _)| i + a.len_utf8());
-                &acc[..len]
-            });
-            Completion {
-                input: (common.len() > fragment.len()).then(|| format!("{head}{common}")),
-                candidates: matches.clone(),
-                no_match: false,
-            }
-        }
-    }
-}
-
-/// The real `list_dirs` for [`complete_dir`]: names of the directories in
-/// `dir`, symlinks to directories included. Read on a Tab press, capped at
-/// `MAX_COMPLETION_ENTRIES` entries.
-pub fn list_subdirs(dir: &Path) -> io::Result<Vec<String>> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(dir)?
-        .take(MAX_COMPLETION_ENTRIES)
-        .flatten()
-    {
-        let is_dir = entry
-            .file_type()
-            .is_ok_and(|t| t.is_dir() || (t.is_symlink() && entry.path().is_dir()));
-        if is_dir {
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-    }
-    Ok(names)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn file(index: usize, path: &str, size: u64) -> PreviewFile {
         PreviewFile {
@@ -1064,7 +948,7 @@ mod tests {
         assert_eq!(p.folder.as_str(), "/my/draft", "back to what was typed");
         assert_eq!(p.recent_position(), None);
         p.recent_older();
-        p.folder_push('x'); // editing it makes it the user's own
+        p.folder_key(key(KeyCode::Char('x'))); // editing it makes it the user's own
         assert_eq!(p.recent_position(), None);
         assert_eq!(p.folder.as_str(), "/srv/tvx");
     }
@@ -1291,7 +1175,7 @@ mod tests {
         assert_eq!(p.probe_due(now), Some(PathBuf::from("/dl")), "due on open");
         assert_eq!(p.probe_due(now), None, "only once");
 
-        p.folder_push('x');
+        p.folder_key(key(KeyCode::Char('x')));
         assert_eq!(p.probe_due(Instant::now()), None, "still typing");
         let later = Instant::now() + SPACE_PROBE_DELAY;
         assert_eq!(p.probe_due(later), Some(PathBuf::from("/dlx")));
@@ -1311,7 +1195,7 @@ mod tests {
         };
         assert!(p.apply_probe(fresh));
         assert_eq!(p.current_probe().and_then(|x| x.free), Some(5));
-        p.folder_pop();
+        p.folder_key(key(KeyCode::Backspace));
         assert!(p.current_probe().is_none(), "the reading belongs to /dlx");
     }
 
@@ -1361,100 +1245,71 @@ mod tests {
         assert_eq!(p.output_folder().unwrap(), cwd.join("dl"));
     }
 
-    fn dirs(names: &'static [&'static str]) -> impl Fn(&Path) -> io::Result<Vec<String>> {
-        move |_| Ok(names.iter().map(|s| s.to_string()).collect())
+    fn dirs(names: &'static [&'static str]) -> impl Fn(&Path) -> io::Result<Vec<Candidate>> {
+        move |_| Ok(names.iter().map(|s| Candidate::dir(s)).collect())
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
     }
 
     #[test]
-    fn completion_finishes_a_unique_match_with_a_separator() {
+    fn tab_in_the_picker_completes_or_opens_the_menu() {
         let sep = std::path::MAIN_SEPARATOR;
-        let done = complete_dir("/srv/me", "/dl", dirs(&["media", "backups"]));
-        assert_eq!(done.input, Some(format!("/srv/media{sep}")));
-        assert!(done.candidates.is_empty());
-    }
-
-    #[test]
-    fn completion_extends_to_the_common_prefix_and_lists_candidates() {
-        let done = complete_dir("/srv/m", "/dl", dirs(&["movies", "movies-4k", "music"]));
-        assert_eq!(done.input, None, "m is already the common prefix");
-        assert_eq!(done.candidates, vec!["movies", "movies-4k", "music"]);
-
-        let done = complete_dir("/srv/mo", "/dl", dirs(&["movies", "movies-4k"]));
-        assert_eq!(done.input, Some("/srv/movies".to_string()));
-    }
-
-    #[test]
-    fn completion_keeps_what_was_typed_and_resolves_where_it_points() {
-        let seen = std::cell::RefCell::new(Vec::new());
-        let list = |dir: &Path| {
-            seen.borrow_mut().push(dir.to_path_buf());
-            Ok(vec!["Downloads".to_string()])
-        };
-        let done = complete_dir("~/Dow", "/dl", list);
-        let sep = std::path::MAIN_SEPARATOR;
-        assert_eq!(done.input, Some(format!("~/Downloads{sep}")));
-        assert_eq!(seen.borrow()[0], PathBuf::from(expand_tilde("~/")));
-
-        // No separator at all: a name inside the download dir.
-        let seen = std::cell::RefCell::new(Vec::new());
-        let list = |dir: &Path| {
-            seen.borrow_mut().push(dir.to_path_buf());
-            Ok(vec!["films".to_string()])
-        };
-        complete_dir("fi", "/dl", list);
-        assert_eq!(seen.borrow()[0], PathBuf::from("/dl"));
-    }
-
-    #[test]
-    fn completion_hides_dot_folders_until_asked() {
-        let done = complete_dir("/h/", "/dl", dirs(&[".cache", "code"]));
-        assert_eq!(
-            done.input,
-            Some(format!("/h/code{}", std::path::MAIN_SEPARATOR))
-        );
-        let done = complete_dir("/h/.", "/dl", dirs(&[".cache", "code"]));
-        assert_eq!(
-            done.input,
-            Some(format!("/h/.cache{}", std::path::MAIN_SEPARATOR))
-        );
-    }
-
-    #[test]
-    fn completion_reports_no_match_and_unreadable_folders() {
-        assert!(complete_dir("/srv/zz", "/dl", dirs(&["media"])).no_match);
-        let unreadable = |_: &Path| -> io::Result<Vec<String>> {
-            Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
-        };
-        assert!(complete_dir("/nope/x", "/dl", unreadable).no_match);
-    }
-
-    #[test]
-    fn a_bare_tilde_completes_to_home() {
-        let done = complete_dir("~", "/dl", dirs(&[]));
-        assert_eq!(done.input, Some(format!("~{}", std::path::MAIN_SEPARATOR)));
-    }
-
-    #[test]
-    fn list_subdirs_reports_directories_only() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("file.txt"), b"x").unwrap();
-        assert_eq!(list_subdirs(dir.path()).unwrap(), vec!["sub"]);
-    }
-
-    #[test]
-    fn tab_in_the_picker_sets_the_folder_and_shows_candidates() {
         let mut p = picker();
         p.folder_set("/srv/m");
         p.complete_folder(dirs(&["movies", "music"]));
         assert_eq!(p.folder.as_str(), "/srv/m");
-        assert_eq!(p.message.as_deref(), Some("movies  music"));
-        p.folder_push('o');
-        assert_eq!(p.message, None, "typing clears the candidates");
+        let menu = p.folder.menu().expect("two folders fit");
+        assert_eq!(menu.items.len(), 2);
+        assert_eq!(p.message, None);
+
+        // The menu takes Tab and the arrows; the recent folders wait.
+        assert_eq!(p.folder_menu_key(key(KeyCode::Down)), MenuKey::Used);
+        assert_eq!(p.folder.as_str(), format!("/srv/movies{sep}"));
+        assert_eq!(p.folder_menu_key(key(KeyCode::Tab)), MenuKey::Used);
+        assert_eq!(p.folder.as_str(), format!("/srv/music{sep}"));
+        assert_eq!(p.folder_menu_key(key(KeyCode::Enter)), MenuKey::Used);
+        assert!(p.folder.menu().is_none());
+        assert_eq!(p.folder_menu_key(key(KeyCode::Enter)), MenuKey::Pass);
+
+        p.folder_set("/srv/mo");
         p.complete_folder(dirs(&["movies", "music"]));
-        assert_eq!(
-            p.folder.as_str(),
-            format!("/srv/movies{}", std::path::MAIN_SEPARATOR)
-        );
+        assert_eq!(p.folder.as_str(), format!("/srv/movies{sep}"));
+        assert!(p.folder.menu().is_none());
+    }
+
+    #[test]
+    fn a_completion_that_finds_nothing_says_so_for_one_key() {
+        let mut p = picker();
+        p.folder_set("/srv/zz");
+        p.complete_folder(dirs(&["media"]));
+        assert_eq!(p.message.as_deref(), Some("No matching folder"));
+        p.folder_key(key(KeyCode::Backspace));
+        assert_eq!(p.message, None);
+    }
+
+    #[test]
+    fn the_folder_completes_at_the_cursor() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let mut p = picker();
+        p.folder_set("/srv/me/tv");
+        for _ in 0..3 {
+            p.folder_key(key(KeyCode::Left));
+        }
+        p.complete_folder(dirs(&["media"]));
+        assert_eq!(p.folder.as_str(), format!("/srv/media{sep}/tv"));
+    }
+
+    #[test]
+    fn editing_keys_reach_the_filter_and_refilter() {
+        let mut p = picker();
+        p.filter_push_str("season 1");
+        assert_eq!(p.visible().len(), 2);
+        p.filter_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(p.filter.as_str(), "season ");
+        assert_eq!(p.visible().len(), 3);
+        p.filter_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(p.visible().len(), 2, "undo refilters too");
     }
 }

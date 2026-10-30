@@ -24,6 +24,7 @@
 mod actions;
 mod add_picker;
 mod app;
+mod completion;
 mod config;
 mod engine;
 mod file_tree;
@@ -60,7 +61,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing_subscriber::{prelude::*, EnvFilter};
 use types::{AppMode, DetailTab, PreviewOutcome, PreviewResult};
-use ui::input::{validate_magnet, validate_torrent_source, InputWidget};
+use ui::input::{validate_magnet, validate_torrent_source, InputWidget, MenuKey};
 
 /// Speed-limit cap in KB/s: ⌊10⁹ / 1024⌋, ≈953 MiB/s. The binding constraint
 /// is governor's pacing ceiling, not the `NonZeroU32` quota: librqbit's
@@ -96,10 +97,6 @@ pub(crate) fn clamped_speed_limit(kbps: u64) -> u64 {
 /// `torrenttui=warn`, which writes almost nothing, so this only bites people
 /// running with `RUST_LOG` turned up.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
-
-/// Maximum digits accepted in the throttle input dialog. Combined with the
-/// numeric cap above, anything past this gets truncated visually.
-const MAX_THROTTLE_INPUT_DIGITS: usize = 8;
 
 #[derive(Parser)]
 #[command(name = "torrenttui", version, about = "Terminal BitTorrent client")]
@@ -1171,18 +1168,29 @@ async fn run_app(
                             chunks[2],
                             &input_widget,
                             app.input_pick,
+                            app.input_note.as_deref(),
                             app.theme,
                         );
+                        if let Some(menu) = input_widget.menu() {
+                            ui::input::render_menu(
+                                f,
+                                chunks[2],
+                                f.area(),
+                                chunks[2].x + 1,
+                                menu,
+                                app.theme,
+                            );
+                        }
                     }
                     AppMode::Filter => {
-                        ui::layout::render_filter_bar(f, chunks[2], &app.filter_text, app.theme);
+                        ui::layout::render_filter_bar(f, chunks[2], &app.filter_input, app.theme);
                     }
                     AppMode::ThrottleInput => {
                         ui::layout::render_throttle_bar(
                             f,
                             chunks[2],
                             app.throttle_step,
-                            &app.throttle_input_buf,
+                            &app.throttle_input,
                             app.theme,
                         );
                     }
@@ -1362,10 +1370,10 @@ async fn run_app(
                     }
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::Input => {
                         // Bracketed-paste payload (e.g. a magnet link from the
-                        // clipboard). push_str filters control chars per-char
-                        // so escape sequences in the paste never reach the
-                        // buffer or the engine.
-                        input_widget.push_str(&s);
+                        // clipboard), inserted at the cursor. insert_str
+                        // filters control chars per-char so escape sequences
+                        // in the paste never reach the buffer or the engine.
+                        input_widget.insert_str(&s);
                         needs_render = true;
                     }
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::Filter => {
@@ -1376,10 +1384,8 @@ async fn run_app(
                         needs_render = true;
                     }
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::Search => {
-                        // Same filter+cap as typing — search_push_char owns both.
-                        for c in s.chars() {
-                            app.search_push_char(c);
-                        }
+                        // Same filter+cap as typing — the field owns both.
+                        app.search.input.insert_str(&s);
                         needs_render = true;
                     }
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::AddPicker => {
@@ -1387,9 +1393,12 @@ async fn run_app(
                         needs_render = true;
                     }
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::Palette => {
-                        for c in s.chars() {
-                            app.palette_push_char(c);
-                        }
+                        app.palette_paste(&s);
+                        needs_render = true;
+                    }
+                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::ThrottleInput => {
+                        // Digits only, like typing.
+                        app.throttle_input.insert_str(&s);
                         needs_render = true;
                     }
                     Some(Ok(Event::Resize(_, _))) => {
@@ -1517,6 +1526,7 @@ fn request_quit(app: &mut App) {
 fn open_add_input(app: &mut App, input_widget: &mut InputWidget) {
     app.mode = AppMode::Input;
     app.input_pick = false;
+    app.input_note = None;
     input_widget.clear();
 }
 
@@ -1644,11 +1654,18 @@ async fn open_detail_on(app: &mut App, tab: DetailTab, cmd_tx: &mpsc::Sender<Eng
 fn open_throttle(app: &mut App) {
     app.mode = AppMode::ThrottleInput;
     app.throttle_step = 0;
-    app.throttle_input_buf = if app.speed_limit_download_kbps > 0 {
-        app.speed_limit_download_kbps.to_string()
+    app.throttle_input
+        .set(&limit_text(app.speed_limit_download_kbps));
+}
+
+/// What the speed-limit dialog starts with: the current limit, or nothing
+/// for unlimited.
+fn limit_text(kbps: u64) -> String {
+    if kbps > 0 {
+        kbps.to_string()
     } else {
         String::new()
-    };
+    }
 }
 
 fn toggle_mark_and_advance(app: &mut App) {
@@ -1706,10 +1723,15 @@ async fn handle_input_mode(
     key: crossterm::event::KeyEvent,
     cmd_tx: &mpsc::Sender<EngineCommand>,
 ) {
+    app.input_note = None;
+    if input_widget.menu_key(key) == MenuKey::Used {
+        return;
+    }
     match key.code {
         KeyCode::Esc => {
             app.mode = AppMode::Normal;
         }
+        KeyCode::Tab => complete_add_input(app, input_widget, completion::list_torrent_sources),
         KeyCode::Enter => {
             // No shell is involved in TUI input, so `~/x.torrent` only works
             // if we expand it ourselves.
@@ -1738,14 +1760,28 @@ async fn handle_input_mode(
                 }
             }
         }
-        KeyCode::Backspace => {
-            input_widget.pop();
+        _ => {
+            input_widget.handle_key(key);
         }
-        KeyCode::Char(c) => {
-            input_widget.push(c);
-        }
-        _ => {}
     }
+}
+
+/// Tab in the add bar: complete a `.torrent` path, relative to the working
+/// directory like the add itself. A magnet has nothing to complete.
+fn complete_add_input(
+    app: &mut App,
+    input_widget: &mut InputWidget,
+    list: impl Fn(&Path) -> io::Result<Vec<completion::Candidate>>,
+) {
+    let before = input_widget.before_cursor();
+    if before.trim_start().starts_with("magnet:") {
+        return;
+    }
+    let done = completion::complete_path(before, ".", list);
+    if done.no_match {
+        app.input_note = Some("No matching .torrent file or folder".to_string());
+    }
+    input_widget.complete(done);
 }
 
 /// Build the shared HTTP client for indexer searches. `https_only` because
@@ -1843,13 +1879,9 @@ fn handle_search_input_mode(
         KeyCode::Enter => {
             start_search(app, search_tx, search_client, false);
         }
-        KeyCode::Backspace => {
-            app.search_pop_char();
+        _ => {
+            app.search.input.handle_key(key);
         }
-        KeyCode::Char(c) => {
-            app.search_push_char(c);
-        }
-        _ => {}
     }
 }
 
@@ -2249,7 +2281,6 @@ async fn handle_add_picker_mode(
     key: crossterm::event::KeyEvent,
     cmd_tx: &mpsc::Sender<EngineCommand>,
 ) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let outcome = match app.add_picker.as_mut() {
         None => PickerKey::Cancel,
         Some(AddPickerState::Resolving { .. }) => match key.code {
@@ -2257,9 +2288,9 @@ async fn handle_add_picker_mode(
             _ => PickerKey::Stay,
         },
         Some(AddPickerState::Ready(picker)) => {
-            // A refusal or a completion list answers one keypress.
+            // A refusal or a failed completion answers one keypress.
             picker.message = None;
-            picker_key(picker, key.code, ctrl)
+            picker_key(picker, key)
         }
     };
     match outcome {
@@ -2269,9 +2300,9 @@ async fn handle_add_picker_mode(
     }
 }
 
-fn picker_key(picker: &mut Picker, code: KeyCode, ctrl: bool) -> PickerKey {
+fn picker_key(picker: &mut Picker, key: crossterm::event::KeyEvent) -> PickerKey {
     match picker.focus {
-        Focus::List => match code {
+        Focus::List => match key.code {
             KeyCode::Char('j') | KeyCode::Down => picker.move_by(1),
             KeyCode::Char('k') | KeyCode::Up => picker.move_by(-1),
             KeyCode::Char('g') | KeyCode::Home => picker.top(),
@@ -2295,27 +2326,24 @@ fn picker_key(picker: &mut Picker, code: KeyCode, ctrl: bool) -> PickerKey {
             KeyCode::Esc => return PickerKey::Cancel,
             _ => {}
         },
-        Focus::Filter => match code {
+        Focus::Filter => match key.code {
             KeyCode::Esc => {
                 picker.filter_clear();
                 picker.focus = Focus::List;
             }
             KeyCode::Enter | KeyCode::Down | KeyCode::Tab => picker.focus = Focus::List,
-            KeyCode::Backspace => picker.filter_pop(),
-            KeyCode::Char('u') if ctrl => picker.filter_clear(),
-            KeyCode::Char(c) if !ctrl => picker.filter_push(c),
-            _ => {}
+            _ => picker.filter_key(key),
         },
-        Focus::Folder => match code {
+        // An open completion menu has first call on Tab, the arrows, Enter
+        // and Esc; everything else closes it and lands below as usual.
+        Focus::Folder => match key.code {
+            _ if picker.folder_menu_key(key) == MenuKey::Used => {}
             KeyCode::Esc | KeyCode::BackTab => picker.focus = Focus::List,
             KeyCode::Enter => return PickerKey::Confirm,
-            KeyCode::Tab => picker.complete_folder(add_picker::list_subdirs),
+            KeyCode::Tab => picker.complete_folder(completion::list_subdirs),
             KeyCode::Up => picker.recent_older(),
             KeyCode::Down => picker.recent_newer(),
-            KeyCode::Backspace => picker.folder_pop(),
-            KeyCode::Char('u') if ctrl => picker.folder_clear(),
-            KeyCode::Char(c) if !ctrl => picker.folder_push(c),
-            _ => {}
+            _ => picker.folder_key(key),
         },
     }
     PickerKey::Stay
@@ -2411,9 +2439,7 @@ async fn handle_palette_mode(
         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.palette_previous()
         }
-        KeyCode::Backspace => app.palette_pop_char(),
-        KeyCode::Char(c) => app.palette_push_char(c),
-        _ => {}
+        _ => app.palette_key(key),
     }
 }
 
@@ -2471,13 +2497,9 @@ fn handle_filter_mode(app: &mut App, key: crossterm::event::KeyEvent) {
             app.mode = AppMode::Normal;
             app.restore_selection();
         }
-        KeyCode::Backspace => {
-            app.pop_filter_char();
+        _ => {
+            app.filter_key(key);
         }
-        KeyCode::Char(c) => {
-            app.push_filter_char(c);
-        }
-        _ => {}
     }
 }
 
@@ -2490,26 +2512,16 @@ async fn handle_throttle_mode(
         KeyCode::Esc => {
             app.mode = AppMode::Normal;
         }
-        KeyCode::Backspace => {
-            app.throttle_input_buf.pop();
-        }
-        KeyCode::Char(c)
-            if c.is_ascii_digit() && app.throttle_input_buf.len() < MAX_THROTTLE_INPUT_DIGITS =>
-        {
-            app.throttle_input_buf.push(c);
-        }
         KeyCode::Enter => {
             // Clamp exactly like the engine will, so the dialog, status bar
             // and enforced limit all agree (including the 16 KB/s floor).
-            let value = clamped_speed_limit(app.throttle_input_buf.parse::<u64>().unwrap_or(0));
+            let value =
+                clamped_speed_limit(app.throttle_input.as_str().parse::<u64>().unwrap_or(0));
             if app.throttle_step == 0 {
                 app.throttle_download_value = value;
                 app.throttle_step = 1;
-                app.throttle_input_buf = if app.speed_limit_upload_kbps > 0 {
-                    app.speed_limit_upload_kbps.to_string()
-                } else {
-                    String::new()
-                };
+                app.throttle_input
+                    .set(&limit_text(app.speed_limit_upload_kbps));
             } else {
                 app.throttle_upload_value = value;
                 app.speed_limit_download_kbps = app.throttle_download_value;
@@ -2526,7 +2538,9 @@ async fn handle_throttle_mode(
                 app.mode = AppMode::Normal;
             }
         }
-        _ => {}
+        _ => {
+            app.throttle_input.handle_key(key);
+        }
     }
 }
 
@@ -3031,12 +3045,12 @@ mod tests {
         app.mode = AppMode::Filter;
         handle_filter_mode(&mut app, key(KeyCode::Char('a')));
         handle_filter_mode(&mut app, key(KeyCode::Char('b')));
-        assert_eq!(app.filter_text, "ab");
+        assert_eq!(app.filter_input.as_str(), "ab");
         handle_filter_mode(&mut app, key(KeyCode::Backspace));
-        assert_eq!(app.filter_text, "a");
+        assert_eq!(app.filter_input.as_str(), "a");
         handle_filter_mode(&mut app, key(KeyCode::Esc));
         assert_eq!(app.mode, AppMode::Normal);
-        assert_eq!(app.filter_text, ""); // Esc clears the filter
+        assert_eq!(app.filter_input.as_str(), ""); // Esc clears the filter
     }
 
     fn torrent(id: usize, status: types::TorrentStatus) -> types::TorrentInfo {
@@ -3191,7 +3205,7 @@ mod tests {
         handle_normal_mode(app, &mut iw, key(KeyCode::Char('A')), tx).await;
         assert_eq!(app.mode, AppMode::Input);
         assert!(app.input_pick);
-        iw.push_str(MAGNET);
+        iw.insert_str(MAGNET);
         handle_input_mode(app, &mut iw, key(KeyCode::Enter), tx).await;
         assert_eq!(app.mode, AppMode::AddPicker);
         match rx.try_recv().expect("a command") {
@@ -3213,7 +3227,7 @@ mod tests {
         handle_input_mode(&mut app, &mut iw, key(KeyCode::Esc), &tx).await;
         handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('a')), &tx).await;
         assert!(!app.input_pick);
-        iw.push_str(MAGNET);
+        iw.insert_str(MAGNET);
         handle_input_mode(&mut app, &mut iw, key(KeyCode::Enter), &tx).await;
         assert!(matches!(
             rx.try_recv().expect("a command"),
@@ -3592,7 +3606,7 @@ mod tests {
             &mut client,
         )
         .await;
-        assert_eq!(app.palette.input, "j");
+        assert_eq!(app.palette.input.as_str(), "j");
         handle_palette_mode(
             &mut app,
             key(KeyCode::Esc),
@@ -3791,7 +3805,7 @@ mod tests {
         for c in "arch".chars() {
             handle_search_input_mode(&mut app, key(KeyCode::Char(c)), &search_tx, &mut client);
         }
-        assert_eq!(app.search.input, "arch");
+        assert_eq!(app.search.input.as_str(), "arch");
         handle_search_input_mode(&mut app, key(KeyCode::Enter), &search_tx, &mut client);
         assert_eq!(app.mode, AppMode::SearchResults);
         assert!(app.search.in_flight);
@@ -3833,7 +3847,7 @@ mod tests {
         app.search_config.enable_apibay = false;
         app.search_config.enable_torrents_csv = false;
         app.mode = AppMode::Search;
-        app.search.input = "arch".to_string();
+        app.search.input.set("arch");
         handle_search_input_mode(&mut app, key(KeyCode::Enter), &search_tx, &mut client);
         assert_eq!(app.mode, AppMode::Search);
         assert!(!app.search.in_flight);
@@ -4090,7 +4104,7 @@ mod tests {
         let mut client = None;
         let mut app = App::new();
         app.mode = AppMode::SearchResults;
-        app.search.input = "arch".to_string();
+        app.search.input.set("arch");
         handle_search_results_mode(
             &mut app,
             key(KeyCode::Char('s')),
@@ -4100,6 +4114,251 @@ mod tests {
         )
         .await;
         assert_eq!(app.mode, AppMode::Search);
-        assert_eq!(app.search.input, "arch");
+        assert_eq!(app.search.input.as_str(), "arch");
+    }
+
+    // -- text fields (#102) ----------------------------------------------
+
+    fn alt(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    async fn type_into(
+        app: &mut App,
+        iw: &mut InputWidget,
+        text: &str,
+        tx: &mpsc::Sender<EngineCommand>,
+    ) {
+        for c in text.chars() {
+            handle_input_mode(app, iw, key(KeyCode::Char(c)), tx).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_add_bar_edits_in_place_and_chords_type_nothing() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('a')), &tx).await;
+        // A typo at the very start, fixed without retyping the rest.
+        type_into(&mut app, &mut iw, &MAGNET[1..], &tx).await;
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Home), &tx).await;
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Char('m')), &tx).await;
+        // Unbound chords used to type their letter here.
+        for k in [
+            ctrl(KeyCode::Char('x')),
+            alt(KeyCode::Char('x')),
+            ctrl(KeyCode::Char('g')),
+        ] {
+            handle_input_mode(&mut app, &mut iw, k, &tx).await;
+        }
+        assert_eq!(iw.as_str(), MAGNET);
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Enter), &tx).await;
+        match rx.try_recv().expect("a command") {
+            EngineCommand::AddTorrent(source) => assert_eq!(source, MAGNET),
+            other => panic!("expected AddTorrent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_in_the_add_bar_completes_a_torrent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["debian-11.torrent", "debian-12.torrent", "notes.txt"] {
+            std::fs::write(dir.path().join(name), b"d").unwrap();
+        }
+        let base = format!("{}{}", dir.path().display(), std::path::MAIN_SEPARATOR);
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('a')), &tx).await;
+        type_into(&mut app, &mut iw, &format!("{base}deb"), &tx).await;
+
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Tab), &tx).await;
+        assert_eq!(
+            iw.as_str(),
+            format!("{base}debian-1"),
+            "as far as both agree"
+        );
+        assert_eq!(
+            iw.menu().map(|m| m.items.len()),
+            Some(2),
+            "the .txt is left out"
+        );
+
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Tab), &tx).await;
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Tab), &tx).await;
+        assert_eq!(iw.as_str(), format!("{base}debian-12.torrent"));
+        // Enter takes the choice; it does not add yet.
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Enter), &tx).await;
+        assert!(iw.menu().is_none());
+        assert_eq!(app.mode, AppMode::Input);
+        assert!(rx.try_recv().is_err());
+
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Enter), &tx).await;
+        match rx.try_recv().expect("a command") {
+            EngineCommand::AddTorrent(source) => {
+                assert_eq!(source, format!("{base}debian-12.torrent"))
+            }
+            other => panic!("expected AddTorrent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_after_a_magnet_or_with_no_match() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('a')), &tx).await;
+        iw.insert_str(MAGNET);
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Tab), &tx).await;
+        assert_eq!(iw.as_str(), MAGNET, "a magnet has nothing to complete");
+        assert_eq!(app.input_note, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        iw.set(&format!(
+            "{}{}zz",
+            dir.path().display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Tab), &tx).await;
+        assert!(app.input_note.is_some(), "a Tab that finds nothing says so");
+        handle_input_mode(&mut app, &mut iw, key(KeyCode::Backspace), &tx).await;
+        assert_eq!(app.input_note, None, "for one key");
+    }
+
+    #[tokio::test]
+    async fn the_folder_menu_takes_the_arrows_and_enter_from_the_picker() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["movies", "music"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let base = format!("{}{sep}", dir.path().display());
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        app.download_dir = "/dl".to_string();
+        app.recent_dirs.push("/srv/recent", "/dl");
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        handle_add_picker_mode(&mut app, key(KeyCode::Tab), &tx).await;
+        handle_add_picker_mode(&mut app, ctrl(KeyCode::Char('u')), &tx).await;
+        for c in format!("{base}m").chars() {
+            handle_add_picker_mode(&mut app, key(KeyCode::Char(c)), &tx).await;
+        }
+        let folder = |app: &App| match &app.add_picker {
+            Some(AddPickerState::Ready(p)) => (p.folder.value(), p.focus),
+            _ => panic!("picker should be open"),
+        };
+        handle_add_picker_mode(&mut app, key(KeyCode::Tab), &tx).await;
+        // ↑ walks the menu, not the recent folders.
+        handle_add_picker_mode(&mut app, key(KeyCode::Up), &tx).await;
+        assert_eq!(folder(&app), (format!("{base}music{sep}"), Focus::Folder));
+        // Shift+Tab steps back in the menu instead of leaving the field.
+        handle_add_picker_mode(&mut app, key(KeyCode::BackTab), &tx).await;
+        assert_eq!(folder(&app), (format!("{base}movies{sep}"), Focus::Folder));
+        // Enter keeps the choice and leaves the picker open.
+        handle_add_picker_mode(&mut app, key(KeyCode::Enter), &tx).await;
+        assert!(rx.try_recv().is_err(), "not added yet");
+        assert_eq!(app.mode, AppMode::AddPicker);
+        // With the menu gone the keys are back to their usual jobs.
+        handle_add_picker_mode(&mut app, key(KeyCode::Up), &tx).await;
+        assert_eq!(folder(&app), ("/srv/recent".to_string(), Focus::Folder));
+        handle_add_picker_mode(&mut app, key(KeyCode::BackTab), &tx).await;
+        assert_eq!(folder(&app).1, Focus::List);
+    }
+
+    #[tokio::test]
+    async fn the_search_bar_edits_in_place() {
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut app = App::new();
+        app.mode = AppMode::Search;
+        for c in "arch linx".chars() {
+            handle_search_input_mode(&mut app, key(KeyCode::Char(c)), &search_tx, &mut client);
+        }
+        handle_search_input_mode(&mut app, key(KeyCode::Left), &search_tx, &mut client);
+        handle_search_input_mode(&mut app, key(KeyCode::Char('u')), &search_tx, &mut client);
+        handle_search_input_mode(&mut app, ctrl(KeyCode::Char('x')), &search_tx, &mut client);
+        assert_eq!(app.search.input.as_str(), "arch linux");
+        handle_search_input_mode(&mut app, alt(KeyCode::Backspace), &search_tx, &mut client);
+        assert_eq!(app.search.input.as_str(), "arch x");
+    }
+
+    #[test]
+    fn the_filter_bar_takes_the_editing_keys() {
+        let mut app = App::new();
+        app.mode = AppMode::Filter;
+        for c in "ubuntu iso".chars() {
+            handle_filter_mode(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_filter_mode(&mut app, ctrl(KeyCode::Char('w')));
+        assert_eq!(app.filter_input.as_str(), "ubuntu ");
+        handle_filter_mode(&mut app, ctrl(KeyCode::Char('z')));
+        assert_eq!(app.filter_input.as_str(), "ubuntu iso");
+        handle_filter_mode(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.filter_input.as_str(), "");
+    }
+
+    #[tokio::test]
+    async fn the_speed_limit_bar_edits_its_digits_in_place() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        app.speed_limit_download_kbps = 500;
+        open_throttle(&mut app);
+        assert_eq!(app.throttle_input.as_str(), "500");
+        handle_throttle_mode(&mut app, key(KeyCode::Home), &tx).await;
+        handle_throttle_mode(&mut app, key(KeyCode::Char('1')), &tx).await;
+        handle_throttle_mode(&mut app, key(KeyCode::Char('k')), &tx).await;
+        assert_eq!(app.throttle_input.as_str(), "1500", "digits only");
+        handle_throttle_mode(&mut app, key(KeyCode::Enter), &tx).await;
+        handle_throttle_mode(&mut app, key(KeyCode::Enter), &tx).await;
+        match rx.try_recv().expect("a command") {
+            EngineCommand::SetSpeedLimits { download_kbps, .. } => assert_eq!(download_kbps, 1500),
+            other => panic!("expected SetSpeedLimits, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_palette_keeps_its_navigation_chords_and_gains_editing() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let (search_tx, _search_rx) = search_channel();
+        let mut client = None;
+        let mut iw = InputWidget::new();
+        let mut app = App::new();
+        assert!(app.open_palette());
+        for k in [
+            key(KeyCode::Char('q')),
+            key(KeyCode::Char('u')),
+            key(KeyCode::Char('i')),
+            key(KeyCode::Char('t')),
+            ctrl(KeyCode::Char('j')),
+        ] {
+            handle_palette_mode(&mut app, k, &mut iw, &tx, &search_tx, &mut client).await;
+        }
+        assert_eq!(
+            app.palette.input.as_str(),
+            "quit",
+            "Ctrl+J navigates, it does not type"
+        );
+        handle_palette_mode(
+            &mut app,
+            ctrl(KeyCode::Char('w')),
+            &mut iw,
+            &tx,
+            &search_tx,
+            &mut client,
+        )
+        .await;
+        assert_eq!(app.palette.input.as_str(), "");
+        assert!(
+            app.palette.anchor.is_none(),
+            "an edit puts the cursor back on top"
+        );
     }
 }
