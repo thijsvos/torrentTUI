@@ -196,7 +196,7 @@ folder you chose, just as it would in `download_dir`.
 | `s` | Sort by torrent order, size, or name |
 | `/` | Filter the files (`Enter` back to the list, `Esc` clears) |
 | `j` / `k`, `g` / `G`, `PgUp` / `PgDn` | Move, jump to top / bottom, page |
-| `Tab` | Edit the save folder (`Tab` there completes, `↑` / `↓` step through recent folders, `Ctrl+U` clears, `Esc` goes back) |
+| `Tab` | Edit the save folder (`Tab` there completes, `↑` / `↓` step through recent folders, `Esc` goes back; [the text-field keys](#text-fields) work there too) |
 | `Enter` | Add with these files, into this folder |
 | `Esc` | Clear the filter, or cancel |
 
@@ -226,6 +226,43 @@ Good to know:
   file to clear the list.
 - Adds that do not go through the keyboard — the CLI argument, a magnet handed
   to a running session, the watch folder — still add straight away.
+
+### Text fields
+
+Every text box — the add bar, the filter, search, the command palette, the
+speed-limit dialog, and the add picker's filter and save folder — edits the
+same way, with the keys a shell uses:
+
+| Key | Action |
+|-----|--------|
+| `←` / `→`, `Home` / `End` (or `Ctrl+A` / `Ctrl+E`) | Move the cursor; typing goes in where it is |
+| `Ctrl+←` / `Ctrl+→` (or `Alt+B` / `Alt+F`) | Move a word at a time |
+| `Backspace` / `Delete` | Delete the character before / under the cursor |
+| `Ctrl+W` (or `Alt+Backspace`, `Ctrl+Backspace`) | Delete the word before the cursor |
+| `Alt+D` (or `Ctrl+Delete`) | Delete the word after the cursor |
+| `Ctrl+U` / `Ctrl+K` | Delete everything before / after the cursor |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo (`Ctrl+Shift+Z` redoes too, where the terminal reports it) |
+
+A word is a run of letters and digits, so in a path a word step moves one
+folder name: at the end of `/home/me/Downloads/`, `Ctrl+W` leaves `/home/me/`.
+Undo takes back a word of typing, a run of deletes, or a paste at a time.
+
+`Tab` completes paths: in the add bar, `.torrent` files and the folders on the
+way to them (relative paths start where TorrentTUI was launched, as the add
+itself does); in the picker's save folder, folders. When more than one name
+fits, `Tab` fills in what they share and opens a menu of them:
+
+| Key | In the completion menu |
+|-----|------------------------|
+| `Tab` / `↓` | Next choice — the field shows it in place |
+| `Shift+Tab` / `↑` | Previous choice |
+| `Enter` | Keep the choice (it does not add the torrent yet) |
+| `Esc` | Close the menu, back to what you typed |
+| Anything else | Keep the choice and carry on — type, `/`, `Backspace` |
+
+Not every terminal sends `Ctrl+←`, `Ctrl+Backspace`, `Ctrl+Delete` or
+`Ctrl+Shift+Z` as keys of their own; the `Ctrl`/`Alt` letter chords reach the
+app from all of them.
 
 ### Search
 

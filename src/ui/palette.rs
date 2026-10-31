@@ -35,11 +35,13 @@ pub fn render_palette(f: &mut Frame, area: Rect, app: &mut App) {
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
 
-    let input_line = Line::from(vec![
-        Span::styled(" > ", Style::default().fg(theme.primary)),
-        Span::raw(app.palette.input.as_str()),
-        Span::styled("\u{2588}", Style::default().fg(theme.text)),
-    ]);
+    let mut spans = vec![Span::styled(" > ", Style::default().fg(theme.primary))];
+    spans.extend(app.palette.input.spans(
+        (chunks[0].width as usize).saturating_sub(3),
+        Style::default(),
+        Some(Style::default().fg(theme.text)),
+    ));
+    let input_line = Line::from(spans);
     f.render_widget(Paragraph::new(input_line), chunks[0]);
 
     let matches = app.palette_matches();

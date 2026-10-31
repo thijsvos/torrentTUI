@@ -11,7 +11,7 @@
 //! dominated CPU at hundreds of torrents. Anything that changes the filter, the
 //! sort, or the torrent list must therefore invalidate the cache, rebuild it,
 //! and then restore the selection — which is why `change_sort_column`,
-//! `push_filter_char` and friends exist as wrappers instead of callers poking
+//! `filter_key` and friends exist as wrappers instead of callers poking
 //! the fields directly.
 //!
 //! `torrents` is replaced wholesale on every push, so state keyed by torrent id
@@ -30,6 +30,7 @@ use crate::recent_dirs::RecentDirs;
 use crate::search::{SearchOutcome, SearchResult};
 use crate::theme::{self, Theme};
 use crate::types::{AppMode, DetailTab, NetworkHealth, SortColumn, TorrentInfo, TorrentStatus};
+use crate::ui::input::{Edit, InputWidget};
 use ratatui::widgets::TableState;
 
 /// Per-torrent progress bookkeeping for the stall doctor. `bytes` is the last
@@ -52,8 +53,13 @@ const MAX_PALETTE_QUERY_CHARS: usize = 64;
 /// Cap on the torrent-table filter (mirrors `search::MAX_QUERY_CHARS`).
 /// Torrent names are bounded, so a longer needle can't match anything — and
 /// without a cap a stray paste of the wrong clipboard buffer grows
-/// `filter_text` without limit.
+/// the filter without limit.
 const MAX_FILTER_CHARS: usize = 200;
+
+/// Maximum digits accepted in the throttle input dialog. Combined with the
+/// numeric cap in `clamped_speed_limit`, anything past this gets truncated
+/// visually.
+const MAX_THROTTLE_INPUT_DIGITS: usize = 8;
 
 /// How long a sent file selection overrides the engine's report. The echo
 /// normally lands on the next push (100 ms); this only bounds how long a
@@ -96,7 +102,7 @@ fn selected_indices(files: &[bool]) -> Vec<usize> {
 pub struct PaletteState {
     /// Live filter text (control/bidi chars rejected on entry, like the
     /// search query).
-    pub input: String,
+    pub input: InputWidget,
     /// The action the cursor is on, tracked by identity rather than by index:
     /// availability predicates re-filter the match list on background events
     /// (a search outcome landing, metadata arriving), and an index would let
@@ -114,7 +120,7 @@ impl PaletteState {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
         Self {
-            input: String::new(),
+            input: InputWidget::with_cap(MAX_PALETTE_QUERY_CHARS),
             anchor: None,
             return_mode: AppMode::Normal,
             table_state,
@@ -199,11 +205,10 @@ impl ResultSortColumn {
 /// coming back shows the last query and results untouched) and only firing a
 /// new search replaces it.
 pub struct SearchState {
-    /// Live edit buffer for the query bar. A plain `String` like
-    /// `filter_text`, deliberately not the shared `InputWidget` — the add
-    /// dialog clears that widget on entry, which would eat the remembered
-    /// query, and a plain field keeps the handlers testable.
-    pub input: String,
+    /// Live edit buffer for the query bar. Its own field, not the add bar's:
+    /// the add dialog clears that one on entry, which would eat the
+    /// remembered query.
+    pub input: InputWidget,
     /// The last *fired* query, for the results title and the `r` retry.
     pub query: String,
     /// Monotonic query id, bumped only when a search fires. Outcomes carrying
@@ -241,7 +246,7 @@ impl SearchState {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
         Self {
-            input: String::new(),
+            input: InputWidget::with_cap(crate::search::MAX_QUERY_CHARS),
             query: String::new(),
             generation: 0,
             in_flight: false,
@@ -277,7 +282,7 @@ pub struct App {
     /// Set with `should_quit` when the user confirmed a detach, so `main` knows
     /// to hand the session to a background process instead of ending it.
     pub detach_requested: bool,
-    pub filter_text: String,
+    pub filter_input: InputWidget,
     /// Counts `rebuild_sort_cache` runs so tests can pin batching claims —
     /// e.g. that one paste re-sorts once, not once per character.
     #[cfg(test)]
@@ -285,7 +290,7 @@ pub struct App {
     pub free_disk_space: Option<u64>,
     pub disk_space_timer: Option<std::time::Instant>,
     pub throttle_step: u8, // 0 = download, 1 = upload
-    pub throttle_input_buf: String,
+    pub throttle_input: InputWidget,
     pub throttle_download_value: u64,
     pub throttle_upload_value: u64,
     pub speed_limit_download_kbps: u64,
@@ -374,6 +379,8 @@ pub struct App {
     pub preview_ticket: u64,
     /// Whether the add bar is the `A` flavour, which goes on to the picker.
     pub input_pick: bool,
+    /// A remark under the add bar for one keypress: a Tab that found nothing.
+    pub input_note: Option<String>,
     /// The mode the picker returns to: the torrent list, or the search
     /// results it was opened from.
     pub add_picker_return: AppMode,
@@ -428,13 +435,15 @@ impl App {
             spinner_tick: 0,
             should_quit: false,
             detach_requested: false,
-            filter_text: String::new(),
+            filter_input: InputWidget::with_cap(MAX_FILTER_CHARS),
             #[cfg(test)]
             sort_rebuilds: 0,
             free_disk_space: None,
             disk_space_timer: None,
             throttle_step: 0,
-            throttle_input_buf: String::new(),
+            throttle_input: InputWidget::with_filter(MAX_THROTTLE_INPUT_DIGITS, |c| {
+                c.is_ascii_digit()
+            }),
             throttle_download_value: 0,
             throttle_upload_value: 0,
             speed_limit_download_kbps: 0,
@@ -465,6 +474,7 @@ impl App {
             add_picker: None,
             preview_ticket: 0,
             input_pick: false,
+            input_note: None,
             add_picker_return: AppMode::Normal,
             add_picker_result: None,
             recent_dirs: RecentDirs::default(),
@@ -503,7 +513,7 @@ impl App {
     }
 
     /// Mark the cached sort order as dirty. Call from anywhere that mutates
-    /// `torrents`, `sort_column`, `sort_reversed`, or `filter_text`.
+    /// `torrents`, `sort_column`, `sort_reversed`, or the filter.
     pub fn invalidate_sort(&mut self) {
         self.sort_dirty = true;
     }
@@ -645,7 +655,7 @@ impl App {
     }
 
     /// Set a new sort column and refresh the cache. Prefer these wrappers
-    /// over assigning `sort_column` / `sort_reversed` / `filter_text` directly:
+    /// over assigning `sort_column` / `sort_reversed` / `filter_input` directly:
     /// each has to pair `invalidate_sort` with `ensure_sort_cache` *and*
     /// `restore_selection`, and skipping the last one leaves the user's cursor
     /// on whatever torrent happens to land at the old index.
@@ -664,55 +674,39 @@ impl App {
         self.restore_selection();
     }
 
-    /// Append a character to the filter and refresh — see `change_sort_column`.
-    /// Owns the same trims typing and paste share: control and bidi-override
-    /// characters are dropped (`filter_text` renders raw in the filter bar
-    /// and status line, so a pasted U+202E would garble both — same rationale
-    /// as `search_push_char`) and the filter is capped at `MAX_FILTER_CHARS`.
+    #[cfg(test)]
+    /// Type a character into the filter and refresh — see
+    /// `change_sort_column`. The field owns the trims typing and paste share:
+    /// control and bidi-override characters are dropped (the filter renders
+    /// raw in the filter bar and status line, so a pasted U+202E would garble
+    /// both) and the filter is capped at `MAX_FILTER_CHARS`.
     pub fn push_filter_char(&mut self, c: char) {
-        if c.is_control()
-            || crate::ui::util::is_bidi_control(c)
-            || self.filter_text.chars().count() >= MAX_FILTER_CHARS
-        {
-            return;
+        if self.filter_input.insert(c) {
+            self.refilter();
         }
-        self.filter_text.push(c);
-        self.invalidate_sort();
-        self.ensure_sort_cache();
-        self.restore_selection();
     }
 
-    /// Append a whole string (a bracketed-paste payload) and refresh ONCE.
-    /// The per-character wrapper re-sorts the table on every push, which
+    /// Insert a whole string (a bracketed-paste payload) and refresh ONCE.
+    /// Refreshing per character re-sorted the table on every one, which
     /// turned a large accidental paste into an
     /// O(chars × torrents·log(torrents)) freeze of the whole event loop.
-    /// Same control-char filter and `MAX_FILTER_CHARS` cap as
-    /// `push_filter_char`.
     pub fn push_filter_str(&mut self, s: &str) {
-        let mut len = self.filter_text.chars().count();
-        let mut changed = false;
-        for c in s.chars() {
-            if len >= MAX_FILTER_CHARS {
-                break;
-            }
-            if c.is_control() || crate::ui::util::is_bidi_control(c) {
-                continue;
-            }
-            self.filter_text.push(c);
-            len += 1;
-            changed = true;
-        }
-        if changed {
-            self.invalidate_sort();
-            self.ensure_sort_cache();
-            self.restore_selection();
+        if self.filter_input.insert_str(s) {
+            self.refilter();
         }
     }
 
-    /// Drop the trailing filter character and refresh — see
-    /// `change_sort_column`.
-    pub fn pop_filter_char(&mut self) {
-        self.filter_text.pop();
+    /// An editing key in the filter bar; refreshes when the text changed —
+    /// see `change_sort_column`.
+    pub fn filter_key(&mut self, key: crossterm::event::KeyEvent) -> Edit {
+        let edit = self.filter_input.handle_key(key);
+        if edit == Edit::Changed {
+            self.refilter();
+        }
+        edit
+    }
+
+    fn refilter(&mut self) {
         self.invalidate_sort();
         self.ensure_sort_cache();
         self.restore_selection();
@@ -720,8 +714,8 @@ impl App {
 
     /// Empty the filter and refresh — see `change_sort_column`.
     pub fn clear_filter(&mut self) {
-        if !self.filter_text.is_empty() {
-            self.filter_text.clear();
+        if !self.filter_input.is_empty() {
+            self.filter_input.clear();
             self.invalidate_sort();
             self.ensure_sort_cache();
         }
@@ -733,7 +727,7 @@ impl App {
         {
             self.sort_rebuilds += 1;
         }
-        let filter_lower = self.filter_text.to_lowercase();
+        let filter_lower = self.filter_input.as_str().to_lowercase();
         // Collect indices into `self.torrents` after applying the filter.
         let mut indices: Vec<usize> = self
             .torrents
@@ -848,7 +842,7 @@ impl App {
     /// the cache is dirty and the caller only has `&self`. Keeps the original
     /// O(N log N) cost but skips the lowercase keys allocation when not Name.
     fn sorted_torrents_live(&self) -> Vec<&TorrentInfo> {
-        let filter_lower = self.filter_text.to_lowercase();
+        let filter_lower = self.filter_input.as_str().to_lowercase();
         let mut torrents: Vec<&TorrentInfo> = self
             .torrents
             .iter()
@@ -1140,24 +1134,14 @@ impl App {
         self.spinner_tick = (self.spinner_tick + 1) % 10;
     }
 
-    /// Append a character to the search query. Rejects control characters
-    /// (like the add dialog's `InputWidget::push`) and bidi controls, plus a
-    /// length cap. Bidi controls matter here because the query is rendered raw
-    /// in the search bar and results title — a pasted U+202E would visually
-    /// reverse the rest of the title line on bidi-aware terminals. Paste goes
-    /// through here too, so typing and pasting obey the same rules.
+    #[cfg(test)]
+    /// Type a character into the search query. The field rejects control
+    /// characters (like the add bar) and bidi controls, and caps the length.
+    /// Bidi controls matter here because the query is rendered raw in the
+    /// search bar and results title — a pasted U+202E would visually reverse
+    /// the rest of the title line on bidi-aware terminals.
     pub fn search_push_char(&mut self, c: char) {
-        if c.is_control() || crate::ui::util::is_bidi_control(c) {
-            return;
-        }
-        if self.search.input.chars().count() >= crate::search::MAX_QUERY_CHARS {
-            return;
-        }
-        self.search.input.push(c);
-    }
-
-    pub fn search_pop_char(&mut self) {
-        self.search.input.pop();
+        self.search.input.insert(c);
     }
 
     /// Arm a search for the current input: bump the generation, remember the
@@ -1166,7 +1150,7 @@ impl App {
     /// the filter's tolerance for empties). No I/O happens here — the caller
     /// owns the spawn — which is what keeps every Esc/Enter path unit-testable.
     pub fn fire_search(&mut self) -> Option<(String, u64)> {
-        let query = self.search.input.trim().to_string();
+        let query = self.search.input.as_str().trim().to_string();
         if query.is_empty() {
             return None;
         }
@@ -1386,7 +1370,9 @@ impl App {
             .iter()
             .filter(|a| a.in_palette && (a.scope == scope || a.scope == Scope::Global))
             .filter(|a| (a.available)(self))
-            .filter_map(|a| fuzzy_score(&self.palette.input, tui_description(a)).map(|s| (s, a)))
+            .filter_map(|a| {
+                fuzzy_score(self.palette.input.as_str(), tui_description(a)).map(|s| (s, a))
+            })
             .collect();
         scored.sort_by(|(sa, a), (sb, b)| {
             sb.cmp(sa)
@@ -1405,22 +1391,30 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// Append a character to the palette filter, mirroring the search query's
+    #[cfg(test)]
+    /// Type a character into the palette filter, with the search query's
     /// control/bidi hygiene. Any edit resets the cursor to the top hit.
     pub fn palette_push_char(&mut self, c: char) {
-        if c.is_control() || crate::ui::util::is_bidi_control(c) {
-            return;
+        if self.palette.input.insert(c) {
+            self.palette_edited();
         }
-        if self.palette.input.chars().count() >= MAX_PALETTE_QUERY_CHARS {
-            return;
-        }
-        self.palette.input.push(c);
-        self.palette.anchor = None;
-        self.palette.table_state.select(Some(0));
     }
 
-    pub fn palette_pop_char(&mut self) {
-        self.palette.input.pop();
+    /// A paste into the palette filter.
+    pub fn palette_paste(&mut self, s: &str) {
+        if self.palette.input.insert_str(s) {
+            self.palette_edited();
+        }
+    }
+
+    /// An editing key in the palette filter.
+    pub fn palette_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.palette.input.handle_key(key) == Edit::Changed {
+            self.palette_edited();
+        }
+    }
+
+    fn palette_edited(&mut self) {
         self.palette.anchor = None;
         self.palette.table_state.select(Some(0));
     }
@@ -1789,9 +1783,9 @@ mod tests {
             make_torrent(1, "Beta", 200, TorrentStatus::Paused),
         ]);
         // Escape, newline and a bidi override smuggled into the payload must
-        // not survive — filter_text renders raw in the filter bar.
+        // not survive — the filter renders raw in the filter bar.
         app.push_filter_str("al\u{1b}ph\n\u{202e}a");
-        assert_eq!(app.filter_text, "alpha");
+        assert_eq!(app.filter_input.as_str(), "alpha");
         let sorted = app.sorted_torrents();
         assert_eq!(sorted.len(), 1);
         assert_eq!(sorted[0].name, "Alpha");
@@ -1829,7 +1823,7 @@ mod tests {
         // once-per-character resort half of that regression is pinned by
         // `filter_paste_resorts_once_while_typing_resorts_per_char`).
         app.push_filter_str(&"x".repeat(10_000));
-        assert_eq!(app.filter_text.chars().count(), MAX_FILTER_CHARS);
+        assert_eq!(app.filter_input.as_str().chars().count(), MAX_FILTER_CHARS);
         assert!(app.sorted_torrents().is_empty());
     }
 
@@ -1839,7 +1833,7 @@ mod tests {
         for _ in 0..(MAX_FILTER_CHARS + 5) {
             app.push_filter_char('x');
         }
-        assert_eq!(app.filter_text.chars().count(), MAX_FILTER_CHARS);
+        assert_eq!(app.filter_input.as_str().chars().count(), MAX_FILTER_CHARS);
     }
 
     #[test]
@@ -2473,7 +2467,7 @@ mod tests {
 
     fn app_with_sortable_results() -> App {
         let mut app = App::new();
-        app.search.input = "q".to_string();
+        app.search.input.set("q");
         let (_, generation) = app.fire_search().expect("fires");
         app.apply_search_outcome(outcome(
             generation,
@@ -2595,7 +2589,7 @@ mod tests {
         app.cycle_result_sort();
         app.cycle_result_sort(); // Title asc, sticky
         app.search_next();
-        app.search.input = "q2".to_string();
+        app.search.input.set("q2");
         let (_, generation) = app.fire_search().expect("fires");
         app.apply_search_outcome(outcome(
             generation,
@@ -2619,7 +2613,7 @@ mod tests {
     fn fire_search_ignores_empty_and_whitespace_queries() {
         let mut app = App::new();
         assert!(app.fire_search().is_none());
-        app.search.input = "   ".to_string();
+        app.search.input.set("   ");
         assert!(app.fire_search().is_none());
         assert!(!app.search.in_flight);
         assert_eq!(app.search.generation, 0);
@@ -2628,22 +2622,22 @@ mod tests {
     #[test]
     fn fire_search_trims_bumps_generation_and_arms_flight() {
         let mut app = App::new();
-        app.search.input = "  arch linux  ".to_string();
+        app.search.input.set("  arch linux  ");
         let (query, generation) = app.fire_search().expect("should fire");
         assert_eq!(query, "arch linux");
         assert_eq!(generation, 1);
         assert!(app.search.in_flight);
         assert_eq!(app.search.query, "arch linux");
         // The edit buffer keeps the raw text for refining.
-        assert_eq!(app.search.input, "  arch linux  ");
+        assert_eq!(app.search.input.as_str(), "  arch linux  ");
     }
 
     #[test]
     fn stale_generation_outcome_is_dropped_untouched() {
         let mut app = App::new();
-        app.search.input = "first".to_string();
+        app.search.input.set("first");
         app.fire_search();
-        app.search.input = "second".to_string();
+        app.search.input.set("second");
         app.fire_search();
         // The gen-1 response arrives after gen-2 fired: dropped, still waiting.
         let hash = "88066b90278f2de655ee2dd44e784c340b54e45c";
@@ -2662,7 +2656,7 @@ mod tests {
     #[test]
     fn outcome_arriving_outside_search_views_is_stored_silently() {
         let mut app = App::new();
-        app.search.input = "q".to_string();
+        app.search.input.set("q");
         app.fire_search();
         app.mode = AppMode::Normal;
         let hash = "88066b90278f2de655ee2dd44e784c340b54e45c";
@@ -2676,7 +2670,7 @@ mod tests {
     fn apply_outcome_resets_selection() {
         let mut app = App::new();
         app.mode = AppMode::SearchResults;
-        app.search.input = "q".to_string();
+        app.search.input.set("q");
         app.fire_search();
         app.search.selected = 7;
         let hash = "88066b90278f2de655ee2dd44e784c340b54e45c";
@@ -2689,9 +2683,9 @@ mod tests {
     fn refire_search_reuses_the_fired_query_not_the_buffer() {
         let mut app = App::new();
         assert!(app.refire_search().is_none()); // nothing fired yet
-        app.search.input = "arch".to_string();
+        app.search.input.set("arch");
         app.fire_search();
-        app.search.input = "edited but not fired".to_string();
+        app.search.input.set("edited but not fired");
         let (query, generation) = app.refire_search().expect("should refire");
         assert_eq!(query, "arch");
         assert_eq!(generation, 2);
@@ -2727,11 +2721,13 @@ mod tests {
         app.search_push_char('\u{202E}');
         app.search_push_char('\u{200F}');
         app.search_push_char('b');
-        assert_eq!(app.search.input, "ab");
-        app.search.input = "x".repeat(crate::search::MAX_QUERY_CHARS);
+        assert_eq!(app.search.input.as_str(), "ab");
+        app.search
+            .input
+            .set(&"x".repeat(crate::search::MAX_QUERY_CHARS));
         app.search_push_char('y');
         assert_eq!(
-            app.search.input.chars().count(),
+            app.search.input.as_str().chars().count(),
             crate::search::MAX_QUERY_CHARS
         );
     }
@@ -2834,9 +2830,9 @@ mod tests {
         assert!(app.palette.anchor.is_some());
         app.palette_push_char('\u{1b}');
         app.palette_push_char('\u{202E}');
-        assert_eq!(app.palette.input, "");
+        assert_eq!(app.palette.input.as_str(), "");
         app.palette_push_char('a');
-        assert_eq!(app.palette.input, "a");
+        assert_eq!(app.palette.input.as_str(), "a");
         assert!(app.palette.anchor.is_none(), "edits reset the cursor");
         assert_eq!(app.palette_selected_index(&app.palette_matches()), 0);
     }

@@ -17,6 +17,7 @@ use ratatui::{
 use crate::app::App;
 use crate::theme::Theme;
 use crate::types::AppMode;
+use crate::ui::input::InputWidget;
 
 /// Split the frame into the three regions every mode shares: a 3-row header, a
 /// flexible main area (table or detail view), and a 3-row bottom bar (status,
@@ -250,10 +251,10 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         left_spans.push(Span::styled(text, style));
     }
 
-    if !app.filter_text.is_empty() && app.mode != AppMode::Filter {
+    if !app.filter_input.is_empty() && app.mode != AppMode::Filter {
         left_spans.push(Span::raw("  \u{2502}  "));
         left_spans.push(Span::styled(
-            format!("filter: \"{}\"", app.filter_text),
+            format!("filter: \"{}\"", app.filter_input.as_str()),
             Style::default().fg(theme.warning),
         ));
     }
@@ -293,50 +294,36 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(right_widget, columns[1]);
 }
 
-pub fn render_filter_bar(f: &mut Frame, area: Rect, filter_text: &str, theme: Theme) {
-    let line = Line::from(vec![
-        Span::styled(" Filter: ", Style::default().fg(theme.primary)),
-        Span::raw(filter_text),
-        Span::styled("\u{2588}", Style::default().fg(theme.text)), // cursor
-    ]);
-
-    let bar = Paragraph::new(line).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.primary)),
-    );
-    f.render_widget(bar, area);
+pub fn render_filter_bar(f: &mut Frame, area: Rect, input: &InputWidget, theme: Theme) {
+    render_field_bar(f, area, " Filter: ", input, theme);
 }
 
-pub fn render_search_bar(f: &mut Frame, area: Rect, query: &str, theme: Theme) {
-    let line = Line::from(vec![
-        Span::styled(" Search torrents: ", Style::default().fg(theme.primary)),
-        Span::raw(query),
-        Span::styled("\u{2588}", Style::default().fg(theme.text)), // cursor
-    ]);
-
-    let bar = Paragraph::new(line).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.primary)),
-    );
-    f.render_widget(bar, area);
+pub fn render_search_bar(f: &mut Frame, area: Rect, input: &InputWidget, theme: Theme) {
+    render_field_bar(f, area, " Search torrents: ", input, theme);
 }
 
-pub fn render_throttle_bar(f: &mut Frame, area: Rect, step: u8, input_buf: &str, theme: Theme) {
+pub fn render_throttle_bar(f: &mut Frame, area: Rect, step: u8, input: &InputWidget, theme: Theme) {
     let prompt = if step == 0 {
         " Download limit (KB/s, 0=unlimited): "
     } else {
         " Upload limit (KB/s, 0=unlimited): "
     };
+    render_field_bar(f, area, prompt, input, theme);
+}
 
-    let line = Line::from(vec![
-        Span::styled(prompt, Style::default().fg(theme.primary)),
-        Span::raw(input_buf),
-        Span::styled("\u{2588}", Style::default().fg(theme.text)),
-    ]);
-
-    let bar = Paragraph::new(line).block(
+/// A bordered one-line bar: a prompt, then the field with its cursor.
+fn render_field_bar(f: &mut Frame, area: Rect, prompt: &str, input: &InputWidget, theme: Theme) {
+    let room = (area.width as usize).saturating_sub(2 + prompt.len());
+    let mut spans = vec![Span::styled(
+        prompt.to_string(),
+        Style::default().fg(theme.primary),
+    )];
+    spans.extend(input.spans(
+        room,
+        Style::default(),
+        Some(Style::default().fg(theme.text)),
+    ));
+    let bar = Paragraph::new(Line::from(spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.primary)),
@@ -374,6 +361,10 @@ fn add_picker_hints(app: &App) -> &'static str {
                  t:tree/flat  h/l:fold  s:sort  r:reset  Esc:cancel"
             }
             Focus::Filter => "type to filter  Enter:back to files  Esc:clear",
+            Focus::Folder if picker.folder.menu().is_some() => {
+                "Tab/\u{2193}:next  Shift+Tab/\u{2191}:previous  Enter:keep  Esc:as typed  \
+                 type:keep and go on"
+            }
             Focus::Folder if picker.has_recents() => {
                 "Tab:complete  \u{2191}/\u{2193}:recent  Ctrl+U:clear  Esc:back to files  Enter:add"
             }
