@@ -46,7 +46,7 @@
 //!
 //! Requests are files in `control/`, written to a `.tmp` sibling and renamed
 //! into place so a reader never sees a partial write — the same atomic-write
-//! idiom [`crate::config::Config::save`] uses. The owner polls, acts, deletes.
+//! idiom `config.toml` is written with. The owner polls, acts, deletes.
 //!
 //! Why not librqbit's embedded HTTP API, which is already running? Mounting it
 //! read-write does not add one route, it adds nine — including
@@ -97,6 +97,19 @@ const STOP_REQUEST: &str = "stop";
 const ADD_PREFIX: &str = "add-";
 const ADD_SUFFIX: &str = ".magnet";
 
+/// Suffix for a hand-off request that names a download folder too; the body
+/// is an [`AddRequest`] as JSON. A separate shape rather than a second line in
+/// the `.magnet` body, so the plain magnet request stays exactly what every
+/// version has read.
+const ADD_INTO_SUFFIX: &str = ".json";
+
+/// What the control channel of this version understands, written into the
+/// daemon record. `0` (a record with no such field) is the plain magnet
+/// request alone; `1` adds [`ADD_INTO_SUFFIX`] requests. A sender checks it
+/// before using a newer request, because an older owner sweeps a name it does
+/// not know — the add would vanish without a word.
+pub const CONTROL_VERSION: u32 = 1;
+
 /// Cap on a control request's size. Mirrors `MAX_MAGNET_FILE_SIZE` in
 /// [`crate::engine::watch`] so the two magnet-ingest paths agree.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -105,6 +118,9 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 /// `MAX_INPUT_CHARS`. `validate_magnet` has no length cap of its own, and the
 /// hand-off path bypasses the input widget that would otherwise apply one.
 const MAX_MAGNET_CHARS: usize = 4096;
+
+/// Cap on a hand-off folder's length — far past any real path.
+const MAX_FOLDER_CHARS: usize = 4096;
 
 /// Record schema version. Bumped when a field's meaning changes, so a newer
 /// record is reported as unrecognised rather than misparsed.
@@ -243,6 +259,12 @@ pub struct DaemonRecord {
     /// Populated when `state` is [`State::Failed`].
     #[serde(default)]
     pub error: Option<String>,
+    /// The `--profile` this session runs as, `None` for the default one.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// See [`CONTROL_VERSION`]. `0` when written by a version before it.
+    #[serde(default)]
+    pub control: u32,
 }
 
 impl DaemonRecord {
@@ -260,6 +282,8 @@ impl DaemonRecord {
             download_dir: download_dir.to_string(),
             privacy: None,
             error: None,
+            profile: crate::config::profile().map(str::to_string),
+            control: CONTROL_VERSION,
         }
     }
 
@@ -534,7 +558,7 @@ pub fn read_record(session_dir: &Path) -> Option<DaemonRecord> {
 
 /// Write the record atomically: tmp + rename, so a reader polling for a state
 /// change never observes a half-written record. Mirrors
-/// [`crate::config::Config::save`].
+/// how `config.toml` is written.
 pub fn write_record(session_dir: &Path, record: &DaemonRecord) -> Result<()> {
     fs::create_dir_all(session_dir)?;
     let final_path = record_path(session_dir);
@@ -647,18 +671,18 @@ pub fn wait_for_handoff(session_dir: &Path, nonce: &str, budget: std::time::Dura
 /// same way [`crate::player::build_command`] is, so it can be asserted without
 /// starting a process.
 ///
-/// `--download-dir` is forwarded already tilde-expanded: the child inherits no
-/// shell, and `main` has resolved the override before this point.
+/// `forwarded` is what the session was started with and the child must start
+/// with too — the profile, `--download-dir`, every `--set` — so the background
+/// copy runs the same session rather than the default one. Paths in it are
+/// already tilde-expanded: the child inherits no shell.
 pub fn build_headless_command(
     exe: &Path,
-    download_dir: Option<&str>,
+    forwarded: &[String],
     nonce: &str,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--headless");
-    if let Some(dir) = download_dir {
-        cmd.arg("--download-dir").arg(dir);
-    }
+    cmd.args(forwarded);
     cmd.env(HANDOFF_ENV, nonce);
     cmd
 }
@@ -669,9 +693,9 @@ pub fn build_headless_command(
 /// `Command::spawn` leaves the child in the terminal's foreground process
 /// group, so closing the window delivers `SIGHUP` and kills exactly the process
 /// the user asked to keep running.
-pub fn spawn_headless_child(download_dir: Option<&str>, nonce: &str) -> Result<u32> {
+pub fn spawn_headless_child(forwarded: &[String], nonce: &str) -> Result<u32> {
     let exe = std::env::current_exe().context("locating the torrenttui binary")?;
-    let mut cmd = build_headless_command(&exe, download_dir, nonce);
+    let mut cmd = build_headless_command(&exe, forwarded, nonce);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -720,6 +744,14 @@ pub struct Flags {
     /// The parent still owns the session and releases it by exiting, so this
     /// child must *wait* for the lock rather than refuse it.
     pub handoff: bool,
+    /// `--set` was given. Settings are applied when a session starts, so they
+    /// cannot travel with a hand-off.
+    pub overrides: bool,
+    /// `--quit-when-done` was given — a property of a session this launch
+    /// starts, which a hand-off does not.
+    pub quit_when_done: bool,
+    /// `--pick`: the source opens the file picker, which needs a window.
+    pub pick: bool,
 }
 
 /// What `main` should do, given the flags and who owns the session.
@@ -792,18 +824,57 @@ pub fn decide(flags: &Flags, holder: &Holder) -> Startup {
 
     match holder {
         Holder::Free => Startup::RunTui,
+        // Choosing files needs this launch's own window, so it is a take-over
+        // of a background session and a refusal next to another window —
+        // never a hand-off, which would add everything unasked.
+        Holder::Held(Some(r)) | Holder::Contested(r) if flags.pick && r.mode == Mode::Tui => {
+            Startup::Refuse(format!(
+                "A TorrentTUI window is already running (pid {}) — add it there with `A` to                  choose its files.",
+                r.pid
+            ))
+        }
         // A source given while something else owns the session belongs to that
         // session. Starting a second owner just to hold one magnet is exactly
         // the silent-corruption path this module exists to close.
-        _ if flags.torrent_source.is_some() => match flags.torrent_source.clone() {
-            Some(source) => Startup::HandOff(source),
-            // Unreachable given the guard, but `decide` stays total rather than
-            // relying on an unwrap this crate does not allow in production code.
-            None => Startup::RunTui,
-        },
+        _ if flags.torrent_source.is_some() && !flags.pick => {
+            // But only the source travels. Saying "added" while dropping the
+            // proxy the user asked for would send the torrent out unprotected.
+            if flags.overrides || flags.quit_when_done {
+                return Startup::Refuse(session_is_fixed(holder, flags));
+            }
+            match flags.torrent_source.clone() {
+                Some(source) => Startup::HandOff(source),
+                // Unreachable given the guard, but `decide` stays total rather
+                // than relying on an unwrap this crate does not allow in
+                // production code.
+                None => Startup::RunTui,
+            }
+        }
         Holder::Held(Some(r)) if r.mode == Mode::Headless => Startup::TakeOver,
         other => Startup::Refuse(already_running(other)),
     }
+}
+
+/// Refusal for a source that would be handed off, carrying something only a
+/// new session can apply.
+fn session_is_fixed(holder: &Holder, flags: &Flags) -> String {
+    let what = if flags.overrides {
+        "--set only applies to a session it starts"
+    } else {
+        "--quit-when-done only applies to a session it starts"
+    };
+    let stop = match holder.record() {
+        Some(r) if r.mode == Mode::Tui => "quit that window first".to_string(),
+        _ => format!(
+            "stop that one first (`{}`)",
+            crate::config::command("--stop")
+        ),
+    };
+    format!(
+        "{} is already running, and {what}.\n\
+         Run this in a separate session with `--profile <name>`, or {stop}.",
+        holder.describe(),
+    )
 }
 
 /// Refusal text shared by every "someone else owns it" branch.
@@ -823,8 +894,16 @@ fn already_running(holder: &Holder) -> String {
 /// The `--status` report, also used to describe what a take-over is taking
 /// over.
 pub fn format_status(holder: &Holder) -> String {
+    format_status_for(holder, crate::config::profile())
+}
+
+/// [`format_status`] for an explicit profile, for tests.
+fn format_status_for(holder: &Holder, profile: Option<&str>) -> String {
     match holder {
-        Holder::Free => "No TorrentTUI session is running.".to_string(),
+        Holder::Free => match profile {
+            Some(name) => format!("No TorrentTUI session is running for profile {name}."),
+            None => "No TorrentTUI session is running.".to_string(),
+        },
         Holder::Unknown(err) => format!("Could not read the session lock: {}", err),
         Holder::Held(None) => {
             "A TorrentTUI session is running, but its daemon record could not be read.".to_string()
@@ -834,10 +913,15 @@ pub fn format_status(holder: &Holder) -> String {
                 Some(0) | None => "just started".to_string(),
                 Some(secs) => format!("up {}", crate::ui::layout::format_eta(Some(secs))),
             };
+            let profile = match r.profile.as_deref() {
+                Some(name) => format!(" for profile {name}"),
+                None => String::new(),
+            };
             let mut out = format!(
-                "TorrentTUI {} running as a {} (pid {}, {}).\nDownloading to {}",
+                "TorrentTUI {} running as a {}{} (pid {}, {}).\nDownloading to {}",
                 r.version,
                 r.mode.label(),
+                profile,
                 r.pid,
                 uptime,
                 r.download_dir
@@ -864,8 +948,19 @@ pub fn format_status(holder: &Holder) -> String {
 pub enum Request {
     /// Shut the session down. Honoured only by a headless owner.
     Stop,
-    /// Add this magnet link.
-    Add(String),
+    /// Add this magnet link — into `folder` when one is given (`-d`), in the
+    /// same layout a session started with that `-d` would use.
+    Add {
+        magnet: String,
+        folder: Option<String>,
+    },
+}
+
+/// The body of an [`ADD_INTO_SUFFIX`] request.
+#[derive(Serialize, Deserialize)]
+struct AddRequest {
+    magnet: String,
+    folder: String,
 }
 
 fn control_dir(session_dir: &Path) -> PathBuf {
@@ -906,11 +1001,11 @@ fn ensure_control_dir(session_dir: &Path) -> Result<PathBuf> {
 pub fn handoff_source(source: &str) -> std::result::Result<String, String> {
     let source = source.trim();
     if !source.starts_with("magnet:?") {
-        return Err(
+        return Err(format!(
             "Only magnet links can be handed to a running session. Stop it first with \
-             `torrenttui --stop`, then add the .torrent file."
-                .to_string(),
-        );
+             `{}`, then add the .torrent file.",
+            crate::config::command("--stop")
+        ));
     }
     if source.chars().count() > MAX_MAGNET_CHARS {
         return Err(format!(
@@ -926,6 +1021,33 @@ pub fn handoff_source(source: &str) -> std::result::Result<String, String> {
     Ok(source.to_string())
 }
 
+/// Whether a download folder may be handed to a running session with a
+/// magnet.
+///
+/// Absolute only: the owner runs in a working directory of its own, so the
+/// sender resolves a relative `-d` against *its* directory before sending —
+/// the same trust-boundary point [`handoff_source`] makes about `.torrent`
+/// paths. Any folder is otherwise fine: the control directory belongs to this
+/// user alone, who could start a session with that `-d` just as well.
+pub fn handoff_folder(folder: &str) -> std::result::Result<String, String> {
+    if folder.chars().count() > MAX_FOLDER_CHARS {
+        return Err(format!(
+            "The download folder is too long ({} characters, limit {}).",
+            folder.chars().count(),
+            MAX_FOLDER_CHARS
+        ));
+    }
+    if folder.chars().any(|c| c.is_control()) {
+        return Err("The download folder contains control characters.".to_string());
+    }
+    if !Path::new(folder).is_absolute() {
+        return Err(format!(
+            "The download folder must be an absolute path (got \"{folder}\")."
+        ));
+    }
+    Ok(folder.to_string())
+}
+
 /// Write a request for the current owner to pick up.
 ///
 /// Written to a `.tmp` sibling and renamed, so the owner's scan never sees a
@@ -936,9 +1058,22 @@ pub fn send_request(session_dir: &Path, request: &Request) -> Result<()> {
 
     let (name, body) = match request {
         Request::Stop => (STOP_REQUEST.to_string(), String::new()),
-        Request::Add(magnet) => (
+        Request::Add {
+            magnet,
+            folder: None,
+        } => (
             format!("{}{}{}", ADD_PREFIX, nonce(), ADD_SUFFIX),
             magnet.clone(),
+        ),
+        Request::Add {
+            magnet,
+            folder: Some(folder),
+        } => (
+            format!("{}{}{}", ADD_PREFIX, nonce(), ADD_INTO_SUFFIX),
+            serde_json::to_string(&AddRequest {
+                magnet: magnet.clone(),
+                folder: folder.clone(),
+            })?,
         ),
     };
 
@@ -996,8 +1131,27 @@ pub fn take_requests(session_dir: &Path) -> Vec<Request> {
             let _ = fs::remove_file(&path);
             if let Some(body) = body {
                 if let Ok(magnet) = handoff_source(&body) {
-                    out.push(Request::Add(magnet));
+                    out.push(Request::Add {
+                        magnet,
+                        folder: None,
+                    });
                 }
+            }
+            continue;
+        }
+
+        if name.starts_with(ADD_PREFIX) && name.ends_with(ADD_INTO_SUFFIX) {
+            let body = read_capped(&path);
+            let _ = fs::remove_file(&path);
+            let request = body
+                .and_then(|body| serde_json::from_str::<AddRequest>(&body).ok())
+                .and_then(|r| Some((handoff_source(&r.magnet).ok()?, r.folder)))
+                .and_then(|(magnet, folder)| Some((magnet, handoff_folder(&folder).ok()?)));
+            if let Some((magnet, folder)) = request {
+                out.push(Request::Add {
+                    magnet,
+                    folder: Some(folder),
+                });
             }
             continue;
         }
@@ -1297,6 +1451,78 @@ mod tests {
     }
 
     #[test]
+    fn settings_for_a_new_session_are_never_handed_off() {
+        // The torrent would be added, and the proxy the user asked for with it
+        // silently dropped.
+        for flags in [
+            Flags {
+                torrent_source: Some("magnet:?xt=urn:btih:aa".to_string()),
+                overrides: true,
+                ..Default::default()
+            },
+            Flags {
+                torrent_source: Some("magnet:?xt=urn:btih:aa".to_string()),
+                quit_when_done: true,
+                ..Default::default()
+            },
+        ] {
+            for holder in [held(Mode::Tui), held(Mode::Headless), Holder::Held(None)] {
+                match decide(&flags, &holder) {
+                    Startup::Refuse(msg) => assert!(msg.contains("--profile"), "{msg}"),
+                    other => panic!("{flags:?} with {holder:?}: {other:?}"),
+                }
+            }
+            assert_eq!(decide(&flags, &Holder::Free), Startup::RunTui);
+        }
+        // With no source to hand off, they apply to the session a take-over
+        // starts.
+        let flags = Flags {
+            overrides: true,
+            quit_when_done: true,
+            ..Default::default()
+        };
+        assert_eq!(decide(&flags, &held(Mode::Headless)), Startup::TakeOver);
+    }
+
+    #[test]
+    fn the_refusal_says_how_to_free_the_session() {
+        let flags = Flags {
+            torrent_source: Some("magnet:?xt=urn:btih:aa".to_string()),
+            overrides: true,
+            ..Default::default()
+        };
+        let Startup::Refuse(msg) = decide(&flags, &held(Mode::Tui)) else {
+            panic!("not refused");
+        };
+        assert!(msg.contains("quit that window"), "{msg}");
+        let Startup::Refuse(msg) = decide(&flags, &held(Mode::Headless)) else {
+            panic!("not refused");
+        };
+        assert!(msg.contains("torrenttui --stop"), "{msg}");
+    }
+
+    #[test]
+    fn picking_files_needs_a_window_of_its_own() {
+        let flags = Flags {
+            torrent_source: Some("magnet:?xt=urn:btih:aa".to_string()),
+            pick: true,
+            ..Default::default()
+        };
+        assert_eq!(decide(&flags, &Holder::Free), Startup::RunTui);
+        // A background session is taken over, so the picker opens here.
+        assert_eq!(decide(&flags, &held(Mode::Headless)), Startup::TakeOver);
+        // Another window keeps the session; it is the place to pick.
+        match decide(&flags, &held(Mode::Tui)) {
+            Startup::Refuse(msg) => assert!(msg.contains("`A`"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            decide(&flags, &Holder::Held(None)),
+            Startup::Refuse(_)
+        ));
+    }
+
+    #[test]
     fn stop_targets_only_a_background_session() {
         let flags = Flags {
             stop: true,
@@ -1353,6 +1579,7 @@ mod tests {
             headless: true,
             handoff: true,
             torrent_source: Some("magnet:?xt=urn:btih:aa".to_string()),
+            ..Default::default()
         };
         for holder in [Holder::Free, held(Mode::Tui), held(Mode::Headless)] {
             assert!(
@@ -1419,6 +1646,32 @@ mod tests {
         assert!(text.contains("TCP listener"), "{text}");
     }
 
+    #[test]
+    fn status_names_the_profile() {
+        assert_eq!(
+            format_status_for(&Holder::Free, Some("vpn")),
+            "No TorrentTUI session is running for profile vpn."
+        );
+        let mut r = record(Mode::Headless);
+        r.profile = Some("vpn".to_string());
+        let text = format_status_for(&Holder::Held(Some(r)), Some("vpn"));
+        assert!(
+            text.contains("background session for profile vpn (pid"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_record_from_before_profiles_reads_as_default_and_old_control() {
+        // What 0.18 wrote: no profile, no control version.
+        let body = r#"{"schema":1,"version":"0.18.1","pid":7,"mode":"headless","state":"running"}"#;
+        let r: DaemonRecord = serde_json::from_str(body).unwrap();
+        assert_eq!(r.profile, None);
+        assert_eq!(r.control, 0);
+        // And this version advertises folder requests.
+        assert_eq!(record(Mode::Tui).control, CONTROL_VERSION);
+    }
+
     // -- the control channel ------------------------------------------------
 
     #[test]
@@ -1436,14 +1689,22 @@ mod tests {
         let sd = session_dir(dir.path());
         let a = format!("magnet:?xt=urn:btih:{}", "a".repeat(40));
         let b = format!("magnet:?xt=urn:btih:{}", "b".repeat(40));
-        send_request(&sd, &Request::Add(a.clone())).unwrap();
-        send_request(&sd, &Request::Add(b.clone())).unwrap();
+        for magnet in [&a, &b] {
+            let add = Request::Add {
+                magnet: magnet.clone(),
+                folder: None,
+            };
+            send_request(&sd, &add).unwrap();
+        }
 
         let mut got: Vec<String> = take_requests(&sd)
             .into_iter()
             .filter_map(|r| match r {
-                Request::Add(s) => Some(s),
-                Request::Stop => None,
+                Request::Add {
+                    magnet,
+                    folder: None,
+                } => Some(magnet),
+                _ => None,
             })
             .collect();
         got.sort();
@@ -1495,6 +1756,69 @@ mod tests {
             fs::write(control.join("add-x.magnet"), body).unwrap();
             assert!(take_requests(&sd).is_empty(), "accepted {body:?}");
         }
+    }
+
+    #[test]
+    fn an_add_into_a_folder_round_trips_as_its_own_request() {
+        let dir = TempDir::new().unwrap();
+        let sd = session_dir(dir.path());
+        let magnet = format!("magnet:?xt=urn:btih:{}", "c".repeat(40));
+        let folder = std::env::temp_dir()
+            .join("tt-into")
+            .to_string_lossy()
+            .into_owned();
+        let add = Request::Add {
+            magnet: magnet.clone(),
+            folder: Some(folder.clone()),
+        };
+        send_request(&sd, &add).unwrap();
+        // Not the `.magnet` shape an older owner reads: it must not be taken
+        // for a plain add and lose its folder.
+        let names: Vec<String> = fs::read_dir(control_dir(&sd))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| n.ends_with(".json")), "{names:?}");
+        assert_eq!(take_requests(&sd), vec![add]);
+        assert!(take_requests(&sd).is_empty());
+    }
+
+    #[test]
+    fn a_folder_request_with_a_bad_magnet_or_folder_is_discarded() {
+        let dir = TempDir::new().unwrap();
+        let sd = session_dir(dir.path());
+        let control = control_dir(&sd);
+        fs::create_dir_all(&control).unwrap();
+        let magnet = format!("magnet:?xt=urn:btih:{}", "d".repeat(40));
+        let abs = std::env::temp_dir().to_string_lossy().into_owned();
+        for body in [
+            "not json".to_string(),
+            serde_json::json!({ "magnet": "/etc/passwd", "folder": abs }).to_string(),
+            serde_json::json!({ "magnet": magnet, "folder": "relative/dir" }).to_string(),
+            serde_json::json!({ "magnet": magnet, "folder": format!("{abs}\nx") }).to_string(),
+            serde_json::json!({ "magnet": magnet }).to_string(),
+        ] {
+            fs::write(control.join("add-x.json"), &body).unwrap();
+            assert!(take_requests(&sd).is_empty(), "accepted {body:?}");
+        }
+    }
+
+    #[test]
+    fn handoff_folders_must_be_absolute_and_plain() {
+        let abs = std::env::temp_dir()
+            .join("dl")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(handoff_folder(&abs), Ok(abs.clone()));
+        assert!(handoff_folder("dl").unwrap_err().contains("absolute"));
+        assert!(handoff_folder(&format!("{abs}\x1b"))
+            .unwrap_err()
+            .contains("control"));
+        assert!(
+            handoff_folder(&format!("/{}", "a".repeat(MAX_FOLDER_CHARS)))
+                .unwrap_err()
+                .contains("too long")
+        );
     }
 
     #[test]
@@ -1551,8 +1875,9 @@ mod tests {
     }
 
     #[test]
-    fn headless_command_carries_the_flag_and_the_resolved_download_dir() {
-        let cmd = build_headless_command(Path::new("/usr/local/bin/torrenttui"), Some("/dl"), "n1");
+    fn headless_command_carries_the_flag_and_what_the_session_started_with() {
+        let forwarded = ["--profile", "vpn", "--download-dir", "/dl"].map(String::from);
+        let cmd = build_headless_command(Path::new("/usr/local/bin/torrenttui"), &forwarded, "n1");
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1561,10 +1886,13 @@ mod tests {
             cmd.get_program().to_string_lossy(),
             "/usr/local/bin/torrenttui"
         );
-        assert_eq!(args, vec!["--headless", "--download-dir", "/dl"]);
+        assert_eq!(
+            args,
+            vec!["--headless", "--profile", "vpn", "--download-dir", "/dl"]
+        );
 
         // No override: the child reads the same config we did.
-        let cmd = build_headless_command(Path::new("torrenttui"), None, "n1");
+        let cmd = build_headless_command(Path::new("torrenttui"), &[], "n1");
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1604,7 +1932,7 @@ mod tests {
 
     #[test]
     fn the_handoff_token_reaches_the_child_through_the_environment() {
-        let cmd = build_headless_command(Path::new("torrenttui"), None, "tok123");
+        let cmd = build_headless_command(Path::new("torrenttui"), &[], "tok123");
         let env: Vec<(String, Option<String>)> = cmd
             .get_envs()
             .map(|(k, v)| {

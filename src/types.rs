@@ -247,6 +247,9 @@ pub struct NetworkHealth {
     /// Session-wide peer buckets (every torrent summed).
     pub peers: PeerBreakdown,
     pub uptime_secs: u64,
+    /// Adds that ended without a torrent since session start: refused, or a
+    /// magnet given up on.
+    pub failed_adds: u64,
     pub upnp: UpnpState,
     /// librqbit's listener defaults to TCP only; the doctor mentions this
     /// rather than showing a confusing all-zero uTP column.

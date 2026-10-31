@@ -27,7 +27,7 @@ use crate::ui::util::sanitize_display;
 use anyhow::{Context, Result};
 use librqbit::{
     api::TorrentIdOrHash,
-    dht::Id20,
+    dht::{DhtPersistenceConfig, Id20, PersistentDht},
     http_api::{HttpApi, HttpApiOptions},
     http_api_types::PeerStatsFilter,
     limits::LimitsConfig,
@@ -189,6 +189,13 @@ pub struct PrivacyStatus {
 /// `*Many` variants are for; prefer them over loops.
 pub enum EngineCommand {
     AddTorrent(String),
+    /// Add into `folder` rather than the session's download folder, with the
+    /// torrent's own subfolder inside it — what a session started with that
+    /// `-d` would have done. A magnet handed to a running session with `-d`.
+    AddTorrentInto {
+        source: String,
+        folder: PathBuf,
+    },
     Pause(usize),
     Resume(usize),
     /// Bulk pause. Replaces a fan-out of N `Pause(id)` sends from the UI,
@@ -286,6 +293,10 @@ pub struct TorrentEngine {
     /// ticket. Each task removes its own entry when it ends, however it ends
     /// — see `PreviewTaskGuard`.
     preview_tasks: std::sync::Mutex<HashMap<u64, (tokio::task::AbortHandle, u64)>>,
+    /// Adds that ended without a torrent — refused, or a magnet given up on —
+    /// since session start. `--quit-when-done` reads it: a run whose only
+    /// magnet nobody seeded has nothing left to download, but did not succeed.
+    failed_adds: std::sync::atomic::AtomicU64,
 }
 
 /// What the engine knows about an add before librqbit has created the
@@ -432,6 +443,34 @@ fn migrate_session_dir(new_dir: &Path) -> Option<String> {
     ))
 }
 
+/// Where a session keeps its DHT routing table.
+fn dht_state_path(session_dir: &Path) -> PathBuf {
+    session_dir.join("dht.json")
+}
+
+/// Start the default profile's DHT from the routing table librqbit kept in
+/// its shared default location, once, so moving the file into the session
+/// directory costs no re-bootstrap. A named profile starts its own table
+/// instead: sharing one node id between two running sessions would only
+/// confuse the DHT. Copied, not moved, like [`migrate_session_dir`].
+fn migrate_dht_state(session_dir: &Path) {
+    if crate::config::profile().is_some() {
+        return;
+    }
+    let new = dht_state_path(session_dir);
+    if new.exists() {
+        return;
+    }
+    let Ok(old) = PersistentDht::default_persistence_filename() else {
+        return;
+    };
+    if old.exists() {
+        if let Err(e) = std::fs::copy(&old, &new) {
+            tracing::warn!("could not copy the DHT state from {}: {e:#}", old.display());
+        }
+    }
+}
+
 /// Build `SessionOptions` from a `NetworkPlan` and rate limits. The
 /// `pick_listen_port` probe (which binds a socket) is only run when the plan
 /// asks for a listener, so proxy mode touches no ports.
@@ -445,8 +484,21 @@ fn build_session_opts(
         enable_upnp_port_forwarding: plan.upnp,
         ..Default::default()
     });
+    // In the session directory, not librqbit's default `dht.json` in a cache
+    // directory shared with upstream rqbit and every other librqbit app. Two
+    // profiles running at once would otherwise load one routing table, and
+    // with it one stored port: the second session's DHT socket fails to bind
+    // and the session does not start. It also keeps a profile's DHT identity
+    // its own.
+    let dht_state = dht_state_path(&session_dir);
     SessionOptions {
-        dht: plan.dht.then(DhtSessionConfig::default),
+        dht: plan.dht.then(|| DhtSessionConfig {
+            persistence: Some(DhtPersistenceConfig {
+                config_filename: Some(dht_state),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
         fastresume: true,
         // Explicit, not `None`: see `migrate_session_dir`. The ownership lock
         // lives in this same directory, so the lock and the state it guards can
@@ -481,6 +533,7 @@ impl TorrentEngine {
 
         let session_dir = crate::instance::session_dir(&Config::config_dir());
         let migration_note = migrate_session_dir(&session_dir);
+        migrate_dht_state(&session_dir);
 
         let plan = NetworkPlan::from_config(config)?;
         let proxy_active = plan.proxied();
@@ -536,7 +589,14 @@ impl TorrentEngine {
             next_pending_ticket: std::sync::atomic::AtomicU64::new(0),
             download_dir,
             preview_tasks: std::sync::Mutex::new(HashMap::new()),
+            failed_adds: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Count an add that ended without a torrent. See `failed_adds`.
+    fn note_failed_add(&self) {
+        self.failed_adds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Register an add that is about to start. Returns the ticket to hand to
@@ -680,6 +740,78 @@ impl TorrentEngine {
                 add_torrent,
                 Some(AddTorrentOptions {
                     overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        added_handle(response)
+    }
+
+    /// Add into `folder`, keeping the subfolder librqbit would have given the
+    /// torrent in the download folder — so `-d /x` handed to a running session
+    /// lands in `/x/<name>/` exactly as it would in a session started with
+    /// that `-d`. librqbit's `output_folder` is the *final* folder and
+    /// `sub_folder` replaces the torrent's own, so the subfolder is only known
+    /// once the metadata is: resolve it with `list_only` first (the slow part,
+    /// for a magnet), then add from the bytes that kept, with the peers it met.
+    pub async fn add_torrent_into(
+        &self,
+        source: &str,
+        folder: &Path,
+    ) -> Result<(usize, ManagedTorrentHandle, bool)> {
+        // librqbit answers `list_only` before its duplicate check; a magnet
+        // already in the list must not be resolved again, nor moved.
+        if let Some(handle) = librqbit::Magnet::parse(source)
+            .ok()
+            .and_then(|m| m.as_id20())
+            .and_then(|hash| self.session.get(TorrentIdOrHash::Hash(hash)))
+        {
+            return Ok((handle.id(), handle, true));
+        }
+        let response = self
+            .session
+            .add_torrent(
+                read_add_source(source).await?,
+                Some(AddTorrentOptions {
+                    list_only: true,
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let listed = match response {
+            AddTorrentResponse::ListOnly(listed) => listed,
+            other => return added_handle(other),
+        };
+        if let Some(handle) = self.session.get(TorrentIdOrHash::Hash(listed.info_hash)) {
+            return Ok((handle.id(), handle, true));
+        }
+        // Same subfolder rule as `preview_torrent`; a single-file torrent has
+        // none, and joining an empty one would only add a trailing separator.
+        let output_folder = match listed
+            .output_folder
+            .strip_prefix(&self.download_dir)
+            .ok()
+            .filter(|sub| !sub.as_os_str().is_empty())
+        {
+            Some(sub) => folder.join(sub),
+            None => folder.to_path_buf(),
+        };
+        let output_folder = output_folder
+            .to_str()
+            .context("the download folder is not valid UTF-8")?
+            .to_string();
+        let response = self
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(listed.torrent_bytes.to_vec()),
+                Some(AddTorrentOptions {
+                    // See `add_torrent`.
+                    overwrite: true,
+                    // A magnet's own `so=` selection, if it had one.
+                    only_files: listed.only_files,
+                    output_folder: Some(output_folder),
+                    initial_peers: (!listed.seen_peers.is_empty()).then_some(listed.seen_peers),
                     ..Default::default()
                 }),
             )
@@ -1155,6 +1287,7 @@ impl TorrentEngine {
                 live_socks: snap.peers.live_socks,
             },
             uptime_secs: self.started_at.elapsed().as_secs(),
+            failed_adds: self.failed_adds.load(std::sync::atomic::Ordering::Relaxed),
             upnp: self.capture.upnp(),
             utp_enabled: self.utp_enabled,
             pending_adds: self.pending_adds(),
@@ -1561,6 +1694,58 @@ const NO_DISCOVERY_ERROR: &str = "no known way to resolve peers";
 /// trackerless — with DHT also off in this mode there is no discovery path
 /// left. The one filter every UI add path goes through, previews included.
 /// Returns the source to hand on and how many trackers were dropped.
+/// Start an add — into `folder` when one is given — off the command loop.
+///
+/// Off the loop, deliberately. For a magnet, `add_torrent` does not return
+/// until librqbit has resolved its metadata from the swarm — seconds normally,
+/// forever for a magnet nobody is seeding. Awaiting that in the loop froze the
+/// whole engine: no state pushes, no pause/delete, and — once a session could
+/// outlive its terminal — no way to answer `Shutdown`, so a background session
+/// became unstoppable until the magnet gave up.
+async fn start_add(
+    engine: &Arc<TorrentEngine>,
+    source: String,
+    folder: Option<PathBuf>,
+    msg_tx: &mpsc::Sender<String>,
+    finished_tx: &mpsc::Sender<usize>,
+) {
+    let (source, stripped_udp) = prepare_source(engine, source, msg_tx).await;
+    let engine = engine.clone();
+    let msg_tx = msg_tx.clone();
+    let finished_tx = finished_tx.clone();
+    let ticket = engine.begin_pending_add(&source);
+    let dht_enabled = engine.session().get_dht().is_some();
+    tokio::spawn(async move {
+        // Bounded: dropping the future cancels librqbit's resolution (a plain
+        // select! loop, no detached tasks), so a magnet nobody seeds ends as a
+        // message rather than a task that dies with the window. The picture is
+        // read *before* the entry is removed so the message can say why.
+        let add = async {
+            match &folder {
+                Some(folder) => engine.add_torrent_into(&source, folder).await,
+                None => engine.add_torrent(&source).await,
+            }
+        };
+        let outcome = tokio::time::timeout(METADATA_TIMEOUT, add).await;
+        let gave_up = match outcome {
+            Ok(_) => None,
+            Err(_) => engine.pending_add(ticket),
+        };
+        engine.end_pending_add(ticket);
+        match outcome {
+            Ok(outcome) => {
+                report_add_outcome(&engine, &msg_tx, &finished_tx, outcome, stripped_udp).await;
+            }
+            Err(_) => {
+                engine.note_failed_add();
+                let msg = gave_up_message(gave_up, dht_enabled);
+                tracing::warn!("{msg}");
+                let _ = msg_tx.send(msg).await;
+            }
+        }
+    });
+}
+
 async fn prepare_source(
     engine: &TorrentEngine,
     source: String,
@@ -1619,6 +1804,7 @@ async fn report_add_outcome(
             }
         }
         Err(e) => {
+            engine.note_failed_add();
             let msg = add_error_message(engine, &e, stripped_udp);
             let _ = msg_tx.send(msg).await;
             tracing::error!("Failed to add torrent: {}", e);
@@ -2141,48 +2327,10 @@ pub async fn run_engine(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(EngineCommand::AddTorrent(source)) => {
-                        let (source, stripped_udp) = prepare_source(&engine, source, &msg_tx).await;
-                        // Off the command loop, deliberately. For a magnet,
-                        // `add_torrent` does not return until librqbit has
-                        // resolved its metadata from the swarm — seconds
-                        // normally, forever for a magnet nobody is seeding.
-                        // Awaiting that here froze the whole engine: no state
-                        // pushes, no pause/delete, and — once a session could
-                        // outlive its terminal — no way to answer `Shutdown`,
-                        // so a background session became unstoppable until the
-                        // magnet gave up.
-                        let engine = engine.clone();
-                        let msg_tx = msg_tx.clone();
-                        let finished_tx = finished_tx.clone();
-                        let ticket = engine.begin_pending_add(&source);
-                        let dht_enabled = engine.session().get_dht().is_some();
-                        tokio::spawn(async move {
-                            // Bounded: dropping the future cancels librqbit's
-                            // resolution (a plain select! loop, no detached
-                            // tasks), so a magnet nobody seeds ends as a
-                            // message rather than a task that dies with the
-                            // window. The picture is read *before* the entry
-                            // is removed so the message can say why.
-                            let outcome =
-                                tokio::time::timeout(METADATA_TIMEOUT, engine.add_torrent(&source))
-                                    .await;
-                            let gave_up = match outcome {
-                                Ok(_) => None,
-                                Err(_) => engine.pending_add(ticket),
-                            };
-                            engine.end_pending_add(ticket);
-                            match outcome {
-                                Ok(outcome) => {
-                                    report_add_outcome(&engine, &msg_tx, &finished_tx, outcome, stripped_udp)
-                                        .await;
-                                }
-                                Err(_) => {
-                                    let msg = gave_up_message(gave_up, dht_enabled);
-                                    tracing::warn!("{msg}");
-                                    let _ = msg_tx.send(msg).await;
-                                }
-                            }
-                        });
+                        start_add(&engine, source, None, &msg_tx, &finished_tx).await;
+                    }
+                    Some(EngineCommand::AddTorrentInto { source, folder }) => {
+                        start_add(&engine, source, Some(folder), &msg_tx, &finished_tx).await;
                     }
                     Some(EngineCommand::PreviewTorrent { ticket, source }) => {
                         let (source, stripped_udp) = prepare_source(&engine, source, &msg_tx).await;
@@ -2648,9 +2796,16 @@ mod tests {
             LimitsConfig::default(),
             PathBuf::from("/tmp/tt-test-session"),
         );
-        assert!(opts.dht.is_some());
         assert!(opts.listen.is_some());
         assert!(opts.connect.is_none());
+        // The routing table lives with the session, not in librqbit's shared
+        // default file — two profiles at once would otherwise share a table
+        // and its stored port.
+        let dht = opts.dht.expect("DHT on");
+        assert_eq!(
+            dht.persistence.and_then(|p| p.config_filename),
+            Some(PathBuf::from("/tmp/tt-test-session/dht.json"))
+        );
     }
 
     #[test]

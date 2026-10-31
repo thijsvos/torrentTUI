@@ -1,6 +1,75 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// The profile this process runs as, chosen once by [`select_profile`] before
+/// anything reads a path. `None` inside means the default profile.
+///
+/// A process-wide value rather than a parameter because a profile is a
+/// property of the whole process: every path the app owns — config, logs, the
+/// session and its lock — moves with it, and a caller that missed the
+/// parameter would quietly read the default profile's files instead.
+static PROFILE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Longest profile name accepted. It ends up in paths and in every hint the
+/// app prints, so it is kept short.
+const MAX_PROFILE_CHARS: usize = 32;
+
+/// Check a `--profile` name. Letters, digits, `-` and `_` only: the name is a
+/// directory name, so anything that could climb out of `profiles/` (`..`, a
+/// separator) or mean something to a shell is refused outright.
+pub fn check_profile_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("The profile name is empty.".to_string());
+    }
+    if name.chars().count() > MAX_PROFILE_CHARS {
+        return Err(format!(
+            "The profile name is too long (limit {MAX_PROFILE_CHARS} characters)."
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "Profile names may only use letters, digits, - and _ (got \"{name}\")."
+        ));
+    }
+    Ok(())
+}
+
+/// Run as `profile` for the rest of the process. Called once, from `main`,
+/// before any path is read; later calls are ignored.
+pub fn select_profile(profile: Option<String>) {
+    let _ = PROFILE.set(profile);
+}
+
+/// The active profile's name, or `None` for the default one.
+pub fn profile() -> Option<&'static str> {
+    PROFILE.get().and_then(|p| p.as_deref())
+}
+
+/// How to type a `torrenttui` command for this profile, for the hints the app
+/// prints: `command("--stop")` is `torrenttui --stop`, or
+/// `torrenttui --profile vpn --stop` when running as `vpn`. An empty `args`
+/// gives the bare launch command.
+pub fn command(args: &str) -> String {
+    command_for(profile(), args)
+}
+
+fn command_for(profile: Option<&str>, args: &str) -> String {
+    let mut out = "torrenttui".to_string();
+    if let Some(name) = profile {
+        out.push_str(" --profile ");
+        out.push_str(name);
+    }
+    if !args.is_empty() {
+        out.push(' ');
+        out.push_str(args);
+    }
+    out
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -364,12 +433,23 @@ impl Default for SearchConfig {
 }
 
 impl Config {
-    /// The app's per-user directory. Holds `config.toml` and the rotating
-    /// `torrenttui.log`, so main.rs calls this before any config is loaded.
-    /// Falls back to the process working directory when the platform reports
-    /// no config dir, which keeps the app runnable in a container with no HOME
-    /// rather than failing at startup.
+    /// The app's per-user directory for the active profile. Holds
+    /// `config.toml`, the rotating `torrenttui.log` and the session, so main.rs
+    /// calls this before any config is loaded. A named profile lives in
+    /// `profiles/<name>/` below the default one's, so it shares nothing with
+    /// it. Falls back to the process working directory when the platform
+    /// reports no config dir, which keeps the app runnable in a container with
+    /// no HOME rather than failing at startup.
     pub fn config_dir() -> PathBuf {
+        let base = Self::default_config_dir();
+        match profile() {
+            Some(name) => profile_dir(&base, name),
+            None => base,
+        }
+    }
+
+    /// The default profile's directory, whichever profile is active.
+    fn default_config_dir() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("torrenttui")
@@ -377,6 +457,28 @@ impl Config {
 
     pub fn config_path() -> PathBuf {
         Self::config_dir().join("config.toml")
+    }
+
+    /// Give a named profile its first `config.toml`: a copy of the default
+    /// profile's, so a new profile starts as the setup the user already has
+    /// and only needs the one setting that differs. Returns a note naming the
+    /// file when it made one. Does nothing for the default profile, for a
+    /// profile that already has a config, or when there is nothing to copy —
+    /// [`Config::load`] then writes the defaults as usual.
+    pub fn seed_profile() -> Result<Option<String>> {
+        let Some(name) = profile() else {
+            return Ok(None);
+        };
+        let made = seed_profile_at(
+            &Self::default_config_dir().join("config.toml"),
+            &Self::config_path(),
+        )?;
+        Ok(made.then(|| {
+            format!(
+                "New profile \"{name}\": its settings start as a copy of yours, in {}",
+                Self::config_path().display()
+            )
+        }))
     }
 
     /// Load config from disk. Returns `(config, optional_warning)`. The warning
@@ -388,28 +490,12 @@ impl Config {
     /// parent directory — and `Err` covers that write as well as the read. A
     /// file that exists but is unparseable is deliberately left alone for the
     /// user to fix.
-    /// Tilde expansion runs only on the parsed-file path; the default and
-    /// parse-failure paths return values that never contain `~`.
-    pub fn load() -> Result<(Self, Option<String>)> {
-        let path = Self::config_path();
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            match toml::from_str::<Config>(&content) {
-                Ok(mut config) => {
-                    config.expand_paths();
-                    Ok((config, None))
-                }
-                Err(e) => {
-                    let msg = format!("Invalid config file, using defaults: {}", e);
-                    tracing::warn!("{msg}");
-                    Ok((Config::default(), Some(msg)))
-                }
-            }
-        } else {
-            let config = Config::default();
-            config.save()?;
-            Ok((config, None))
-        }
+    ///
+    /// `overrides` (from `--set`) are laid over whatever was read — the file,
+    /// or the defaults when it did not parse — and are never written anywhere:
+    /// the defaults written on a first run are the plain defaults.
+    pub fn load(overrides: &[Override]) -> Result<(Self, Option<String>)> {
+        load_at(&Self::config_path(), overrides)
     }
 
     /// Expand `~` in every user-supplied path the config carries. Called once
@@ -423,22 +509,15 @@ impl Config {
         self.player.command = expand_tilde(&self.player.command);
     }
 
-    /// Write the config out, creating the directory if needed. Serializes the
-    /// in-memory values, so any `~` the user wrote has already been expanded by
-    /// `load` and gets persisted in expanded form.
-    pub fn save(&self) -> Result<()> {
-        write_atomic(&Self::config_path(), &toml::to_string_pretty(self)?)
-    }
-
     /// Persist a theme chosen in the app by editing only `[ui] theme` in the
     /// file on disk.
     ///
-    /// Not [`Config::save`]: that re-serializes the in-memory config, which at
-    /// runtime is not what the file says. It would drop comments and unknown
-    /// keys, write `~` paths back expanded, bake a one-off `--download-dir`
-    /// into the file, and — when the file failed to parse and the session fell
-    /// back to defaults — replace the user's settings, proxy included, with
-    /// those defaults.
+    /// Not a re-serialization of the in-memory config, which at runtime is
+    /// not what the file says. That would drop comments and unknown keys,
+    /// write `~` paths back expanded, bake a one-off `--download-dir` or
+    /// `--set` into the file, and — when the file failed to parse and the
+    /// session fell back to defaults — replace the user's settings, proxy
+    /// included, with those defaults.
     pub fn save_theme(theme: &str) -> Result<()> {
         save_theme_at(&Self::config_path(), theme)
     }
@@ -481,6 +560,187 @@ fn save_theme_at(path: &Path, theme: &str) -> Result<()> {
         }
     }
     write_atomic(&path, &doc.to_string())
+}
+
+/// [`Config::load`] against an explicit path, for tests.
+fn load_at(path: &Path, overrides: &[Override]) -> Result<(Config, Option<String>)> {
+    let (table, warning) = if path.exists() {
+        let content = std::fs::read_to_string(path)?;
+        match toml::from_str::<Config>(&content) {
+            // Parsed again as a plain table so overrides land on the file's
+            // own values, keys this version does not know included.
+            Ok(_) => (toml::from_str::<toml::Table>(&content)?, None),
+            Err(e) => {
+                let msg = format!("Invalid config file, using defaults: {}", e);
+                tracing::warn!("{msg}");
+                (toml::Table::new(), Some(msg))
+            }
+        }
+    } else {
+        write_atomic(path, &toml::to_string_pretty(&Config::default())?)?;
+        (toml::Table::new(), None)
+    };
+    let mut config = with_overrides(table, overrides)?;
+    // Tilde expansion runs here, after the overrides, so a `--set` path gets
+    // the same `~` handling as one in the file.
+    config.expand_paths();
+    Ok((config, warning))
+}
+
+/// Where a named profile lives below the default profile's directory.
+fn profile_dir(base: &Path, name: &str) -> PathBuf {
+    base.join("profiles").join(name)
+}
+
+/// [`Config::seed_profile`] against explicit paths, for tests. Returns whether
+/// it wrote `target`.
+fn seed_profile_at(source: &Path, target: &Path) -> Result<bool> {
+    if target.exists() {
+        return Ok(false);
+    }
+    let content = match std::fs::read_to_string(source) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    write_atomic(target, &content)?;
+    // The copy can hold the same proxy credentials, so it gets the same
+    // permissions as the file it came from.
+    if let Ok(meta) = std::fs::metadata(source) {
+        std::fs::set_permissions(target, meta.permissions())?;
+    }
+    Ok(true)
+}
+
+/// One `--set section.key=value`, checked against the settings this version
+/// has. Built only by [`parse_override`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Override {
+    section: String,
+    key: String,
+    value: toml::Value,
+    /// The argument as given, for passing on to a detached background copy.
+    arg: String,
+}
+
+impl Override {
+    pub fn arg(&self) -> &str {
+        &self.arg
+    }
+}
+
+/// Every setting `--set` may name, with its default value — which also gives
+/// the type a value has to have. From the serialized defaults, so a setting
+/// added to the config is settable without touching this. `watch_dir` is the
+/// one optional setting, and serializing skips it while it is unset, so it is
+/// filled in here.
+fn known_settings() -> toml::Table {
+    let mut config = Config::default();
+    config.general.watch_dir = Some(String::new());
+    to_table(&config)
+}
+
+/// `config` as a TOML table.
+fn to_table(config: &Config) -> toml::Table {
+    match toml::Value::try_from(config) {
+        Ok(toml::Value::Table(table)) => table,
+        _ => toml::Table::new(),
+    }
+}
+
+/// Parse and check a `--set` argument, so a mistake stops the launch with a
+/// message instead of being ignored. That matters more here than in the file:
+/// a mistyped key would be dropped silently, and an override that made the
+/// config fail to parse would fall back to the defaults — the very setting the
+/// user meant to add (say, a proxy) gone without a word.
+///
+/// The value is read the way the setting's type needs: a text setting takes
+/// the rest of the argument as it is, so `privacy.proxy_url=socks5://…` needs
+/// no TOML quoting (quotes are accepted and removed); anything else is parsed
+/// as a TOML value — `true`, `6882`, `["--fs"]`.
+pub fn parse_override(arg: &str) -> std::result::Result<Override, String> {
+    let Some((name, raw)) = arg.split_once('=') else {
+        return Err(
+            "expected section.key=value, like privacy.proxy_url=socks5://127.0.0.1:9050"
+                .to_string(),
+        );
+    };
+    let name = name.trim();
+    let known = known_settings();
+    let (section, key) = name.split_once('.').unwrap_or((name, ""));
+    let expected = known
+        .get(section)
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get(key));
+    let Some(expected) = expected else {
+        return Err(format!(
+            "no setting named \"{name}\". Settings are named section.key, as in config.toml: {}",
+            setting_names(&known).join(", ")
+        ));
+    };
+    let value = if expected.is_str() {
+        match toml_value(raw) {
+            Some(toml::Value::String(s)) => toml::Value::String(s),
+            _ => toml::Value::String(raw.to_string()),
+        }
+    } else {
+        toml_value(raw).ok_or_else(|| {
+            format!(
+                "{name} takes a {} value (got \"{raw}\")",
+                expected.type_str()
+            )
+        })?
+    };
+    let parsed = Override {
+        section: section.to_string(),
+        key: key.to_string(),
+        value,
+        arg: arg.to_string(),
+    };
+    // The real check: apply it to the defaults and deserialize. That catches
+    // what the type alone does not, like a port that does not fit in 16 bits,
+    // and since the file is applied the same way, an override that passes
+    // here cannot make the real config fail to parse later.
+    with_overrides(to_table(&Config::default()), std::slice::from_ref(&parsed))
+        .map_err(|e| format!("{name}: {}", e.root_cause()))?;
+    Ok(parsed)
+}
+
+/// `raw` as a TOML value, or `None` when it is not one.
+fn toml_value(raw: &str) -> Option<toml::Value> {
+    let doc: toml::Table = toml::from_str(&format!("v = {raw}")).ok()?;
+    doc.get("v").cloned()
+}
+
+/// `section.key` for every setting, sorted.
+fn setting_names(known: &toml::Table) -> Vec<String> {
+    let mut names = Vec::new();
+    for (section, table) in known {
+        if let Some(table) = table.as_table() {
+            for key in table.keys() {
+                names.push(format!("{section}.{key}"));
+            }
+        }
+    }
+    names
+}
+
+/// Lay `overrides` over `table` and deserialize the result.
+fn with_overrides(mut table: toml::Table, overrides: &[Override]) -> Result<Config> {
+    for o in overrides {
+        let section = table
+            .entry(o.section.clone())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        // A section that is not a table cannot have come from a file that
+        // parsed as a `Config`, but replacing it keeps this total.
+        if !section.is_table() {
+            *section = toml::Value::Table(toml::Table::new());
+        }
+        if let Some(section) = section.as_table_mut() {
+            section.insert(o.key.clone(), o.value.clone());
+        }
+    }
+    Ok(toml::Value::Table(table).try_into::<Config>()?)
 }
 
 /// Atomic write: tmp file + fsync + rename. A power loss or SIGKILL mid-write
@@ -940,5 +1200,242 @@ theme = "system"              # colour theme; see Themes below
             std::fs::read_to_string(&real).unwrap(),
             "[ui]\ntheme = \"nord\"\n"
         );
+    }
+
+    // -- profiles -------------------------------------------------------------
+
+    #[test]
+    fn profile_names_are_plain_directory_names() {
+        for good in ["vpn", "work-2", "a_b", "X"] {
+            assert_eq!(check_profile_name(good), Ok(()), "{good}");
+        }
+        for bad in ["", "..", "a/b", "a\\b", "with space", "dot.name", "ü"] {
+            assert!(check_profile_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_profile_name(&"a".repeat(MAX_PROFILE_CHARS)).is_ok());
+        assert!(check_profile_name(&"a".repeat(MAX_PROFILE_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn hints_carry_the_profile() {
+        assert_eq!(command_for(None, ""), "torrenttui");
+        assert_eq!(command_for(None, "--stop"), "torrenttui --stop");
+        assert_eq!(command_for(Some("vpn"), ""), "torrenttui --profile vpn");
+        assert_eq!(
+            command_for(Some("vpn"), "--stop"),
+            "torrenttui --profile vpn --stop"
+        );
+    }
+
+    #[test]
+    fn a_profile_lives_below_the_default_one() {
+        let base = Path::new("/cfg/torrenttui");
+        assert_eq!(
+            profile_dir(base, "vpn"),
+            PathBuf::from("/cfg/torrenttui/profiles/vpn")
+        );
+    }
+
+    #[test]
+    fn a_new_profile_starts_as_a_copy_of_the_default_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("config.toml");
+        let target = dir.path().join("profiles/vpn/config.toml");
+        let content = "# mine\n[general]\ndownload_dir = \"~/dl\"\n";
+        std::fs::write(&source, content).unwrap();
+
+        assert!(seed_profile_at(&source, &target).unwrap());
+        // Byte for byte: comments and `~` spellings survive.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), content);
+
+        // Once only: the profile's own edits are never overwritten.
+        std::fs::write(&target, "[ui]\ntheme = \"nord\"\n").unwrap();
+        assert!(!seed_profile_at(&source, &target).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "[ui]\ntheme = \"nord\"\n"
+        );
+    }
+
+    #[test]
+    fn with_no_default_config_a_new_profile_gets_plain_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("profiles/vpn/config.toml");
+        assert!(!seed_profile_at(&dir.path().join("config.toml"), &target).unwrap());
+        assert!(!target.exists());
+        // `load` then writes the defaults, as on any first run.
+        let (config, warning) = load_at(&target, &[]).unwrap();
+        assert!(warning.is_none());
+        assert!(target.exists());
+        assert_eq!(config.network.listen_port, 6881);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_copy_of_a_private_config_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("config.toml");
+        std::fs::write(&source, "[privacy]\nproxy_url = \"socks5://u:p@h:1080\"\n").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let target = dir.path().join("profiles/vpn/config.toml");
+        seed_profile_at(&source, &target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // -- --set ----------------------------------------------------------------
+
+    fn set(args: &[&str]) -> Vec<Override> {
+        args.iter().map(|a| parse_override(a).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_text_setting_takes_the_rest_of_the_argument_as_is() {
+        let o = parse_override("privacy.proxy_url=socks5://u:p=w@127.0.0.1:9050").unwrap();
+        assert_eq!(
+            o.value,
+            toml::Value::String("socks5://u:p=w@127.0.0.1:9050".to_string())
+        );
+        // TOML quoting is accepted, not required.
+        let o = parse_override(r#"general.download_dir="~/my dl""#).unwrap();
+        assert_eq!(o.value, toml::Value::String("~/my dl".to_string()));
+        // Something that happens to read as a number stays text.
+        let o = parse_override("network.http_api_bind=8080").unwrap();
+        assert_eq!(o.value, toml::Value::String("8080".to_string()));
+        // Empty turns a text setting off.
+        let o = parse_override("privacy.proxy_url=").unwrap();
+        assert_eq!(o.value, toml::Value::String(String::new()));
+        assert_eq!(o.arg(), "privacy.proxy_url=");
+    }
+
+    #[test]
+    fn other_settings_take_a_toml_value_of_their_type() {
+        assert_eq!(
+            parse_override("network.enable_dht=false").unwrap().value,
+            toml::Value::Boolean(false)
+        );
+        assert_eq!(
+            parse_override("network.listen_port=7000").unwrap().value,
+            toml::Value::Integer(7000)
+        );
+        let o = parse_override(r#"player.args=["--fs", "--no-osc"]"#).unwrap();
+        assert!(o.value.is_array());
+        // The optional setting is settable too.
+        assert!(parse_override("general.watch_dir=~/watch").is_ok());
+    }
+
+    #[test]
+    fn a_mistake_in_set_is_an_error_not_a_silent_default() {
+        let err = parse_override("privacy.proxy=socks5://x").unwrap_err();
+        assert!(err.contains("no setting named \"privacy.proxy\""), "{err}");
+        assert!(
+            err.contains("privacy.proxy_url"),
+            "lists the real names: {err}"
+        );
+        assert!(parse_override("proxy_url=x").is_err(), "needs a section");
+        assert!(parse_override("privacy=x").is_err());
+        assert!(parse_override("privacy.proxy_url").is_err(), "needs =");
+
+        let err = parse_override("network.enable_dht=yes").unwrap_err();
+        assert!(err.contains("network.enable_dht takes a boolean"), "{err}");
+        // Right type, out of range: caught by deserializing for real.
+        let err = parse_override("network.listen_port=70000").unwrap_err();
+        assert!(err.starts_with("network.listen_port:"), "{err}");
+        assert!(parse_override("network.listen_port=\"6881\"").is_err());
+    }
+
+    #[test]
+    fn overrides_land_on_the_file_and_are_never_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let content = "[general]\ndownload_dir = \"/srv/dl\"\nfuture_key = 1\n\n[network]\nlisten_port = 7000\n";
+        std::fs::write(&path, content).unwrap();
+
+        let (config, warning) = load_at(
+            &path,
+            &set(&[
+                "privacy.proxy_url=socks5://127.0.0.1:9050",
+                "network.enable_dht=false",
+            ]),
+        )
+        .unwrap();
+        assert!(warning.is_none());
+        assert_eq!(config.privacy.proxy_url, "socks5://127.0.0.1:9050");
+        assert!(!config.network.enable_dht);
+        // The file's own values stay where nothing overrides them.
+        assert_eq!(config.general.download_dir, "/srv/dl");
+        assert_eq!(config.network.listen_port, 7000);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn the_last_override_of_a_setting_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (config, _) = load_at(
+            &path,
+            &set(&["network.listen_port=7000", "network.listen_port=7100"]),
+        )
+        .unwrap();
+        assert_eq!(config.network.listen_port, 7100);
+    }
+
+    #[test]
+    fn overrides_apply_over_defaults_when_the_file_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[network\n").unwrap();
+        let (config, warning) =
+            load_at(&path, &set(&["privacy.proxy_url=socks5://127.0.0.1:9050"])).unwrap();
+        assert!(warning.is_some());
+        assert_eq!(config.privacy.proxy_url, "socks5://127.0.0.1:9050");
+        // The broken file is left for the user to fix.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[network\n");
+    }
+
+    #[test]
+    fn a_first_run_writes_plain_defaults_not_the_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (config, _) = load_at(&path, &set(&["privacy.proxy_url=socks5://h:1"])).unwrap();
+        assert_eq!(config.privacy.proxy_url, "socks5://h:1");
+        let on_disk: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(on_disk.privacy.proxy_url.is_empty());
+    }
+
+    #[test]
+    fn an_override_path_gets_tilde_expansion() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _) = load_at(
+            &dir.path().join("config.toml"),
+            &set(&["general.download_dir=~/dl"]),
+        )
+        .unwrap();
+        assert_eq!(
+            config.general.download_dir,
+            home.join("dl").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn every_setting_in_the_defaults_can_be_overridden() {
+        // Guards `known_settings` against a section or key it cannot see.
+        let names = setting_names(&known_settings());
+        for name in [
+            "general.download_dir",
+            "general.watch_dir",
+            "network.listen_port",
+            "privacy.proxy_url",
+            "privacy.bind_interface",
+            "search.max_results",
+            "ui.theme",
+            "player.args",
+        ] {
+            assert!(names.iter().any(|n| n == name), "{name} missing: {names:?}");
+        }
     }
 }

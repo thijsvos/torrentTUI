@@ -34,6 +34,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 - **Why is it slow?** — press `w` and the Health tab says *why* a torrent is stalled (no way to find peers, peers unreachable, swarm has no seeders, your own cap) and what to change; see [the Health tab](#why-is-it-slow--the-health-tab)
 - **Session persistence** — torrents survive restarts via librqbit's built-in fastresume
 - **Background sessions** — press `Ctrl+D` to detach: downloads and seeding keep running in a process you started on purpose. Nothing survives a plain `q`. Run `torrenttui` again to take the session back; `torrenttui --stop` ends it
+- **Profiles and one-off settings** — `--profile vpn` runs a separate session with its own settings next to your usual one; `-c privacy.proxy_url=…` overrides any setting for a single run; `-q` quits when the downloads are done, for scripts
 - **Disk space monitoring** — free space indicator with low-space warnings
 - **Completion notifications** — status bar message, plus a desktop notification on Linux/Windows or a system sound on macOS
 - **Mouse support** — click to select torrents in the list
@@ -89,6 +90,11 @@ torrenttui [OPTIONS] [TORRENT_SOURCE]
 |--------|-------------|
 | `<TORRENT_SOURCE>` | Magnet link or `.torrent` file path to add on startup (positional) |
 | `-d`, `--download-dir <PATH>` | Override download directory (otherwise read from config) |
+| `-p`, `--profile <NAME>` | Run as a separate profile, with its own settings, torrents and session — see [Profiles](#profiles) |
+| `-c`, `--set <KEY=VALUE>` | Override any `config.toml` setting for this run only; repeatable — see [One-off settings](#one-off-settings) |
+| `-i`, `--pick` | Open the file picker for the source instead of adding it straight away (what `A` does) |
+| `-s`, `--search <QUERY>` | Start with a search for `QUERY` (what `s` does) |
+| `-q`, `--quit-when-done` | Quit once nothing is left to download — see [Quitting when done](#quitting-when-done) |
 | `--headless` | Run the engine with no terminal (a server, or a detached session) |
 | `--status` | Report whether a session is running, and exit |
 | `--stop` | Stop a running background session and exit |
@@ -111,7 +117,21 @@ torrenttui path/to/file.torrent
 torrenttui -d /path/to/downloads
 
 # Add a magnet to the session that is already running, from any shell
+# (-d works here too: the torrent goes to that folder)
 torrenttui "magnet:?xt=urn:btih:..."
+
+# Choose the files first, or start with a search
+torrenttui -i "magnet:?xt=urn:btih:..."
+torrenttui -s "debian netinst"
+
+# This one through a proxy, without editing config.toml
+torrenttui -c privacy.proxy_url=socks5://127.0.0.1:9050 "magnet:?xt=urn:btih:..."
+
+# A second session with settings of its own, next to the usual one
+torrenttui --profile vpn
+
+# Download, then exit: 0 when everything finished, 1 when something failed
+torrenttui --headless -q -p batch "magnet:?xt=urn:btih:..."
 
 # Background session (see Background sessions below)
 torrenttui --headless
@@ -474,6 +494,70 @@ lives inside the watch folder.
 
 By default only `torrenttui=warn` is logged to `~/.config/torrenttui/torrenttui.log`. Set `RUST_LOG` to bump verbosity (e.g. `RUST_LOG=torrenttui=debug,librqbit=info`).
 
+### One-off settings
+
+`-c section.key=value` (long form `--set`) overrides one setting for one run and
+is never written back to `config.toml`. Give it as often as you need; names are
+the section and key exactly as they appear in the file:
+
+```bash
+torrenttui -c privacy.proxy_url=socks5://127.0.0.1:9050 -c network.listen_port=7000
+torrenttui -c privacy.proxy_url=      # the proxy off, just this once
+```
+
+A text setting takes the rest of the argument as it is, so URLs and paths need
+no quoting beyond what your shell wants; other settings take a TOML value
+(`true`, `7000`, `["--fs"]`). A name that does not exist or a value of the wrong
+type stops the launch with a message — it is never silently ignored, because
+the setting that went missing would usually be the one that mattered.
+
+Settings are applied when a session starts, so `-c` cannot change a session
+that is already running: `torrenttui -c … "magnet:…"` with a session open
+refuses instead of adding the magnet without the setting. Start it as a
+[profile](#profiles) to run it next to the other one, or stop the other first.
+
+Mind that anything on a command line is visible to other users of the machine
+in `ps` — put proxy credentials in a profile's `config.toml` rather than in `-c`.
+
+### Profiles
+
+`--profile <name>` (`-p`) runs a session of its own: its own `config.toml`,
+torrent list, background session, logs and DHT state, in `profiles/<name>/`
+beside your config. Profiles run independently, so `torrenttui -p vpn` can sit
+next to your usual session — each holds its own lock, and two sessions never
+share torrents.
+
+The first launch of a profile starts its `config.toml` as a copy of your main
+one, so you only change what differs — say, the proxy:
+
+```bash
+torrenttui -p vpn          # first run creates profiles/vpn/config.toml
+# edit privacy.proxy_url in that file, then:
+torrenttui -p vpn "magnet:?xt=urn:btih:..."
+```
+
+Everything that talks to a session takes the profile: `torrenttui -p vpn
+--status`, `torrenttui -p vpn --stop`, and a magnet given with `-p vpn` goes to
+the `vpn` session if it is running. `Ctrl+D` in a profile detaches that profile.
+Names are letters, digits, `-` and `_`.
+
+### Quitting when done
+
+`--quit-when-done` (`-q`) quits once nothing is left to download: no magnet is
+still waiting for metadata, and no torrent is downloading or checking. A paused
+torrent counts as settled — it will not finish on its own — and so does one in
+error. Seeding stops when it quits, like any other quit.
+
+It prints what happened and exits with status `0` when nothing failed, or `1`
+when a torrent ended in error or something could not be added (a magnet nobody
+could resolve, a broken `.torrent`), so a script can tell. It works in the window and with `--headless`; a separate profile
+keeps a scripted run away from your everyday torrents, which would otherwise
+count too:
+
+```bash
+torrenttui --headless -q -p batch "magnet:?xt=urn:btih:..." && echo downloaded
+```
+
 ## Background sessions
 
 TorrentTUI normally lives and dies with your terminal: `q` and `Ctrl+C` stop the
@@ -501,15 +585,19 @@ names the pid of the first. This is not tidiness: librqbit's session state is
 guarded only inside a single process, so two instances writing the same
 `session.json` and the same fastresume files silently lose torrents. (If what
 you wanted a second instance for was a different download folder: `A` chooses
-the folder per torrent.) Before this
-existed, a second launch started anyway.
+the folder per torrent. For different settings, run a
+[profile](#profiles) — a session of its own.) Before this existed, a second
+launch started anyway.
 
 **Handing work to a running session.** `torrenttui "magnet:?..."` while a
 session is running — a window or a background one — adds the magnet to it and
 exits, instead of starting a competing instance. This makes TorrentTUI usable as
-a `magnet:` handler from a browser. Magnets only: a `.torrent` *path* would be
-resolved against the running session's working directory rather than yours, so
-it is refused with an explanation.
+a `magnet:` handler from a browser. `-d` travels with it: the torrent goes to
+that folder, in its own subfolder, just as a session started with that `-d`
+would place it. Magnets only: a `.torrent` *path* would be resolved against the
+running session's working directory rather than yours, so it is refused with an
+explanation. Settings (`-c`) and `--quit-when-done` belong to a session as it
+starts, so they are refused rather than dropped.
 
 **On a server.** `--headless` runs the engine with no terminal at all, logging
 to `torrenttui-daemon.log` beside your config. It shuts down cleanly on SIGTERM,
