@@ -164,7 +164,13 @@ pub fn render_detach_dialog(
     // [Y]es/[N]o line was cut off, which is only visible by looking at it.
     let needed = if streaming { 13 } else { 12 };
     popup.height = popup.height.max(needed).min(area.height);
-    popup.width = popup.width.max(46.min(area.width));
+    // Wide enough for the stop command whole, which grows with a profile's
+    // name — a cut-off command is no way out at all.
+    let reattach = format!("  Reattach:  {}", crate::config::command(""));
+    let stop = format!("  Stop:      {}", crate::config::command("--stop"));
+    let wide = u16::try_from(stop.chars().count() + 3).unwrap_or(u16::MAX);
+    popup.width = popup.width.max(wide.max(46)).min(area.width);
+    popup.x = area.x + (area.width - popup.width) / 2;
     f.render_widget(Clear, popup);
 
     let dim = Style::default().fg(theme.muted);
@@ -198,8 +204,8 @@ pub fn render_detach_dialog(
 
     text.extend([
         Line::from(""),
-        Line::from(Span::styled("  Reattach:  torrenttui", dim)),
-        Line::from(Span::styled("  Stop:      torrenttui --stop", dim)),
+        Line::from(Span::styled(reattach, dim)),
+        Line::from(Span::styled(stop, dim)),
         Line::from(""),
         Line::from(vec![
             Span::styled(

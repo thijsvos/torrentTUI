@@ -26,6 +26,7 @@ mod add_picker;
 mod app;
 mod completion;
 mod config;
+mod done;
 mod engine;
 mod file_tree;
 mod health;
@@ -42,7 +43,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use add_picker::{AddPickerState, Focus, Picker};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use app::App;
 use clap::Parser;
 use crossterm::{
@@ -98,7 +99,7 @@ pub(crate) fn clamped_speed_limit(kbps: u64) -> u64 {
 /// running with `RUST_LOG` turned up.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(name = "torrenttui", version, about = "Terminal BitTorrent client")]
 struct Cli {
     /// Magnet link or .torrent file path to add on startup
@@ -107,6 +108,44 @@ struct Cli {
     /// Download directory override
     #[arg(short, long)]
     download_dir: Option<String>,
+
+    /// Run as a separate profile: its own settings, torrents and session,
+    /// which can run next to the default one
+    #[arg(short, long, value_name = "NAME", value_parser = parse_profile)]
+    profile: Option<String>,
+
+    /// Override a config.toml setting for this run only, e.g.
+    /// `-c privacy.proxy_url=socks5://127.0.0.1:9050`. Repeatable
+    #[arg(
+        short = 'c',
+        long = "set",
+        value_name = "KEY=VALUE",
+        value_parser = config::parse_override,
+        conflicts_with_all = ["stop", "status"]
+    )]
+    set: Vec<config::Override>,
+
+    /// Open the file picker for the source instead of adding it straight away
+    #[arg(
+        short = 'i',
+        long,
+        requires = "torrent_source",
+        conflicts_with_all = ["headless", "stop", "status"]
+    )]
+    pick: bool,
+
+    /// Start with a search for QUERY
+    #[arg(
+        short,
+        long,
+        value_name = "QUERY",
+        conflicts_with_all = ["torrent_source", "headless", "stop", "status"]
+    )]
+    search: Option<String>,
+
+    /// Quit once nothing is left to download. Seeding stops with it
+    #[arg(short, long, conflicts_with_all = ["stop", "status"])]
+    quit_when_done: bool,
 
     /// Run the engine with no terminal, for a server or a detached session
     #[arg(long, conflicts_with_all = ["stop", "status"])]
@@ -129,8 +168,36 @@ impl Cli {
             status: self.status,
             torrent_source: self.torrent_source.clone(),
             handoff,
+            overrides: !self.set.is_empty(),
+            quit_when_done: self.quit_when_done,
+            pick: self.pick,
         }
     }
+
+    /// The arguments a detached background copy needs to run this same
+    /// session: the profile, the download folder, every `--set`, and
+    /// `--quit-when-done`. Not the source, which this session already added.
+    fn forwarded(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(ref profile) = self.profile {
+            args.extend(["--profile".to_string(), profile.clone()]);
+        }
+        if let Some(ref dir) = self.download_dir {
+            args.extend(["--download-dir".to_string(), config::expand_tilde(dir)]);
+        }
+        for o in &self.set {
+            args.extend(["--set".to_string(), o.arg().to_string()]);
+        }
+        if self.quit_when_done {
+            args.push("--quit-when-done".to_string());
+        }
+        args
+    }
+}
+
+/// clap's check for `--profile`.
+fn parse_profile(name: &str) -> std::result::Result<String, String> {
+    config::check_profile_name(name).map(|()| name.to_string())
 }
 
 /// How long to wait for a background session to release the lock, for `--stop`
@@ -226,6 +293,9 @@ async fn main() -> Result<()> {
     // a config directory and writing a startup marker to the log of a machine
     // that may never have run the app (#44).
     let cli = Cli::parse();
+    // Before the first path is read: every directory the app owns moves with
+    // the profile, the session lock included.
+    config::select_profile(cli.profile.clone());
 
     // Resolve session ownership before anything else touches the filesystem.
     // `probe` creates nothing, so `--status` on a machine that has never run
@@ -263,7 +333,7 @@ async fn main() -> Result<()> {
             return stop_background_session(&session_dir);
         }
         instance::Startup::HandOff(source) => {
-            return hand_off_to_running_session(&session_dir, &source);
+            return hand_off_to_running_session(&session_dir, &source, cli.download_dir.as_deref());
         }
         instance::Startup::TakeOver => {
             takeover_of = take_over_background_session(&session_dir)?;
@@ -327,7 +397,16 @@ async fn main() -> Result<()> {
     // surface it; an Err is an I/O failure either reading an existing config or
     // — on first run, when `load` writes the defaults out — creating the config
     // directory, serializing, fsyncing or renaming the new file.
-    let (mut config, config_warning) = match config::Config::load() {
+    // A new profile starts from a copy of the default profile's settings.
+    // Before `load`, which would otherwise write plain defaults.
+    let profile_note = match config::Config::seed_profile() {
+        Ok(note) => note,
+        Err(e) => {
+            tracing::warn!("could not copy the settings into the new profile: {e:#}");
+            None
+        }
+    };
+    let (mut config, config_warning) = match config::Config::load(&cli.set) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("Failed to load config, using defaults: {e}");
@@ -380,13 +459,23 @@ async fn main() -> Result<()> {
     }
 
     if cli.headless {
+        if let Some(ref note) = profile_note {
+            println!("{note}");
+        }
+        if let Some(ref warning) = config_warning {
+            eprintln!("{warning}");
+        }
         let result = run_headless(config, health, &cli, &session_dir, record).await;
         // Hold the lock until the process exits — see `SessionGuard::leak`.
         guard.leak();
-        if let Err(ref e) = result {
-            eprintln!("Error: {:#}", e);
-        }
-        return result;
+        return match result {
+            Ok(Some(done)) => finish_when_done(&done),
+            Ok(None) => Ok(()),
+            Err(e) => {
+                eprintln!("Error: {:#}", e);
+                Err(e)
+            }
+        };
     }
 
     enable_raw_mode()?;
@@ -398,14 +487,15 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Captured before `cli` moves: a detached child inherits no shell, so the
-    // override has to travel on its argv, already tilde-expanded.
-    let cli_download_dir = cli.download_dir.clone();
+    // Captured before `cli` moves: a detached child inherits no shell, so
+    // what this session was started with has to travel on its argv.
+    let forwarded = cli.forwarded();
     let result = run_app(
         &mut terminal,
         cli,
         config,
         health,
+        profile_note,
         config_warning,
         takeover_of,
         &session_dir,
@@ -425,10 +515,14 @@ async fn main() -> Result<()> {
         let nonce = instance::nonce();
         // No stale marker can be mistaken for this hand-off.
         instance::clear_handoff(&session_dir);
-        match instance::spawn_headless_child(cli_download_dir.as_deref(), &nonce) {
+        match instance::spawn_headless_child(&forwarded, &nonce) {
             Ok(pid) if instance::wait_for_handoff(&session_dir, &nonce, HANDOFF_WAIT) => {
                 println!("Running in the background (pid {pid}). Downloads and seeding continue.");
-                println!("Reattach with `torrenttui`, stop with `torrenttui --stop`.");
+                println!(
+                    "Reattach with `{}`, stop with `{}`.",
+                    config::command(""),
+                    config::command("--stop")
+                );
             }
             // It launched but never reported in, so we genuinely do not know
             // whether it is running. Say exactly that rather than guessing
@@ -440,14 +534,19 @@ async fn main() -> Result<()> {
                     HANDOFF_WAIT.as_secs()
                 );
                 eprintln!(
-                    "Check `torrenttui --status`; if nothing is running, `torrenttui` starts again."
+                    "Check `{}`; if nothing is running, `{}` starts again.",
+                    config::command("--status"),
+                    config::command("")
                 );
             }
             Err(e) => {
                 // The window is already gone, so this is the user's only
                 // notice. Be explicit that nothing is running.
                 eprintln!("Could not start the background process: {:#}", e);
-                eprintln!("Your torrents are stopped. Run `torrenttui` to start again.");
+                eprintln!(
+                    "Your torrents are stopped. Run `{}` to start again.",
+                    config::command("")
+                );
             }
         }
     }
@@ -458,23 +557,54 @@ async fn main() -> Result<()> {
     // gone would overlap with them on the same session files.
     guard.leak();
 
-    if let Err(e) = result {
-        // Alternate format prints the whole context chain — for a privacy
-        // startup failure the actionable part ("error reading blocklist from
-        // …", "error creating bind device …") is librqbit's inner context,
-        // which plain `{}` would hide.
-        eprintln!("Error: {:#}", e);
+    match result {
+        Ok(AppExit::Done(done)) => finish_when_done(&done)?,
+        Ok(_) => {}
+        Err(e) => {
+            // Alternate format prints the whole context chain — for a privacy
+            // startup failure the actionable part ("error reading blocklist
+            // from …", "error creating bind device …") is librqbit's inner
+            // context, which plain `{}` would hide.
+            eprintln!("Error: {:#}", e);
+        }
     }
 
     Ok(())
 }
 
+/// Whether the user is in the middle of adding something — typing a source,
+/// choosing files, or looking through search results. `--quit-when-done` waits
+/// while they are: `torrenttui -q -s …` starts with nothing to download, and
+/// quitting under the results would make it useless.
+fn choosing_what_to_add(app: &App) -> bool {
+    app.add_picker.is_some()
+        || matches!(
+            app.mode,
+            AppMode::Input | AppMode::AddPicker | AppMode::Search | AppMode::SearchResults
+        )
+}
+
+/// The last word of a `--quit-when-done` run: what happened, and an exit status
+/// a script can act on — 0 only when nothing failed.
+fn finish_when_done(done: &done::Outcome) -> Result<()> {
+    if done.succeeded() {
+        println!("{}", done.summary());
+        return Ok(());
+    }
+    eprintln!("{}", done.summary());
+    // Safe here: the terminal is restored, the engine has flushed and the
+    // lock is leaked to the OS, which releases it as the process ends.
+    std::process::exit(1);
+}
+
 /// How the TUI ended, which decides whether `main` hands the session to a
 /// background process or lets it end with the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AppExit {
     Quit,
     Detach,
+    /// `--quit-when-done` saw nothing left to download.
+    Done(done::Outcome),
 }
 
 /// Give the terminal back to the shell, in an order that leaves nothing
@@ -527,13 +657,15 @@ fn drain_pending_input() {
 /// status message — command loop dead, state ticks dead, and deaf to a stop
 /// request. That failure would be invisible: no terminal, and the messages that
 /// would explain it are exactly the ones stuck in the channel.
+///
+/// Returns the outcome when `--quit-when-done` ended it.
 async fn run_headless(
     config: config::Config,
     health: Arc<HealthCapture>,
     cli: &Cli,
     session_dir: &Path,
     record: instance::DaemonRecord,
-) -> Result<()> {
+) -> Result<Option<done::Outcome>> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(32);
     let (state_tx, mut state_rx) = mpsc::channel::<Vec<types::TorrentInfo>>(4);
     let (msg_tx, mut msg_rx) = mpsc::channel::<String>(16);
@@ -566,15 +698,30 @@ async fn run_headless(
         "TorrentTUI is running in the background (pid {}). Downloads and seeding continue.",
         std::process::id()
     );
-    println!("Attach with `torrenttui`, stop with `torrenttui --stop`, or press Ctrl+C here.");
+    if cli.quit_when_done {
+        println!("It quits once nothing is left to download.");
+    }
+    println!(
+        "Attach with `{}`, stop with `{}`, or press Ctrl+C here.",
+        config::command(""),
+        config::command("--stop")
+    );
 
     let mut signals = ShutdownSignals::install();
     let mut engine_result: Result<()> = Ok(());
+    let mut done_watch = cli.quit_when_done.then(done::DoneWatch::default);
+    let mut torrents: Vec<types::TorrentInfo> = Vec::new();
+    let mut outcome = None;
     loop {
         tokio::select! {
             // Nothing renders these, but the channel must not fill: the engine
             // `try_send`s snapshots and would otherwise spin on a full queue.
-            Some(_) = state_rx.recv() => {}
+            // Kept only for `--quit-when-done`.
+            Some(pushed) = state_rx.recv() => {
+                if done_watch.is_some() {
+                    torrents = pushed;
+                }
+            }
             // Status-bar strings are the only report a headless session has, so
             // they go to the log at a level the default filter keeps.
             Some(msg) = msg_rx.recv() => tracing::warn!("{msg}"),
@@ -585,8 +732,15 @@ async fn run_headless(
                 EngineInfo::HttpApiReady { .. } => tracing::info!("streaming API ready"),
                 EngineInfo::Privacy(status) => tracing::info!("privacy applied: {status:?}"),
                 // Once a second, and nobody is watching; the TUI shows it on
-                // take-over from its own fresh pushes.
-                EngineInfo::Network(_) => {}
+                // take-over from its own fresh pushes. `--quit-when-done`
+                // decides on this beat.
+                EngineInfo::Network(net) => {
+                    if let Some(done) = done_watch.as_mut().and_then(|w| w.observe(&torrents, &net)) {
+                        tracing::warn!("quitting when done: {}", done.summary());
+                        outcome = Some(done);
+                        break;
+                    }
+                }
                 // Only the add picker asks for previews, and it is TUI-only.
                 EngineInfo::Preview(_) => {}
             },
@@ -598,7 +752,7 @@ async fn run_headless(
                 };
                 // The engine is gone; there is nothing left to shut down.
                 keeper.abort();
-                return record_failure_if_any(session_dir, engine_result);
+                return record_failure_if_any(session_dir, engine_result).map(|()| None);
             }
             _ = signals.recv() => {
                 tracing::warn!("shutting down on signal");
@@ -616,7 +770,7 @@ async fn run_headless(
     // engine can delay the flush.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), engine_handle).await;
     keeper.abort();
-    record_failure_if_any(session_dir, engine_result)
+    record_failure_if_any(session_dir, engine_result).map(|()| outcome)
 }
 
 /// Record a headless startup failure where a user with no terminal can still
@@ -743,13 +897,53 @@ fn stop_background_session(session_dir: &Path) -> Result<()> {
 /// The request becomes an ordinary `EngineCommand::AddTorrent` in the owner, so
 /// it passes through the same `strip_udp_trackers` filtering as one typed into
 /// the add dialog — which is why this does not use librqbit's HTTP API.
-fn hand_off_to_running_session(session_dir: &Path, source: &str) -> Result<()> {
+///
+/// `-d` travels with it, resolved against *this* directory — the owner's
+/// working directory is not the user's — and lands the torrent where a
+/// session started with that `-d` would have.
+fn hand_off_to_running_session(
+    session_dir: &Path,
+    source: &str,
+    download_dir: Option<&str>,
+) -> Result<()> {
     let magnet = instance::handoff_source(&config::expand_tilde(source.trim()))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    instance::send_request(session_dir, &instance::Request::Add(magnet))?;
-    match instance::probe(session_dir).record().map(|r| r.pid) {
-        Some(pid) => println!("Added to the running TorrentTUI session (pid {pid})."),
-        None => println!("Added to the running TorrentTUI session."),
+    let record = instance::probe(session_dir).record().cloned();
+    let folder = match download_dir {
+        Some(dir) => {
+            // An owner from before folders could travel would sweep the
+            // request unread: the torrent would silently not be added.
+            if let Some(r) = record.as_ref().filter(|r| r.control < 1) {
+                anyhow::bail!(
+                    "the running session (TorrentTUI {}, pid {}) is too old to take a download \
+                     folder.\nRestart it, or leave out -d to add the magnet to its own folder.",
+                    r.version,
+                    r.pid
+                );
+            }
+            let dir = config::expand_tilde(dir.trim());
+            let dir = std::path::absolute(&dir)
+                .with_context(|| format!("resolving the download folder {dir}"))?;
+            Some(
+                instance::handoff_folder(&dir.to_string_lossy())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            )
+        }
+        None => None,
+    };
+    instance::send_request(
+        session_dir,
+        &instance::Request::Add {
+            magnet,
+            folder: folder.clone(),
+        },
+    )?;
+    let into = folder
+        .map(|f| format!(", downloading into {f}"))
+        .unwrap_or_default();
+    match record.map(|r| r.pid) {
+        Some(pid) => println!("Added to the running TorrentTUI session (pid {pid}){into}."),
+        None => println!("Added to the running TorrentTUI session{into}."),
     }
     Ok(())
 }
@@ -771,8 +965,9 @@ fn take_over_background_session(session_dir: &Path) -> Result<Option<instance::D
     match pid {
         Some(pid) => anyhow::bail!(
             "the background session (pid {pid}) did not stop within {}s.\n\
-             Stop it manually and try again: torrenttui --stop",
-            RELEASE_WAIT.as_secs()
+             Stop it manually and try again: {}",
+            RELEASE_WAIT.as_secs(),
+            config::command("--stop")
         ),
         None => anyhow::bail!(
             "the background session did not stop within {}s.",
@@ -811,7 +1006,15 @@ fn spawn_session_keeper(
                     };
                     for request in requests {
                         let cmd = match request {
-                            instance::Request::Add(magnet) => EngineCommand::AddTorrent(magnet),
+                            instance::Request::Add { magnet, folder: None } => {
+                                EngineCommand::AddTorrent(magnet)
+                            }
+                            instance::Request::Add { magnet, folder: Some(folder) } => {
+                                EngineCommand::AddTorrentInto {
+                                    source: magnet,
+                                    folder: PathBuf::from(folder),
+                                }
+                            }
                             instance::Request::Stop
                                 if record.mode == instance::Mode::Headless =>
                             {
@@ -914,6 +1117,7 @@ async fn run_app(
     cli: Cli,
     config: config::Config,
     health: Arc<HealthCapture>,
+    profile_note: Option<String>,
     config_warning: Option<String>,
     takeover_of: Option<instance::DaemonRecord>,
     session_dir: &Path,
@@ -940,6 +1144,12 @@ async fn run_app(
     // so a stale or hand-edited value never stops the app from starting.
     app.set_theme(&config.ui.theme);
 
+    if cli.quit_when_done {
+        app.set_info("Quits once nothing is left to download (--quit-when-done)".to_string());
+    }
+    if let Some(note) = profile_note {
+        app.set_info(note);
+    }
     if let Some(msg) = config_warning {
         app.set_error(msg);
     }
@@ -1029,12 +1239,24 @@ async fn run_app(
         // `~`, so expansion is a no-op for them.
         let source = config::expand_tilde(source.trim());
         match validate_torrent_source(&source) {
+            // `--pick`: what `A` does with the same source typed in.
+            Ok(()) if cli.pick => {
+                let label = engine::torrent::pending_add_label(&source);
+                start_preview(&mut app, source, label, AppMode::Normal, None, &cmd_tx).await;
+            }
             Ok(()) => {
                 send_cmd(&cmd_tx, EngineCommand::AddTorrent(source), &mut app).await;
             }
             Err(e) => app.set_error(e),
         }
     }
+    // `--search`: what `s` does with the same query typed in.
+    if let Some(ref query) = cli.search {
+        app.search.input.set(query);
+        start_search(&mut app, &search_tx, &mut search_client, false);
+    }
+    let mut done_watch = cli.quit_when_done.then(done::DoneWatch::default);
+    let mut done_outcome: Option<done::Outcome> = None;
 
     let download_dir = config.general.download_dir.clone();
     let mut event_stream = EventStream::new();
@@ -1086,8 +1308,22 @@ async fn run_app(
             needs_render = true;
         }
         while let Ok(info) = info_rx.try_recv() {
+            let beat = matches!(info, EngineInfo::Network(_));
             apply_engine_info(&mut app, info);
             needs_render = true;
+            if let (true, Some(watch), Some(net)) =
+                (beat, done_watch.as_mut(), app.network_health.as_ref())
+            {
+                // Not while the user is still choosing what to add: an empty
+                // session with the add bar, the picker or search results open
+                // is not done.
+                if choosing_what_to_add(&app) {
+                    watch.hold();
+                } else if let Some(outcome) = watch.observe(&app.torrents, net) {
+                    done_outcome = Some(outcome);
+                    app.should_quit = true;
+                }
+            }
         }
         while let Ok(free) = disk_rx.try_recv() {
             if app.free_disk_space != free {
@@ -1270,6 +1506,8 @@ async fn run_app(
                     .unwrap_or_else(|| anyhow::anyhow!("engine task ended unexpectedly")))
             } else if app.detach_requested {
                 Ok(AppExit::Detach)
+            } else if let Some(outcome) = done_outcome.take() {
+                Ok(AppExit::Done(outcome))
             } else {
                 Ok(AppExit::Quit)
             };
@@ -2758,6 +2996,152 @@ mod tests {
 
     fn read_log(dir: &Path) -> String {
         std::fs::read_to_string(dir.join("torrenttui.log")).unwrap()
+    }
+
+    fn cli(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("torrenttui").chain(args.iter().copied()))
+    }
+
+    const CLI_MAGNET: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn the_cli_definition_is_consistent() {
+        // clap's own checks: conflicting short flags, a `requires` naming an
+        // argument that does not exist, and the like.
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn every_new_flag_has_its_short_form() {
+        let c = cli(&[
+            "-p",
+            "vpn",
+            "-c",
+            "network.enable_dht=false",
+            "-q",
+            "-i",
+            "-d",
+            "/dl",
+            CLI_MAGNET,
+        ])
+        .unwrap();
+        assert_eq!(c.profile.as_deref(), Some("vpn"));
+        assert_eq!(c.set.len(), 1);
+        assert!(c.quit_when_done && c.pick);
+        assert_eq!(c.download_dir.as_deref(), Some("/dl"));
+        assert_eq!(
+            cli(&["-s", "debian iso"]).unwrap().search.as_deref(),
+            Some("debian iso")
+        );
+    }
+
+    #[test]
+    fn a_bad_profile_or_setting_stops_the_launch() {
+        assert!(cli(&["--profile", "../other"]).is_err());
+        assert!(cli(&["--profile", ""]).is_err());
+        let err = cli(&["--set", "privacy.proxy=socks5://x"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no setting named"), "{err}");
+        assert!(cli(&["--set", "network.enable_dht=yes"]).is_err());
+    }
+
+    #[test]
+    fn flags_that_cannot_combine_are_refused() {
+        // Picking needs a source, and a window.
+        assert!(cli(&["--pick"]).is_err());
+        assert!(cli(&["--pick", "--headless", CLI_MAGNET]).is_err());
+        // A search opens the window on results; a source would be added
+        // behind it unasked.
+        assert!(cli(&["--search", "x", CLI_MAGNET]).is_err());
+        assert!(cli(&["--search", "x", "--headless"]).is_err());
+        // --status and --stop act on a session, not start one.
+        for flag in ["--status", "--stop"] {
+            assert!(cli(&[flag, "--set", "network.enable_dht=false"]).is_err());
+            assert!(cli(&[flag, "--quit-when-done"]).is_err());
+        }
+        // But they do take a profile: that is which session they ask about.
+        assert!(cli(&["--status", "--profile", "vpn"]).is_ok());
+        assert!(cli(&["--stop", "-p", "vpn"]).is_ok());
+        // And a headless run can quit when done — the scripted use.
+        assert!(cli(&["--headless", "-q", "-p", "batch", CLI_MAGNET]).is_ok());
+    }
+
+    #[test]
+    fn a_detached_copy_is_started_as_the_same_session() {
+        let c = cli(&[
+            "--profile",
+            "vpn",
+            "-d",
+            "/dl",
+            "--set",
+            "privacy.proxy_url=socks5://127.0.0.1:9050",
+            "--set",
+            "network.listen_port=7000",
+            "--quit-when-done",
+            CLI_MAGNET,
+        ])
+        .unwrap();
+        assert_eq!(
+            c.forwarded(),
+            [
+                "--profile",
+                "vpn",
+                "--download-dir",
+                "/dl",
+                "--set",
+                "privacy.proxy_url=socks5://127.0.0.1:9050",
+                "--set",
+                "network.listen_port=7000",
+                "--quit-when-done",
+            ]
+        );
+        // The source is already in this session; the copy must not re-add it.
+        assert!(!c.forwarded().iter().any(|a| a == CLI_MAGNET));
+        // And the forwarded arguments parse back to the same session.
+        let mut args: Vec<&str> = vec!["--headless"];
+        let forwarded = c.forwarded();
+        args.extend(forwarded.iter().map(String::as_str));
+        let back = cli(&args).unwrap();
+        assert_eq!(back.profile, c.profile);
+        assert_eq!(back.set, c.set);
+        assert!(back.quit_when_done);
+        assert!(cli(&[]).unwrap().forwarded().is_empty());
+    }
+
+    #[test]
+    fn quit_when_done_waits_while_something_is_being_added() {
+        let mut app = App::new();
+        assert!(!choosing_what_to_add(&app));
+        for mode in [
+            AppMode::Input,
+            AppMode::AddPicker,
+            AppMode::Search,
+            AppMode::SearchResults,
+        ] {
+            app.mode = mode;
+            assert!(choosing_what_to_add(&app), "{:?}", app.mode);
+        }
+        for mode in [AppMode::Normal, AppMode::Detail, AppMode::Help] {
+            app.mode = mode;
+            assert!(!choosing_what_to_add(&app), "{:?}", app.mode);
+        }
+    }
+
+    #[test]
+    fn a_detached_copy_gets_the_download_dir_expanded() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let c = cli(&["-d", "~/dl"]).unwrap();
+        assert_eq!(
+            c.forwarded(),
+            [
+                "--download-dir".to_string(),
+                home.join("dl").to_string_lossy().into_owned()
+            ]
+        );
     }
 
     #[cfg(unix)]
