@@ -2102,9 +2102,9 @@ dependencies = [
 
 [[package]]
 name = "librqbit"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4349c0f35ede576a87cc2881dc6eb286ff7a1c8fc4d1f7fef95b5c5a530a7174"
+checksum = "4e35a06e481e854f69141928d067406397b3ad7a47bfdc095bc31325f44f5d13"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2170,9 +2170,9 @@ dependencies = [
 
 [[package]]
 name = "librqbit-bencode"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be6410a7434e6c2b148931b6d109b57939cfed04cefa86451197c5f5198edf91"
+checksum = "0cf295fa65b3ad66bd363a5d3a278730352745b72ff0f5b6e6010612351924e5"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -2187,9 +2187,9 @@ dependencies = [
 
 [[package]]
 name = "librqbit-buffers"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b00e4b6780a30d3c204f778ad64b3c917b842f5c54df38455c361761e7d12ce2"
+checksum = "6a11501f6b2d68169725cf9e030d5ad7a9ede4b3839a9e16a27c4faef7507c8c"
 dependencies = [
  "bytes",
  "librqbit-clone-to-owned",
@@ -2199,18 +2199,18 @@ dependencies = [
 
 [[package]]
 name = "librqbit-clone-to-owned"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "929ff2b22b1596c3f3689a79c0b84ee8a01a650a2dd0b6eb7322d6a3b9be0e0e"
+checksum = "c611ae410046c2e2cc90b0f300d53fe368d5129f26d822cede8f605f33f7fa84"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "librqbit-core"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1c33158d5c47ac68771dcf7cca13eb2fa2ee2980efbb6bb5645273e2f08c69b"
+checksum = "af3d5c9eec46a17b87123cee6280126056590143dd1bda7743681297e27737eb"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2238,9 +2238,9 @@ dependencies = [
 
 [[package]]
 name = "librqbit-dht"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "575f94f543c16de3088f8aa84175203d65437c8886dc24d383941f408dc26488"
+checksum = "558e74c5bcbb270fc19e1cf0517c26ed132f96c29b43b41f5ec5ce22470393a3"
 dependencies = [
  "anyhow",
  "backon",
@@ -2286,9 +2286,9 @@ dependencies = [
 
 [[package]]
 name = "librqbit-lsd"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d1d2699a46a9dc83693c5fbbf288a17b77a24b9924815a69bfc97853a47af42"
+checksum = "0a4c9f1c24581f11813f3ad2a45620be83c01a00f3f99bfc2126c204b523d980"
 dependencies = [
  "anyhow",
  "atoi",
@@ -2306,9 +2306,9 @@ dependencies = [
 
 [[package]]
 name = "librqbit-peer-protocol"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43e4b11349070274a1f77fb432d5e764ed38b310e7cdae8d2c37e0568ceb950e"
+checksum = "88b018302dbb1d053dfe34aca20b200e9c434d2bc8ea27e41875771bd31008ef"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -2327,9 +2327,9 @@ dependencies = [
 
 [[package]]
 name = "librqbit-sha1-wrapper"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abf23eeda5a8999809c0be52e36b711d062f1d52e2f3cae42d71b7b012a466c7"
+checksum = "4633bfa4c77dd7153be92584947d669a0ff8f61b82bb8bf283ff5f11ddee75be"
 dependencies = [
  "assert_cfg",
  "aws-lc-rs",
@@ -2337,9 +2337,9 @@ dependencies = [
 
 [[package]]
 name = "librqbit-tracker-comms"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b561cb29abec85eee031c998f9e0c987f82d3e193b087f4d2bdc8f00d825796c"
+checksum = "3753f7f7a0dd00cf9fb088d2ba203c7e4df93028f922b5da5ac42e14cdf9b2e7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2366,9 +2366,9 @@ dependencies = [
 
 [[package]]
 name = "librqbit-upnp"
-version = "9.0.1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b950b4dfe2102d3047f3fac70763c494b63a50f04a00d3dd36102d740e9bf33"
+checksum = "9308348f5235ab719c99c12ac40a0f03288f3469950f5906dd0ba6f202f31a66"
 dependencies = [
  "anyhow",
  "bstr",
@@ -4131,7 +4131,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
