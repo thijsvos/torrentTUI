@@ -32,7 +32,7 @@ use tracing_subscriber::{filter::Targets, layer::Context, registry::LookupSpan, 
 /// The upstream message shapes this layer keys on, in one place. Prefixes are
 /// matched with `starts_with`; the error text is whatever follows.
 ///
-/// From `librqbit-tracker-comms-9.0.1/src/tracker_comms.rs` unless noted.
+/// From `librqbit-tracker-comms-9.1.0/src/tracker_comms.rs` unless noted.
 pub(crate) struct Messages {
     /// HTTP announce succeeded; the `{:?}` is the sleep `Duration`.
     pub http_ok_prefix: &'static str,
@@ -48,7 +48,7 @@ pub(crate) struct Messages {
     /// UDP monitor about to sleep; the `interval` field carries the
     /// `Option<Duration>` the tracker asked for.
     pub udp_sleep: &'static str,
-    /// `librqbit-upnp-9.0.1/src/lib.rs`.
+    /// `librqbit-upnp-9.1.0/src/lib.rs`.
     pub upnp_ok: &'static str,
     pub upnp_err_prefixes: [&'static str; 3],
 }

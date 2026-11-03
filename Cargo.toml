@@ -31,7 +31,11 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 # external media players can open. `tracing-subscriber-utils` is required by
 # the http-api crate (its `/stream_logs` handler references a method that only
 # exists with that feature).
-librqbit = { version = "9", default-features = false, features = ["rust-tls", "watch", "http-api", "tracing-subscriber-utils"] }
+#
+# 9.1 is the floor on Windows: before it, download files were never made
+# sparse (so NTFS zero-filled each one ahead of the first write near its end)
+# and the DHT stopped for good on the first UDP error 10054 (#107).
+librqbit = { version = "9.1", default-features = false, features = ["rust-tls", "watch", "http-api", "tracing-subscriber-utils"] }
 # librqbit 9's `make_http_api_and_run` takes this crate's listener type instead
 # of tokio's, and librqbit does not re-export it. Keep the version in lockstep
 # with what librqbit itself depends on.

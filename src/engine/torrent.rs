@@ -3210,4 +3210,162 @@ mod tests {
         let url = stream_url("http://[::1]:9000", 12, 4);
         assert_eq!(url, "http://[::1]:9000/torrents/12/stream/4");
     }
+
+    // Two things librqbit has to get right on Windows, each of which broke a
+    // download's first minute there (#107). They are pinned here rather than
+    // left to upstream's tests because both regressed silently: neither shows
+    // up on Linux, and neither fails loudly on Windows either.
+
+    /// A single-file `.torrent` of `len` bytes in 1 MiB pieces, bencoded by
+    /// hand like `padded_torrent`. It names no tracker, so a session holding
+    /// it never goes looking for peers, and its piece hashes are zeros, which
+    /// nothing checks until a piece arrives.
+    fn single_file_torrent(name: &str, len: u64) -> Vec<u8> {
+        const PIECE: u64 = 1 << 20;
+        let hash_bytes = len.div_ceil(PIECE) as usize * 20;
+        let mut t = Vec::new();
+        t.extend_from_slice(
+            format!("d4:infod6:lengthi{len}e4:name{}:{name}", name.len()).as_bytes(),
+        );
+        t.extend_from_slice(format!("12:piece lengthi{PIECE}e6:pieces{hash_bytes}:").as_bytes());
+        t.extend(std::iter::repeat_n(0u8, hash_bytes));
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    /// On Windows a download's file has to be marked sparse before it grows,
+    /// or NTFS zero-fills everything ahead of each write. librqbit fetches a
+    /// file's *last* piece right after its first, so the second write lands at
+    /// the very end and the whole download waits while Windows writes the
+    /// file full of zeros: half a minute for a few GB on a hard disk.
+    ///
+    /// librqbit 9.0.1 did the marking inside the arguments of a `debug!`,
+    /// which `tracing` only evaluates when that event is enabled. At this
+    /// app's log filter it never is, so no file was ever marked. This adds a
+    /// torrent to a session built the way `TorrentEngine::new` builds one
+    /// and checks what lands on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn added_torrent_files_are_full_length_and_sparse_on_windows() {
+        const NAME: &str = "sparse-check.bin";
+        const LEN: u64 = 64 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+
+        // The app's own session options, with every part that reaches the
+        // network turned off: nothing here needs a peer, and CI must not
+        // depend on finding one.
+        let plan = NetworkPlan {
+            dht: false,
+            listen_port: None,
+            upnp: false,
+            disable_lsd: true,
+            proxy_url: None,
+            blocklist_url: None,
+            bind_interface: None,
+        };
+        let opts = build_session_opts(&plan, LimitsConfig::default(), dir.path().join("session"));
+        let session = Session::new_with_opts(downloads.clone(), opts)
+            .await
+            .unwrap();
+        // The options `add_torrent` passes.
+        let response = session
+            .add_torrent(
+                AddTorrent::from_bytes(single_file_torrent(NAME, LEN)),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let (_, handle, _) = added_handle(response).unwrap();
+        // librqbit sets file lengths as the last step of initializing, so
+        // once this returns the file is as big as it is going to get before
+        // the first piece arrives.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            handle.wait_until_initialized(),
+        )
+        .await
+        .expect("the torrent never finished initializing")
+        .unwrap();
+
+        let path = downloads.join(NAME);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), LEN, "{path:?} is not full length");
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            // winnt.h. windows-sys has it only behind a feature this crate
+            // needs for nothing else.
+            const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+            assert_ne!(
+                meta.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE,
+                0,
+                "{path:?} is not sparse, so Windows will zero-fill it ahead of \
+                 the first write past its start (#107)"
+            );
+        }
+
+        session.stop().await;
+    }
+
+    /// The other half of #107, from the reporter's log: `dht finished with
+    /// error: ... os error 10054`. When a datagram draws an ICMP
+    /// port-unreachable, Windows fails the socket's *next* `recv_from` with
+    /// WSAECONNRESET. For a DHT that is routine, since it keeps messaging
+    /// nodes that have gone away, but librqbit-dht 9.0.1 treated it as fatal:
+    /// the DHT stopped seconds into the session and stayed down until a
+    /// restart. Unix never reports that error on an unconnected socket, so
+    /// there this passes on any version.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dht_keeps_answering_after_messaging_a_closed_port() {
+        use librqbit::dht::{DhtConfig, DhtState};
+        use std::net::UdpSocket;
+        use std::time::Duration;
+
+        // A port nothing listens on: bind one, note it, close it.
+        let closed = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let dht = DhtState::with_config(DhtConfig {
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            // Bootstrapping messages it straight away.
+            bootstrap_addrs: Some(vec![closed.to_string()]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dht_addr = dht.listen_addr();
+        // Long enough for the bootstrap datagram and the ICMP reply, which
+        // never leave the machine.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let answered = tokio::task::spawn_blocking(move || {
+            let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            // A BEP 5 ping, keys sorted.
+            let mut ping = b"d1:ad2:id20:".to_vec();
+            ping.extend_from_slice(&[7; 20]);
+            ping.extend_from_slice(b"e1:q4:ping1:t2:pg1:y1:qe");
+            let mut buf = [0u8; 1500];
+            // UDP: ask again rather than wait once, for up to ten seconds.
+            (0..40).any(|_| {
+                client.send_to(&ping, dht_addr).unwrap();
+                matches!(client.recv_from(&mut buf),
+                    Ok((n, _)) if buf[..n].windows(6).any(|w| w == b"1:y1:r"))
+            })
+        })
+        .await
+        .unwrap();
+        dht.cancellation_token().cancel();
+        assert!(
+            answered,
+            "the DHT stopped answering after it messaged a closed port"
+        );
+    }
 }
