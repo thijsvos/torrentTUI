@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::add_picker::PickerSort;
+use crate::sorting::{natural_cmp, FileSort};
 use crate::types::PreviewFile;
 
 pub type NodeId = usize;
@@ -142,7 +142,7 @@ impl FileTree {
         &self,
         expanded: &HashSet<NodeId>,
         matches: Option<&HashSet<usize>>,
-        sort: PickerSort,
+        sort: FileSort,
     ) -> Vec<TreeRow> {
         let mut out = Vec::new();
         self.push_rows(&self.roots, expanded, matches, sort, &mut out);
@@ -154,7 +154,7 @@ impl FileTree {
         ids: &[NodeId],
         expanded: &HashSet<NodeId>,
         matches: Option<&HashSet<usize>>,
-        sort: PickerSort,
+        sort: FileSort,
         out: &mut Vec<TreeRow>,
     ) {
         let mut ids: Vec<NodeId> = ids
@@ -167,9 +167,9 @@ impl FileTree {
         ids.sort_by(|&a, &b| {
             let (a, b) = (&self.nodes[a], &self.nodes[b]);
             b.is_dir().cmp(&a.is_dir()).then_with(|| match sort {
-                PickerSort::TorrentOrder => a.files[0].cmp(&b.files[0]),
-                PickerSort::Size => b.size.cmp(&a.size),
-                PickerSort::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                FileSort::TorrentOrder => a.files[0].cmp(&b.files[0]),
+                FileSort::Size => b.size.cmp(&a.size),
+                FileSort::Name => natural_cmp(&a.name, &b.name),
             })
         });
         for id in ids {
@@ -261,13 +261,13 @@ mod tests {
     #[test]
     fn rows_put_folders_first_and_hide_collapsed_contents() {
         let (_, tree) = sample();
-        let rows = tree.rows(&HashSet::new(), None, PickerSort::TorrentOrder);
+        let rows = tree.rows(&HashSet::new(), None, FileSort::TorrentOrder);
         assert_eq!(
             names(&tree, &rows),
             vec!["Season 1", "Season 2", "notes.txt"]
         );
 
-        let rows = tree.rows(&all_expanded(&tree), None, PickerSort::TorrentOrder);
+        let rows = tree.rows(&all_expanded(&tree), None, FileSort::TorrentOrder);
         assert_eq!(
             names(&tree, &rows),
             vec![
@@ -286,13 +286,13 @@ mod tests {
     #[test]
     fn rows_follow_the_sort_within_each_level() {
         let (_, tree) = sample();
-        let rows = tree.rows(&all_expanded(&tree), None, PickerSort::Size);
+        let rows = tree.rows(&all_expanded(&tree), None, FileSort::Size);
         assert_eq!(names(&tree, &rows)[0], "Season 2", "45 beats 30");
         // Inside Season 2 the extras folder still leads, then e01 (40).
         assert_eq!(names(&tree, &rows)[1], "  extras");
         assert_eq!(names(&tree, &rows)[3], "  e01.mkv");
         assert_eq!(names(&tree, &rows)[4], "Season 1");
-        let rows = tree.rows(&HashSet::new(), None, PickerSort::Name);
+        let rows = tree.rows(&HashSet::new(), None, FileSort::Name);
         assert_eq!(
             names(&tree, &rows),
             vec!["Season 1", "Season 2", "notes.txt"]
@@ -304,7 +304,7 @@ mod tests {
         let (_, tree) = sample();
         let matches: HashSet<usize> = [2].into();
         // Nothing expanded, yet the match inside extras/ shows.
-        let rows = tree.rows(&HashSet::new(), Some(&matches), PickerSort::TorrentOrder);
+        let rows = tree.rows(&HashSet::new(), Some(&matches), FileSort::TorrentOrder);
         assert_eq!(
             names(&tree, &rows),
             vec!["Season 2", "  extras", "    making-of.mkv"]
@@ -347,7 +347,7 @@ mod tests {
         let files = vec![file("a.iso", 1), file("b.iso", 2)];
         let tree = FileTree::build(&files);
         assert!(!tree.has_folders());
-        let rows = tree.rows(&HashSet::new(), None, PickerSort::TorrentOrder);
+        let rows = tree.rows(&HashSet::new(), None, FileSort::TorrentOrder);
         assert_eq!(rows.len(), 2);
     }
 }

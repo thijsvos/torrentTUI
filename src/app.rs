@@ -28,6 +28,7 @@ use crate::config::{PlayerConfig, SearchConfig};
 use crate::health;
 use crate::recent_dirs::RecentDirs;
 use crate::search::{SearchOutcome, SearchResult};
+use crate::sorting::{natural_cmp, FileSort, SortPrefs};
 use crate::theme::{self, Theme};
 use crate::types::{AppMode, DetailTab, NetworkHealth, SortColumn, TorrentInfo, TorrentStatus};
 use crate::ui::input::{Edit, InputWidget};
@@ -162,12 +163,14 @@ impl ThemeSelectState {
 /// column has a *natural* direction it lands in when first selected
 /// (numeric columns biggest-first, title A→Z), and `sort_reversed` flips
 /// that, rather than reversal being a direction in itself.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultSortColumn {
     Seeders,
     Size,
     Title,
     Leechers,
+    /// How long ago the indexer first listed the torrent.
+    Age,
 }
 
 impl ResultSortColumn {
@@ -176,8 +179,33 @@ impl ResultSortColumn {
             ResultSortColumn::Seeders => ResultSortColumn::Size,
             ResultSortColumn::Size => ResultSortColumn::Title,
             ResultSortColumn::Title => ResultSortColumn::Leechers,
-            ResultSortColumn::Leechers => ResultSortColumn::Seeders,
+            ResultSortColumn::Leechers => ResultSortColumn::Age,
+            ResultSortColumn::Age => ResultSortColumn::Seeders,
         }
+    }
+
+    /// The value `[sort] search` stores for this column.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            ResultSortColumn::Seeders => "seeders",
+            ResultSortColumn::Size => "size",
+            ResultSortColumn::Title => "title",
+            ResultSortColumn::Leechers => "leechers",
+            ResultSortColumn::Age => "age",
+        }
+    }
+
+    /// Read a `[sort] search` value; anything unknown is `None`.
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        [
+            ResultSortColumn::Seeders,
+            ResultSortColumn::Size,
+            ResultSortColumn::Title,
+            ResultSortColumn::Leechers,
+            ResultSortColumn::Age,
+        ]
+        .into_iter()
+        .find(|c| c.config_name() == name.trim())
     }
 
     /// Position of this column in the rendered results table (column 0 is
@@ -190,13 +218,52 @@ impl ResultSortColumn {
             ResultSortColumn::Size => 2,
             ResultSortColumn::Seeders => 3,
             ResultSortColumn::Leechers => 4,
+            ResultSortColumn::Age => 5,
         }
     }
 
     /// The direction this column lands in when first selected: you sort by
-    /// seeders to find the best-seeded result, by title to read A→Z.
+    /// seeders to find the best-seeded result, by title to read A→Z, by age
+    /// to find the newest.
     pub fn natural_descending(self) -> bool {
-        !matches!(self, ResultSortColumn::Title)
+        !matches!(self, ResultSortColumn::Title | ResultSortColumn::Age)
+    }
+}
+
+/// The torrent table's order: one comparator for both the cached sort and
+/// the live fallback, so the two cannot drift apart. Names compare naturally
+/// (`Season 2` before `Season 10`); `natural_cmp` folds case per character, so
+/// no lowercased copy of every name is needed.
+fn compare_torrents(
+    a: &TorrentInfo,
+    b: &TorrentInfo,
+    column: SortColumn,
+    reversed: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ord = match column {
+        SortColumn::Index => a.id.cmp(&b.id),
+        SortColumn::Name => natural_cmp(&a.name, &b.name),
+        SortColumn::Size => a.size_bytes.cmp(&b.size_bytes),
+        SortColumn::Progress => a
+            .progress_percent()
+            .partial_cmp(&b.progress_percent())
+            .unwrap_or(Ordering::Equal),
+        SortColumn::DownSpeed => a.download_speed.cmp(&b.download_speed),
+        SortColumn::UpSpeed => a.upload_speed.cmp(&b.upload_speed),
+        SortColumn::Peers => a.peers_connected.cmp(&b.peers_connected),
+        SortColumn::Eta => match (a.eta_seconds, b.eta_seconds) {
+            (Some(a_eta), Some(b_eta)) => a_eta.cmp(&b_eta),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+        SortColumn::Status => a.status.sort_key().cmp(&b.status.sort_key()),
+    };
+    if reversed {
+        ord.reverse()
+    } else {
+        ord
     }
 }
 
@@ -273,6 +340,12 @@ pub struct App {
     pub detail_tab: DetailTab,
     pub sort_column: SortColumn,
     pub sort_reversed: bool,
+    /// Order of a torrent's files, in the Files tab and the add picker alike.
+    pub file_sort: FileSort,
+    /// The sorts as `config.toml` last had them — read at startup, updated on
+    /// every save. `run_app` compares [`App::sort_prefs`] against it after
+    /// each key, so a sort changed by any route is persisted exactly once.
+    pub saved_sort: SortPrefs,
     pub error_message: Option<String>,
     pub error_timer: Option<std::time::Instant>,
     pub info_message: Option<String>,
@@ -299,6 +372,9 @@ pub struct App {
     /// mapped back to rows. Set by the renderer and cleared to `None` in
     /// Detail mode, which is what makes clicks inert there.
     pub table_area: Option<ratatui::layout::Rect>,
+    /// The Files tab's cursor, as a row in the tab's display order (see
+    /// [`App::detail_file_order`]) — not a librqbit file index. Go through
+    /// [`App::detail_file_under_cursor`] for the file it is on.
     pub detail_file_index: usize,
     /// Per torrent id, a file selection sent to the engine that the engine has
     /// not echoed back yet. The engine's `FileInfo::selected` is the truth;
@@ -428,6 +504,8 @@ impl App {
             detail_tab: DetailTab::Stats,
             sort_column: SortColumn::Index,
             sort_reversed: false,
+            file_sort: FileSort::TorrentOrder,
+            saved_sort: SortPrefs::default(),
             error_message: None,
             error_timer: None,
             info_message: None,
@@ -743,60 +821,9 @@ impl App {
             .map(|(i, _)| i)
             .collect();
 
-        if self.sort_column == SortColumn::Name {
-            // Lowercase keys precomputed so each name is lowered once, not
-            // O(N log N) times during sort comparisons.
-            let lc: Vec<String> = indices
-                .iter()
-                .map(|&i| self.torrents[i].name.to_lowercase())
-                .collect();
-            let mut pos: Vec<usize> = (0..indices.len()).collect();
-            pos.sort_by(|&a, &b| {
-                let cmp = lc[a].cmp(&lc[b]);
-                if self.sort_reversed {
-                    cmp.reverse()
-                } else {
-                    cmp
-                }
-            });
-            indices = pos.into_iter().map(|i| indices[i]).collect();
-        } else {
-            let sort_column = self.sort_column;
-            let sort_reversed = self.sort_reversed;
-            let torrents = &self.torrents;
-            indices.sort_by(|&a, &b| {
-                let ta = &torrents[a];
-                let tb = &torrents[b];
-                let cmp = match sort_column {
-                    SortColumn::Index => ta.id.cmp(&tb.id),
-                    SortColumn::Name => {
-                        // Handled by the early-return above; degrade gracefully.
-                        debug_assert!(false, "SortColumn::Name should hit the early return");
-                        std::cmp::Ordering::Equal
-                    }
-                    SortColumn::Size => ta.size_bytes.cmp(&tb.size_bytes),
-                    SortColumn::Progress => ta
-                        .progress_percent()
-                        .partial_cmp(&tb.progress_percent())
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                    SortColumn::DownSpeed => ta.download_speed.cmp(&tb.download_speed),
-                    SortColumn::UpSpeed => ta.upload_speed.cmp(&tb.upload_speed),
-                    SortColumn::Peers => ta.peers_connected.cmp(&tb.peers_connected),
-                    SortColumn::Eta => match (ta.eta_seconds, tb.eta_seconds) {
-                        (Some(a_eta), Some(b_eta)) => a_eta.cmp(&b_eta),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => std::cmp::Ordering::Equal,
-                    },
-                    SortColumn::Status => ta.status.sort_key().cmp(&tb.status.sort_key()),
-                };
-                if sort_reversed {
-                    cmp.reverse()
-                } else {
-                    cmp
-                }
-            });
-        }
+        let (column, reversed) = (self.sort_column, self.sort_reversed);
+        let torrents = &self.torrents;
+        indices.sort_by(|&a, &b| compare_torrents(&torrents[a], &torrents[b], column, reversed));
 
         self.sort_cache = indices;
         self.sort_dirty = false;
@@ -839,8 +866,7 @@ impl App {
     }
 
     /// Live (uncached) sort. Used as a fallback in `sorted_torrents()` when
-    /// the cache is dirty and the caller only has `&self`. Keeps the original
-    /// O(N log N) cost but skips the lowercase keys allocation when not Name.
+    /// the cache is dirty and the caller only has `&self`.
     fn sorted_torrents_live(&self) -> Vec<&TorrentInfo> {
         let filter_lower = self.filter_input.as_str().to_lowercase();
         let mut torrents: Vec<&TorrentInfo> = self
@@ -855,49 +881,8 @@ impl App {
             })
             .collect();
 
-        if self.sort_column == SortColumn::Name {
-            let lc: Vec<String> = torrents.iter().map(|t| t.name.to_lowercase()).collect();
-            let mut indices: Vec<usize> = (0..torrents.len()).collect();
-            indices.sort_by(|&a, &b| {
-                let cmp = lc[a].cmp(&lc[b]);
-                if self.sort_reversed {
-                    cmp.reverse()
-                } else {
-                    cmp
-                }
-            });
-            return indices.into_iter().map(|i| torrents[i]).collect();
-        }
-
-        torrents.sort_by(|a, b| {
-            let cmp = match self.sort_column {
-                SortColumn::Index => a.id.cmp(&b.id),
-                SortColumn::Name => {
-                    debug_assert!(false, "SortColumn::Name should hit the early return");
-                    std::cmp::Ordering::Equal
-                }
-                SortColumn::Size => a.size_bytes.cmp(&b.size_bytes),
-                SortColumn::Progress => a
-                    .progress_percent()
-                    .partial_cmp(&b.progress_percent())
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                SortColumn::DownSpeed => a.download_speed.cmp(&b.download_speed),
-                SortColumn::UpSpeed => a.upload_speed.cmp(&b.upload_speed),
-                SortColumn::Peers => a.peers_connected.cmp(&b.peers_connected),
-                SortColumn::Eta => match (a.eta_seconds, b.eta_seconds) {
-                    (Some(a_eta), Some(b_eta)) => a_eta.cmp(&b_eta),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                },
-                SortColumn::Status => a.status.sort_key().cmp(&b.status.sort_key()),
-            };
-            if self.sort_reversed {
-                cmp.reverse()
-            } else {
-                cmp
-            }
-        });
+        let (column, reversed) = (self.sort_column, self.sort_reversed);
+        torrents.sort_by(|a, b| compare_torrents(a, b, column, reversed));
 
         torrents
     }
@@ -1251,12 +1236,16 @@ impl App {
                 // Unknown sizes count as 0, sinking "?" rows to the bottom
                 // in the default (descending) direction.
                 ResultSortColumn::Size => a.size_bytes.unwrap_or(0).cmp(&b.size_bytes.unwrap_or(0)),
-                ResultSortColumn::Title => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+                ResultSortColumn::Title => natural_cmp(&a.title, &b.title),
+                // Younger first means a later listing time. An unknown date
+                // counts as the epoch, the oldest possible, so "?" rows sink
+                // to the bottom in the default (newest-first) direction.
+                ResultSortColumn::Age => b.added.unwrap_or(0).cmp(&a.added.unwrap_or(0)),
             };
             let ord = if descending { ord.reverse() } else { ord };
             // Tiebreak after the flip, so equal keys always read A→Z
             // whichever direction the column sorts in.
-            ord.then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            ord.then_with(|| natural_cmp(&a.title, &b.title))
         });
         if let Some(hash) = anchor {
             if let Some(pos) = self.search.results.iter().position(|r| r.info_hash == hash) {
@@ -1499,6 +1488,79 @@ impl App {
         entry.id
     }
 
+    /// The sorts as they are now, for persisting.
+    pub fn sort_prefs(&self) -> SortPrefs {
+        SortPrefs {
+            torrents: self.sort_column,
+            torrents_reversed: self.sort_reversed,
+            files: self.file_sort,
+            search: self.search.sort_column,
+            search_reversed: self.search.sort_reversed,
+        }
+    }
+
+    /// Start with the sorts from `config.toml`, and remember them as saved.
+    pub fn apply_sort_prefs(&mut self, prefs: SortPrefs) {
+        self.sort_column = prefs.torrents;
+        self.sort_reversed = prefs.torrents_reversed;
+        self.file_sort = prefs.files;
+        self.search.sort_column = prefs.search;
+        self.search.sort_reversed = prefs.search_reversed;
+        self.saved_sort = prefs;
+        self.invalidate_sort();
+        self.ensure_sort_cache();
+        self.restore_selection();
+    }
+
+    /// The sorts and the `[sort]` keys that changed since the last save, when
+    /// any did — and from now on count them as saved, so a failed write is
+    /// reported once rather than on every key until the next change.
+    pub fn take_unsaved_sort(&mut self) -> Option<(SortPrefs, Vec<&'static str>)> {
+        let now = self.sort_prefs();
+        let keys = now.changed_keys(self.saved_sort);
+        if keys.is_empty() {
+            return None;
+        }
+        self.saved_sort = now;
+        Some((now, keys))
+    }
+
+    /// The Files tab's rows: positions in the Detail torrent's file list, in
+    /// display order. Empty while there is no file list.
+    ///
+    /// Sorted afresh on each call rather than cached: only the one Detail
+    /// torrent's files are ever present, and the tab already builds a line per
+    /// file every frame, so the sort is the same order of work as drawing.
+    pub fn detail_file_order(&self) -> Vec<usize> {
+        let Some(t) = self.selected_torrent() else {
+            return Vec::new();
+        };
+        self.file_sort.order(
+            t.files.len(),
+            |i| t.files[i].name.as_str(),
+            |i| t.files[i].size_bytes,
+        )
+    }
+
+    /// The librqbit file index under the Files tab's cursor.
+    pub fn detail_file_under_cursor(&self) -> Option<usize> {
+        self.detail_file_order()
+            .get(self.detail_file_index)
+            .copied()
+    }
+
+    /// Next file order in the Files tab, keeping the cursor on the file it
+    /// was on rather than on the row number.
+    pub fn cycle_file_sort(&mut self) {
+        let file = self.detail_file_under_cursor();
+        self.file_sort = self.file_sort.next();
+        if let Some(file) = file {
+            if let Some(row) = self.detail_file_order().iter().position(|&i| i == file) {
+                self.detail_file_index = row;
+            }
+        }
+    }
+
     /// The file selection as the user currently sees it: a pending change if
     /// one is in flight, otherwise what the engine reported. `None` while the
     /// torrent has no file list (not the Detail target, or no metadata yet).
@@ -1554,6 +1616,16 @@ impl App {
         self.pending_file_selection
             .insert(torrent_id, PendingSelection::new(files));
         Ok(indices)
+    }
+
+    /// Flip the file under the Files tab's cursor — see
+    /// [`App::toggle_file_selection`].
+    pub fn toggle_file_under_cursor(
+        &mut self,
+        torrent_id: usize,
+    ) -> Result<Vec<usize>, &'static str> {
+        let file = self.detail_file_under_cursor().ok_or(NO_FILES_YET)?;
+        self.toggle_file_selection(torrent_id, file)
     }
 
     /// The indices currently selected, for re-sending with `S`. Same refusals
@@ -2435,6 +2507,7 @@ mod tests {
             size_bytes: Some(100),
             seeders,
             leechers: 0,
+            added: None,
             source: crate::search::SourceSet {
                 apibay: true,
                 torrents_csv: false,
@@ -2458,6 +2531,7 @@ mod tests {
             size_bytes: size,
             seeders,
             leechers: l,
+            added: None,
             source: crate::search::SourceSet {
                 apibay: true,
                 torrents_csv: false,
@@ -2494,6 +2568,8 @@ mod tests {
         assert_eq!(app.search.sort_column, ResultSortColumn::Title);
         app.cycle_result_sort();
         assert_eq!(app.search.sort_column, ResultSortColumn::Leechers);
+        app.cycle_result_sort();
+        assert_eq!(app.search.sort_column, ResultSortColumn::Age);
         app.cycle_result_sort();
         assert_eq!(app.search.sort_column, ResultSortColumn::Seeders);
     }
@@ -2960,5 +3036,234 @@ mod tests {
         assert!(app.search_spinner_active());
         app.search.in_flight = false;
         assert!(!app.search_spinner_active());
+    }
+
+    // -- sorting: natural names, the Files tab, remembering -----------------
+
+    fn names(app: &App) -> Vec<String> {
+        app.sorted_torrents()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn torrent_names_sort_naturally() {
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "Show S10", 1, TorrentStatus::Downloading),
+            make_torrent(1, "Show S2", 1, TorrentStatus::Downloading),
+            make_torrent(2, "show s1", 1, TorrentStatus::Downloading),
+        ]);
+        app.change_sort_column(SortColumn::Name);
+        assert_eq!(names(&app), vec!["show s1", "Show S2", "Show S10"]);
+    }
+
+    #[test]
+    fn index_reversed_lists_the_newest_torrent_first() {
+        // librqbit gives each new torrent `max(id) + 1`, so the highest id is
+        // always the most recent add.
+        // As at startup: the sorts are applied before the first push.
+        let mut app = App::new();
+        app.apply_sort_prefs(SortPrefs {
+            torrents_reversed: true,
+            ..SortPrefs::default()
+        });
+        app.handle_state_push(vec![
+            make_torrent(0, "oldest", 1, TorrentStatus::Downloading),
+            make_torrent(7, "newest", 1, TorrentStatus::Downloading),
+            make_torrent(3, "middle", 1, TorrentStatus::Downloading),
+        ]);
+        assert_eq!(names(&app), vec!["newest", "middle", "oldest"]);
+        assert_eq!(
+            app.selected_torrent().map(|t| t.id),
+            Some(7),
+            "cursor on top"
+        );
+    }
+
+    fn with_named_files(id: usize, files: &[(&str, u64)]) -> TorrentInfo {
+        let mut t = make_torrent(id, "Show", 300, TorrentStatus::Downloading);
+        t.files = files
+            .iter()
+            .map(|&(name, size)| crate::types::FileInfo {
+                name: name.to_string(),
+                size_bytes: size,
+                progress_bytes: 0,
+                selected: true,
+            })
+            .collect();
+        t
+    }
+
+    #[test]
+    fn files_tab_cursor_follows_its_file_across_a_resort() {
+        let mut app = App::new();
+        app.handle_state_push(vec![with_named_files(
+            0,
+            &[("ep10.mkv", 3), ("ep2.mkv", 1), ("ep1.mkv", 2)],
+        )]);
+        assert_eq!(app.detail_file_order(), vec![0, 1, 2]);
+        app.detail_file_index = 1; // ep2.mkv
+        app.cycle_file_sort(); // size: ep10, ep1, ep2
+        assert_eq!(app.file_sort, FileSort::Size);
+        assert_eq!(app.detail_file_order(), vec![0, 2, 1]);
+        assert_eq!(app.detail_file_index, 2);
+        assert_eq!(app.detail_file_under_cursor(), Some(1));
+        app.cycle_file_sort(); // name: ep1, ep2, ep10
+        assert_eq!(app.detail_file_order(), vec![2, 1, 0]);
+        assert_eq!(app.detail_file_index, 1);
+        assert_eq!(app.detail_file_under_cursor(), Some(1));
+        app.cycle_file_sort();
+        assert_eq!(app.file_sort, FileSort::TorrentOrder);
+        assert_eq!(app.detail_file_under_cursor(), Some(1));
+    }
+
+    #[test]
+    fn toggling_in_a_sorted_files_tab_flips_the_file_under_the_cursor() {
+        let mut app = App::new();
+        app.handle_state_push(vec![with_named_files(
+            0,
+            &[("ep10.mkv", 1), ("ep2.mkv", 1), ("ep1.mkv", 1)],
+        )]);
+        app.file_sort = FileSort::Name;
+        app.detail_file_index = 0; // ep1.mkv, which is file 2
+        assert_eq!(app.toggle_file_under_cursor(0), Ok(vec![0, 1]));
+        assert!(!app.is_file_selected(0, 2));
+        assert!(app.is_file_selected(0, 0));
+    }
+
+    #[test]
+    fn no_file_list_means_no_file_under_the_cursor() {
+        let mut app = App::new();
+        app.handle_state_push(vec![make_torrent(
+            0,
+            "x",
+            1,
+            TorrentStatus::FetchingMetadata,
+        )]);
+        app.file_sort = FileSort::Name;
+        assert!(app.detail_file_order().is_empty());
+        assert_eq!(app.detail_file_under_cursor(), None);
+        assert_eq!(app.toggle_file_under_cursor(0), Err(NO_FILES_YET));
+        // Nothing to keep the cursor on, but the order still changes.
+        app.cycle_file_sort();
+        assert_eq!(app.file_sort, FileSort::TorrentOrder);
+    }
+
+    #[test]
+    fn a_sort_change_is_reported_once_with_the_keys_it_touched() {
+        let mut app = App::new();
+        app.apply_sort_prefs(SortPrefs::default());
+        assert!(app.take_unsaved_sort().is_none(), "nothing changed yet");
+
+        app.toggle_sort_reversed();
+        let (prefs, keys) = app.take_unsaved_sort().expect("a change");
+        assert!(prefs.torrents_reversed);
+        assert_eq!(keys, vec!["torrents_reversed"]);
+        assert!(app.take_unsaved_sort().is_none(), "reported once");
+
+        app.cycle_file_sort();
+        app.search.sort_column = ResultSortColumn::Age;
+        assert_eq!(app.take_unsaved_sort().unwrap().1, vec!["files", "search"]);
+
+        // Changing it back is a change as well.
+        app.toggle_sort_reversed();
+        let (prefs, keys) = app.take_unsaved_sort().unwrap();
+        assert!(!prefs.torrents_reversed);
+        assert_eq!(keys, vec!["torrents_reversed"]);
+    }
+
+    #[test]
+    fn startup_sorts_reach_every_list_and_count_as_saved() {
+        let prefs = SortPrefs {
+            torrents: SortColumn::Name,
+            torrents_reversed: true,
+            files: FileSort::Name,
+            search: ResultSortColumn::Age,
+            search_reversed: true,
+        };
+        let mut app = app_with_torrents(vec![
+            make_torrent(0, "a", 1, TorrentStatus::Downloading),
+            make_torrent(1, "b", 1, TorrentStatus::Downloading),
+        ]);
+        app.apply_sort_prefs(prefs);
+        assert_eq!(app.sort_prefs(), prefs);
+        assert!(app.take_unsaved_sort().is_none());
+        // The cached order was rebuilt, not left as it was before.
+        assert_eq!(names(&app), vec!["b", "a"]);
+    }
+
+    fn dated_results() -> Vec<SearchResult> {
+        let dated = |hash: &str, added: Option<u64>| {
+            let mut r = sortable(hash, hash, None, 1, 0);
+            r.added = added;
+            r
+        };
+        vec![
+            dated("old", Some(1_000)),
+            dated("unknown", None),
+            dated("new", Some(9_000)),
+        ]
+    }
+
+    /// Fire a search on `app` and land `results` for it.
+    fn land_results(app: &mut App, results: Vec<SearchResult>) {
+        app.search.input.set("q");
+        let (_, generation) = app.fire_search().expect("fires");
+        app.apply_search_outcome(outcome(generation, results));
+    }
+
+    fn app_with_dated_results() -> App {
+        let mut app = App::new();
+        land_results(&mut app, dated_results());
+        app
+    }
+
+    fn result_hashes(app: &App) -> Vec<&str> {
+        app.search
+            .results
+            .iter()
+            .map(|r| r.info_hash.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn age_sort_lists_the_newest_first_and_unknown_dates_last() {
+        let mut app = app_with_dated_results();
+        while app.search.sort_column != ResultSortColumn::Age {
+            app.cycle_result_sort();
+        }
+        assert!(!app.result_sort_descending(), "▲: youngest at the top");
+        assert_eq!(result_hashes(&app), vec!["new", "old", "unknown"]);
+        app.reverse_result_sort();
+        assert_eq!(result_hashes(&app), vec!["unknown", "old", "new"]);
+    }
+
+    #[test]
+    fn a_remembered_search_sort_applies_to_the_first_results() {
+        let mut app = App::new();
+        app.apply_sort_prefs(SortPrefs {
+            search: ResultSortColumn::Age,
+            ..SortPrefs::default()
+        });
+        land_results(&mut app, dated_results());
+        assert_eq!(result_hashes(&app), vec!["new", "old", "unknown"]);
+    }
+
+    #[test]
+    fn search_titles_sort_naturally() {
+        let mut app = App::new();
+        land_results(
+            &mut app,
+            vec![
+                sortable("h10", "Vol 10", None, 1, 0),
+                sortable("h2", "Vol 2", None, 1, 0),
+                sortable("h1", "vol 1", None, 1, 0),
+            ],
+        );
+        while app.search.sort_column != ResultSortColumn::Title {
+            app.cycle_result_sort();
+        }
+        assert_eq!(result_hashes(&app), vec!["h1", "h2", "h10"]);
     }
 }

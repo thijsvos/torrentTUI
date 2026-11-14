@@ -448,7 +448,7 @@ pub enum AppMode {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
     Index = 0,
     Name = 1,
@@ -483,6 +483,41 @@ impl SortColumn {
             SortColumn::Eta => SortColumn::Status,
             SortColumn::Status => SortColumn::Index,
         }
+    }
+
+    /// Every column, in table order.
+    pub const ALL: [SortColumn; 9] = [
+        SortColumn::Index,
+        SortColumn::Name,
+        SortColumn::Size,
+        SortColumn::Progress,
+        SortColumn::DownSpeed,
+        SortColumn::UpSpeed,
+        SortColumn::Peers,
+        SortColumn::Eta,
+        SortColumn::Status,
+    ];
+
+    /// The value `[sort] torrents` stores for this column.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            SortColumn::Index => "index",
+            SortColumn::Name => "name",
+            SortColumn::Size => "size",
+            SortColumn::Progress => "progress",
+            SortColumn::DownSpeed => "download",
+            SortColumn::UpSpeed => "upload",
+            SortColumn::Peers => "peers",
+            SortColumn::Eta => "eta",
+            SortColumn::Status => "status",
+        }
+    }
+
+    /// Read a `[sort] torrents` value; anything unknown is `None`.
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.config_name() == name.trim())
     }
 }
 
@@ -599,6 +634,18 @@ mod tests {
             col = col.next();
         }
         assert_eq!(col, SortColumn::Index);
+    }
+
+    #[test]
+    fn sort_column_config_names_round_trip_and_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for (i, col) in SortColumn::ALL.into_iter().enumerate() {
+            assert_eq!(col.column_index(), i, "ALL is in table order");
+            assert_eq!(SortColumn::from_config_name(col.config_name()), Some(col));
+            assert!(seen.insert(col.config_name()), "{}", col.config_name());
+        }
+        assert_eq!(SortColumn::from_config_name("Name"), None);
+        assert_eq!(SortColumn::from_config_name(""), None);
     }
 
     #[test]

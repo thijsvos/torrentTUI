@@ -26,6 +26,7 @@ use crate::actions::fuzzy_score;
 use crate::completion::{complete_path, Candidate};
 use crate::config::expand_tilde;
 use crate::file_tree::{Check, FileTree, NodeId, TreeRow};
+use crate::sorting::FileSort;
 use crate::types::{PreparedTorrent, PreviewFile, TorrentPreview};
 use crate::ui::input::{Edit, InputWidget, MenuKey};
 
@@ -68,33 +69,6 @@ pub enum View {
     Flat,
     /// Folders that open and close; one row can stand for a whole season.
     Tree,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PickerSort {
-    /// The order the torrent lists its files in.
-    TorrentOrder,
-    /// Largest first: what usually decides what to skip.
-    Size,
-    Name,
-}
-
-impl PickerSort {
-    fn next(self) -> Self {
-        match self {
-            Self::TorrentOrder => Self::Size,
-            Self::Size => Self::Name,
-            Self::Name => Self::TorrentOrder,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::TorrentOrder => "torrent order",
-            Self::Size => "size",
-            Self::Name => "name",
-        }
-    }
 }
 
 /// What the picker hands back when the user confirms.
@@ -154,7 +128,7 @@ pub struct Picker {
     pub filter: InputWidget,
     pub folder: InputWidget,
     pub focus: Focus,
-    pub sort: PickerSort,
+    pub sort: FileSort,
     pub table_state: TableState,
     /// Rows a page key moves; the renderer sets it to the visible height.
     pub page_size: usize,
@@ -224,7 +198,7 @@ impl Picker {
             filter: InputWidget::with_cap(MAX_FILTER_CHARS),
             folder,
             focus: Focus::List,
-            sort: PickerSort::TorrentOrder,
+            sort: FileSort::TorrentOrder,
             table_state: TableState::default(),
             page_size: 10,
             visible: Vec::new(),
@@ -288,11 +262,8 @@ impl Picker {
             order = scored.into_iter().map(|(_, i)| i).collect();
             self.fuzzy = !order.is_empty();
         } else {
-            match self.sort {
-                PickerSort::TorrentOrder => {}
-                PickerSort::Size => order.sort_by(|&a, &b| files[b].size.cmp(&files[a].size)),
-                PickerSort::Name => order.sort_by_cached_key(|&i| files[i].path.to_lowercase()),
-            }
+            self.sort
+                .sort(&mut order, |i| files[i].path.as_str(), |i| files[i].size);
         }
         self.visible = order;
         self.matches = (!query.is_empty()).then(|| self.visible.iter().copied().collect());
@@ -515,7 +486,12 @@ impl Picker {
     }
 
     pub fn cycle_sort(&mut self) {
-        self.sort = self.sort.next();
+        self.set_sort(self.sort.next());
+    }
+
+    /// Order the list by `sort` — on opening, the one the user last chose.
+    pub fn set_sort(&mut self, sort: FileSort) {
+        self.sort = sort;
         self.refresh_visible();
     }
 
@@ -1074,14 +1050,14 @@ mod tests {
     fn sort_cycles_through_size_and_name() {
         let mut p = picker();
         p.cycle_sort();
-        assert_eq!(p.sort, PickerSort::Size);
+        assert_eq!(p.sort, FileSort::Size);
         assert_eq!(visible_paths(&p)[0], "Season 2/e01.mkv");
         p.cycle_sort();
-        assert_eq!(p.sort, PickerSort::Name);
+        assert_eq!(p.sort, FileSort::Name);
         assert_eq!(visible_paths(&p)[3], "Season 2/e01.mkv");
         assert_eq!(visible_paths(&p)[0], "notes.txt");
         p.cycle_sort();
-        assert_eq!(p.sort, PickerSort::TorrentOrder);
+        assert_eq!(p.sort, FileSort::TorrentOrder);
     }
 
     #[test]

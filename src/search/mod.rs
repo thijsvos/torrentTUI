@@ -87,7 +87,18 @@ pub struct SearchResult {
     pub size_bytes: Option<u64>,
     pub seeders: u64,
     pub leechers: u64,
+    /// When the indexer first listed it, in Unix seconds — apibay's `added`,
+    /// torrents-csv's `created_unix`. `None` when the provider sent nothing
+    /// usable; rendered as "?".
+    pub added: Option<u64>,
     pub source: SourceSet,
+}
+
+/// An indexer's listing time as `Some(unix seconds)`. Zero is how both
+/// providers say "unknown" (apibay's no-results sentinel carries it), so it
+/// is `None` like a missing or malformed value.
+fn listing_time(secs: Option<u64>) -> Option<u64> {
+    secs.filter(|&s| s > 0)
 }
 
 /// The one message type on the UI-bound search channel.
@@ -229,6 +240,12 @@ pub fn merge_and_rank(lists: Vec<Vec<SearchResult>>, cap: usize) -> Vec<SearchRe
                 if existing.size_bytes.is_none() {
                     existing.size_bytes = result.size_bytes;
                 }
+                // The earlier listing is the torrent's real age; the other
+                // indexer just picked it up later.
+                existing.added = match (existing.added, result.added) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
                 existing.source.merge(result.source);
             }
             Entry::Vacant(v) => {
@@ -308,6 +325,7 @@ mod tests {
             size_bytes: None,
             seeders,
             leechers: 0,
+            added: None,
             source,
         }
     }
@@ -394,6 +412,28 @@ mod tests {
         assert_eq!(merged[0].leechers, 3);
         assert_eq!(merged[0].size_bytes, Some(700));
         assert_eq!(merged[0].source.label(), "both");
+    }
+
+    #[test]
+    fn merge_keeps_the_earliest_listing_time() {
+        let mut a = result(HASH_A, 1, SourceSet::default());
+        a.added = Some(2_000);
+        let mut b = result(HASH_A, 1, SourceSet::default());
+        b.added = Some(1_000);
+        let mut c = result(HASH_A, 1, SourceSet::default());
+        c.added = None;
+        let merged = merge_and_rank(vec![vec![a.clone(), b], vec![c.clone()]], 50);
+        assert_eq!(merged[0].added, Some(1_000));
+        // A known time beats an unknown one, in either order.
+        let merged = merge_and_rank(vec![vec![c], vec![a]], 50);
+        assert_eq!(merged[0].added, Some(2_000));
+    }
+
+    #[test]
+    fn a_zero_listing_time_means_unknown() {
+        assert_eq!(listing_time(Some(0)), None);
+        assert_eq!(listing_time(None), None);
+        assert_eq!(listing_time(Some(1_455_746_145)), Some(1_455_746_145));
     }
 
     #[test]

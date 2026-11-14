@@ -330,8 +330,12 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &mut App) {
         None => return,
     };
 
+    let order = app.detail_file_order();
     let mut lines: Vec<Line> = Vec::new();
-    for (idx, file) in torrent.files.iter().enumerate() {
+    for (row, &idx) in order.iter().enumerate() {
+        let Some(file) = torrent.files.get(idx) else {
+            continue;
+        };
         let percent = if file.size_bytes > 0 {
             (file.progress_bytes as f64 / file.size_bytes as f64 * 100.0).clamp(0.0, 100.0)
         } else {
@@ -342,7 +346,7 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &mut App) {
         let selected = app.is_file_selected(torrent_id, idx);
         let checkbox = if selected { "[\u{2713}]" } else { "[ ]" };
 
-        let is_highlighted = idx == app.detail_file_index;
+        let is_highlighted = row == app.detail_file_index;
 
         let highlight_style = if is_highlighted {
             Style::default()
@@ -390,13 +394,24 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .title(format!(
-                    " Files ({}) - Space:toggle  S:apply  s:stream \u{25B6} ",
-                    torrent.files.len()
+                    " Files ({}, {}) - Space:toggle  S:apply  s:stream \u{25B6}  r:sort ",
+                    torrent.files.len(),
+                    file_sort_title(app.file_sort),
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.muted)),
         );
     f.render_widget(files_widget, area);
+}
+
+/// The Files tab's order as its title says it.
+fn file_sort_title(sort: crate::sorting::FileSort) -> &'static str {
+    use crate::sorting::FileSort;
+    match sort {
+        FileSort::TorrentOrder => "torrent order",
+        FileSort::Size => "largest first",
+        FileSort::Name => "by name",
+    }
 }
 
 /// Render the Peers tab. Takes `&mut App` because scrolling is resolved here:
@@ -1141,6 +1156,40 @@ mod tests {
         let row = |name: &str| text.lines().find(|l| l.contains(name)).unwrap_or_default();
         assert!(row("disc.iso").contains("[\u{2713}]"), "{text}");
         assert!(row("notes.txt").contains("[ ]"), "{text}");
+    }
+
+    #[test]
+    fn files_tab_draws_rows_in_the_chosen_order_and_says_which() {
+        let file = |name: &str, size: u64| FileInfo {
+            name: name.to_string(),
+            size_bytes: size,
+            progress_bytes: 0,
+            selected: true,
+        };
+        let mut t = torrent();
+        t.files = vec![file("ep10.mkv", 1), file("ep2.mkv", 3), file("ep1.mkv", 2)];
+        let mut app = app_showing(t, DetailTab::Files);
+        let at = |text: &str, name: &str| text.find(name).unwrap_or_else(|| panic!("{name}"));
+
+        let text = draw(&mut app, 140, 30);
+        assert!(text.contains("Files (3, torrent order)"), "{text}");
+        assert!(at(&text, "ep10.mkv") < at(&text, "ep2.mkv"));
+        assert!(at(&text, "ep2.mkv") < at(&text, "ep1.mkv"));
+
+        app.file_sort = crate::sorting::FileSort::Name;
+        let text = draw(&mut app, 140, 30);
+        assert!(text.contains("Files (3, by name)"), "{text}");
+        assert!(text.contains("r:sort"), "{text}");
+        assert!(at(&text, "ep1.mkv") < at(&text, "ep2.mkv"));
+        assert!(at(&text, "ep2.mkv") < at(&text, "ep10.mkv"));
+        // The highlight is on the cursor's row, which is now ep1.mkv.
+        assert!(text.contains("> [\u{2713}] \u{25B6} ep1.mkv"), "{text}");
+
+        app.file_sort = crate::sorting::FileSort::Size;
+        let text = draw(&mut app, 140, 30);
+        assert!(text.contains("Files (3, largest first)"), "{text}");
+        assert!(at(&text, "ep2.mkv") < at(&text, "ep1.mkv"));
+        assert!(at(&text, "ep1.mkv") < at(&text, "ep10.mkv"));
     }
 
     #[test]

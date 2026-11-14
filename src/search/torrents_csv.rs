@@ -20,10 +20,10 @@ struct Response {
     torrents: Vec<serde_json::Value>,
 }
 
-/// The subset of torrents-csv's fields we read; `created_unix`, `completed`,
-/// `scraped_date` and `id` are ignored. `Option`/`default` so a missing field
-/// degrades instead of dropping the entry — except the hash, which is
-/// validated hard downstream.
+/// The subset of torrents-csv's fields we read; `completed`, `scraped_date`
+/// and `id` are ignored. `Option`/`default` so a missing field degrades
+/// instead of dropping the entry — except the hash, which is validated hard
+/// downstream.
 #[derive(Deserialize)]
 struct Entry {
     #[serde(default)]
@@ -35,6 +35,10 @@ struct Entry {
     seeders: u64,
     #[serde(default)]
     leechers: u64,
+    /// Unix seconds. Read as any JSON value so a negative or fractional date
+    /// costs only the date: as a `u64` field it would fail the whole entry.
+    #[serde(default)]
+    created_unix: serde_json::Value,
 }
 
 pub fn parse_response(body: &[u8]) -> Result<Vec<SearchResult>, String> {
@@ -57,6 +61,7 @@ pub fn parse_response(body: &[u8]) -> Result<Vec<SearchResult>, String> {
             size_bytes: entry.size_bytes,
             seeders: entry.seeders,
             leechers: entry.leechers,
+            added: super::listing_time(entry.created_unix.as_u64()),
             source: SourceSet {
                 apibay: false,
                 torrents_csv: true,
@@ -90,6 +95,7 @@ mod tests {
         );
         assert_eq!(results[0].size_bytes, Some(20501290));
         assert_eq!(results[0].seeders, 9);
+        assert_eq!(results[0].added, Some(1609604656));
         assert!(results[0].source.torrents_csv);
         assert!(!results[0].source.apibay);
     }
@@ -109,6 +115,18 @@ mod tests {
         assert_eq!(results[0].size_bytes, None);
         assert_eq!(results[0].seeders, 0);
         assert_eq!(results[0].leechers, 0);
+        assert_eq!(results[0].added, None);
+    }
+
+    #[test]
+    fn a_strange_listing_time_costs_only_the_time() {
+        let body = r#"{"torrents": [
+            {"infohash":"22b8f63218f1e726ec2f1fb9b38239f95fc6a629","name":"neg","seeders":1,"created_unix":-5},
+            {"infohash":"88066b90278f2de655ee2dd44e784c340b54e45c","name":"str","seeders":1,"created_unix":"soon"}
+        ]}"#;
+        let results = parse_response(body.as_bytes()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.added.is_none()));
     }
 
     #[test]

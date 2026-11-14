@@ -25,7 +25,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 - **Built-in torrent search** — press `s`, type a query, pick a result, and it starts downloading; queries public indexer APIs directly, with no Prowlarr/Jackett, accounts, or API keys
 - **Stream while downloading** — press `s` on any media file in the Files tab to open it in your default player; pieces are fetched in playback order
 - **Real-time progress** — progress bars, download/upload speeds, ETA, and peer counts
-- **Sorting & filtering** — sort by any column, search torrents by name
+- **Sorting & filtering** — sort by any column, search torrents by name; names sort naturally (`2` before `10`), and every list remembers the order you left it in — see [Sorting](#sorting)
 - **Bandwidth limits** — session-wide download/upload rate limits, applied smoothly by librqbit's token-bucket limiter and adjustable live with `t`
 - **Privacy pack** — SOCKS5 proxy with honest lockdown (no DHT/UDP leaking around it), PeerGuardian IP blocklists, and VPN interface binding; see [Privacy](#privacy)
 - **Selective file download** — press `A` to pick which files to download and where to save them *before* anything starts; change the selection later in the Files tab
@@ -213,7 +213,7 @@ folder you chose, just as it would in `download_dir`.
 | `t` | Switch between the folder tree and a flat list |
 | `l` / `h` (or `→` / `←`) | Open / close a folder (on a file, `h` steps out to its folder) |
 | `r` | Back to the selection the picker opened with |
-| `s` | Sort by torrent order, size, or name |
+| `s` | Sort by torrent order, size, or name — the same order as the Files tab, remembered with it (see [Sorting](#sorting)) |
 | `/` | Filter the files (`Enter` back to the list, `Esc` clears) |
 | `j` / `k`, `g` / `G`, `PgUp` / `PgDn` | Move, jump to top / bottom, page |
 | `Tab` | Edit the save folder (`Tab` there completes, `↑` / `↓` step through recent folders, `Esc` goes back; [the text-field keys](#text-fields) work there too) |
@@ -290,7 +290,8 @@ Press `s`, type what you're looking for (e.g. `arch linux iso`), and hit
 `Enter`. TorrentTUI queries two public indexer APIs — [apibay](https://apibay.org)
 (The Pirate Bay) and [torrents-csv](https://torrents-csv.com) — merges and
 dedups the results, and lists them by seeder count — press `Tab` to sort by
-size, title, or leechers instead. Press `Enter` on a result
+size, title, leechers, or age (newest first) instead; the order you pick is
+remembered ([Sorting](#sorting)). Press `Enter` on a result
 and it starts downloading immediately — or `A` to choose its files and save
 folder first ([the add picker](#choosing-files-and-a-folder-before-downloading));
 the magnet link is built locally from
@@ -303,7 +304,7 @@ accounts, or API keys involved. Both providers can be toggled off in
 | `Enter` | Download the selected result (stays in results for multi-grab) |
 | `A` | Choose files and save folder, then download the selected result |
 | `j` / `k` (or `↓` / `↑`) | Move selection down/up |
-| `Tab` | Cycle sort column (Seeders → Size → Title → Leechers) |
+| `Tab` | Cycle sort column (Seeders → Size → Title → Leechers → Age) |
 | `R` | Reverse sort order |
 | `s` | Edit the query (pre-filled) |
 | `r` | Retry the same query |
@@ -331,6 +332,7 @@ from the same API, and there is no warehouse of magnet links anywhere.
 | `Space` | Toggle file selection (Files tab) |
 | `S` | Apply current file selection to engine (Files tab) |
 | `s` | Stream selected file in default media player (Files tab) |
+| `r` | Cycle file order: torrent order → size → name (Files tab; the add picker shares it) |
 | `o` | Reveal this torrent in your file manager |
 | `Esc` / `q` | Back to list |
 
@@ -442,6 +444,13 @@ refresh_rate_ms = 100
 enable_notifications = true
 theme = "system"              # colour theme; see Themes below
 
+[sort]                        # saved by the app whenever you change a sort; see Sorting below
+torrents = "index"            # index (order added), name, size, progress, download, upload, peers, eta, status
+torrents_reversed = false     # with "index": true lists the newest first
+files = "torrent"             # Files tab and add picker: torrent (as listed), size, name
+search = "seeders"            # seeders, size, title, leechers, age
+search_reversed = false       # flips the column's usual direction
+
 [player]
 command = ""                  # empty = OS default (xdg-open / open / start)
 args = []                     # extra args inserted before the URL
@@ -471,6 +480,27 @@ The choice is saved as `[ui] theme`, and only that line of `config.toml` changes
 `system` (the default) is TorrentTUI's original ANSI palette, which follows your terminal's own colour scheme. The other themes are `catppuccin`, `dracula`, `everforest`, `github`, `gruvbox`, `kanagawa`, `monokai`, `nord`, `one-dark`, `rosepine`, `solarized` and `tokyonight`. They set explicit 24-bit colours, so they need a truecolor terminal, and they are dark schemes: they colour text but leave your terminal's background alone, so they are meant for a dark background.
 
 The preset list and the first colour mapping came from [OpenCode](https://github.com/anomalyco/opencode)'s MIT-licensed themes; each was then matched to its scheme's upstream palette.
+
+### Sorting
+
+Every list opens the way you last sorted it. Changing a sort — `Tab` / `r` in
+the torrent list, `Tab` / `R` in search results, `r` in the Files tab, `s` in the
+add picker — saves it under `[sort]` in `config.toml`, the same way the theme is
+saved: only the keys that changed are rewritten, and nothing is written while
+the file has a syntax error. You can set them by hand too, or for a single run
+with `-c sort.files=name`.
+
+- **Newest torrents on top:** `torrents = "index"` with `torrents_reversed = true`.
+  The `#` column is the order torrents were added in.
+- **Episodes, chapters and pages in order:** `files = "name"`. Names sort
+  naturally everywhere: numbers compare by value, so `2` comes before `10`, and
+  `Chapter 10.5.cbz` sits between `Chapter 10.cbz` and `Chapter 11.cbz`. The Files
+  tab and the add picker share this order.
+- **Newest search results first:** `search = "age"`. The Age column is how long
+  ago the indexer listed the torrent; `search_reversed = true` puts the oldest
+  first.
+
+A value that names no sort falls back to that list's default.
 
 ### Watch folder
 
