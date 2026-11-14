@@ -35,6 +35,7 @@ mod opener;
 mod player;
 mod recent_dirs;
 mod search;
+mod sorting;
 mod theme;
 mod types;
 mod ui;
@@ -1143,6 +1144,8 @@ async fn run_app(
     // An unknown id in the config falls back to `system` (see `theme::by_name`),
     // so a stale or hand-edited value never stops the app from starting.
     app.set_theme(&config.ui.theme);
+    // The sorts the user last chose; unknown values fall back per list.
+    app.apply_sort_prefs(sorting::SortPrefs::from_config(&config.sort));
 
     if cli.quit_when_done {
         app.set_info("Quits once nothing is left to download (--quit-when-done)".to_string());
@@ -1604,6 +1607,9 @@ async fn run_app(
                                 }
                             }
                         }
+                        // Whichever route changed a sort — its key, the
+                        // palette, the add picker — it is saved here, once.
+                        save_sort_if_changed(&mut app);
                         needs_render = true;
                     }
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::Input => {
@@ -2301,6 +2307,7 @@ async fn handle_detail_mode(
         KeyCode::Char('S') if app.detail_tab == DetailTab::Files => {
             apply_file_selection(app, cmd_tx).await;
         }
+        KeyCode::Char('r') if app.detail_tab == DetailTab::Files => app.cycle_file_sort(),
         _ => {}
     }
 }
@@ -2325,7 +2332,7 @@ async fn toggle_file_selection_key(app: &mut App, cmd_tx: &mpsc::Sender<EngineCo
     let Some(torrent_id) = app.selected_torrent().map(|t| t.id) else {
         return;
     };
-    match app.toggle_file_selection(torrent_id, app.detail_file_index) {
+    match app.toggle_file_under_cursor(torrent_id) {
         Ok(file_indices) => {
             send_cmd(
                 cmd_tx,
@@ -2466,7 +2473,10 @@ fn apply_preview(app: &mut App, outcome: PreviewOutcome) {
     match outcome.result {
         Ok(PreviewResult::Ready(preview)) => {
             let recents = app.recent_dirs.list().to_vec();
-            let picker = Picker::new(*preview, &app.download_dir, recents);
+            let mut picker = Picker::new(*preview, &app.download_dir, recents);
+            // In the order last chosen (here or in the Files tab), from the top.
+            picker.set_sort(app.file_sort);
+            picker.top();
             app.add_picker = Some(AddPickerState::Ready(Box::new(picker)));
         }
         Ok(PreviewResult::AlreadyInList(name)) => {
@@ -2528,7 +2538,11 @@ async fn handle_add_picker_mode(
         Some(AddPickerState::Ready(picker)) => {
             // A refusal or a failed completion answers one keypress.
             picker.message = None;
-            picker_key(picker, key)
+            let outcome = picker_key(picker, key);
+            // One file order for the picker and the Files tab, remembered
+            // across restarts like the other sorts.
+            app.file_sort = picker.sort;
+            outcome
         }
     };
     match outcome {
@@ -2628,6 +2642,7 @@ async fn execute_action(
         A::ToggleFileSelection => toggle_file_selection_key(app, cmd_tx).await,
         A::ApplyFileSelection => apply_file_selection(app, cmd_tx).await,
         A::StreamFile => handle_stream_keypress(app),
+        A::CycleFileSort => app.cycle_file_sort(),
         A::DetailBack => detail_back(app, cmd_tx).await,
         A::DownloadResult => download_selected_result(app, cmd_tx).await,
         A::PickResult => pick_selected_result(app, cmd_tx).await,
@@ -2949,6 +2964,20 @@ fn handle_open_folder(app: &mut App) {
     }
 }
 
+/// Write the sorts that changed to `[sort]` in `config.toml`, so the next
+/// launch opens every list the way it was left. Only the changed keys are
+/// written — see `Config::save_sort` — which keeps a `-c sort.…` override
+/// for this run out of the file.
+fn save_sort_if_changed(app: &mut App) {
+    if let Some((prefs, keys)) = app.take_unsaved_sort() {
+        if let Err(e) = config::Config::save_sort(&prefs.to_config(), &keys) {
+            app.set_error(format!(
+                "The new sort order is on for this session but not saved: {e:#}"
+            ));
+        }
+    }
+}
+
 /// Handle the `s` keystroke in Detail mode's Files tab. Composes the
 /// librqbit stream URL and hands it to the configured external player.
 /// All failure modes degrade to a status-bar message instead of a crash.
@@ -2964,10 +2993,12 @@ fn handle_stream_keypress(app: &mut App) {
     // Pull the (torrent_id, file_idx, file_name) tuple inside a tight borrow
     // scope so the immutable borrow ends before we mutate `app` to set
     // status messages.
+    let file_idx = app.detail_file_under_cursor();
     let resolved = app.selected_torrent().and_then(|t| {
+        let file_idx = file_idx?;
         t.files
-            .get(app.detail_file_index)
-            .map(|f| (t.id, app.detail_file_index, f.name.clone()))
+            .get(file_idx)
+            .map(|f| (t.id, file_idx, f.name.clone()))
     });
 
     let (torrent_id, file_idx, file_name) = match resolved {
@@ -3508,6 +3539,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn r_reorders_the_files_tab_and_space_acts_on_the_file_under_the_cursor() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = files_tab_on(&[true, true, true]);
+        for (file, name) in app.torrents[0].files.iter_mut().zip(["ep10", "ep2", "ep1"]) {
+            file.name = format!("{name}.mkv");
+        }
+        // Torrent order -> size (all equal, so unchanged) -> name.
+        handle_detail_mode(&mut app, key(KeyCode::Char('r')), &tx).await;
+        handle_detail_mode(&mut app, key(KeyCode::Char('r')), &tx).await;
+        assert_eq!(app.file_sort, sorting::FileSort::Name);
+        assert_eq!(app.detail_file_order(), vec![2, 1, 0]);
+        // The cursor stayed on ep10.mkv, now the last row.
+        assert_eq!(app.detail_file_index, 2);
+        handle_detail_mode(&mut app, key(KeyCode::Char('k')), &tx).await;
+        handle_detail_mode(&mut app, key(KeyCode::Char('k')), &tx).await;
+        // Top row: ep1.mkv, which is file 2.
+        handle_detail_mode(&mut app, key(KeyCode::Char(' ')), &tx).await;
+        match rx.try_recv().expect("a command") {
+            EngineCommand::SetSelectedFiles { file_indices, .. } => {
+                assert_eq!(file_indices, vec![0, 1]);
+            }
+            other => panic!("expected SetSelectedFiles, got {other:?}"),
+        }
+        // Remembered: the next save writes exactly this.
+        assert_eq!(app.take_unsaved_sort().map(|(_, k)| k), Some(vec!["files"]));
+    }
+
+    #[tokio::test]
+    async fn r_outside_the_files_tab_does_nothing() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = files_tab_on(&[true]);
+        app.detail_tab = DetailTab::Peers;
+        handle_detail_mode(&mut app, key(KeyCode::Char('r')), &tx).await;
+        assert_eq!(app.file_sort, sorting::FileSort::TorrentOrder);
+    }
+
+    #[tokio::test]
     async fn bulk_pause_resumes_when_any_marked_torrent_is_paused() {
         // "Any paused → resume all" over the marked set.
         let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
@@ -3649,6 +3717,33 @@ mod tests {
         );
         assert!(matches!(app.add_picker, Some(AddPickerState::Ready(_))));
         assert_eq!(app.mode, AppMode::AddPicker);
+    }
+
+    #[tokio::test]
+    async fn the_picker_opens_in_the_remembered_file_order_and_shares_changes() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        app.download_dir = "/dl".to_string();
+        app.file_sort = sorting::FileSort::Size;
+        app.saved_sort = app.sort_prefs();
+        let ticket = open_picker(&mut app, &tx, &mut rx).await;
+        apply_preview(
+            &mut app,
+            PreviewOutcome {
+                ticket,
+                result: Ok(PreviewResult::Ready(Box::new(ready_preview()))),
+            },
+        );
+        match &app.add_picker {
+            Some(AddPickerState::Ready(p)) => {
+                assert_eq!(p.sort, sorting::FileSort::Size);
+                assert_eq!(p.table_state.selected(), Some(0), "opens at the top");
+            }
+            _ => panic!("picker not open"),
+        }
+        handle_add_picker_mode(&mut app, key(KeyCode::Char('s')), &tx).await;
+        assert_eq!(app.file_sort, sorting::FileSort::Name);
+        assert_eq!(app.take_unsaved_sort().map(|(_, k)| k), Some(vec!["files"]));
     }
 
     #[tokio::test]
@@ -4148,6 +4243,7 @@ mod tests {
             size_bytes: Some(735051776),
             seeders: 12,
             leechers: 1,
+            added: Some(1_455_746_145),
             source: search::SourceSet {
                 apibay: true,
                 torrents_csv: false,

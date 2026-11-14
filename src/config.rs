@@ -80,6 +80,8 @@ pub struct Config {
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
+    pub sort: SortConfig,
+    #[serde(default)]
     pub player: PlayerConfig,
     #[serde(default)]
     pub search: SearchConfig,
@@ -329,6 +331,62 @@ pub struct UiConfig {
     pub theme: String,
 }
 
+/// The `[sort]` section: the order each list opens in. The app writes it
+/// back whenever a sort is changed in it, so the last choice sticks across
+/// restarts; editing it by hand works the same way.
+///
+/// Strings rather than enums on purpose: a value naming no sort falls back to
+/// that list's default at startup (see `SortPrefs::from_config`) instead of
+/// failing the parse, which would drop the *whole* file to defaults — proxy
+/// included — over a typo in a sort order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SortConfig {
+    /// The torrent list's column: `index` (the order torrents were added),
+    /// `name`, `size`, `progress`, `download`, `upload`, `peers`, `eta` or
+    /// `status`.
+    #[serde(default = "default_sort_torrents")]
+    pub torrents: String,
+    /// Reverse the torrent list's column — with `index`, newest first.
+    #[serde(default)]
+    pub torrents_reversed: bool,
+    /// A torrent's files, in the Files tab and the add picker: `torrent` (the
+    /// order the torrent lists them in), `size` (largest first) or `name`
+    /// (natural order, so `2` comes before `10`).
+    #[serde(default = "default_sort_files")]
+    pub files: String,
+    /// Search results: `seeders`, `size`, `title`, `leechers` or `age`.
+    #[serde(default = "default_sort_search")]
+    pub search: String,
+    /// Flip the search column's usual direction, which is most first for
+    /// seeders, size and leechers, A→Z for titles and newest first for age.
+    #[serde(default)]
+    pub search_reversed: bool,
+}
+
+impl Default for SortConfig {
+    fn default() -> Self {
+        Self {
+            torrents: default_sort_torrents(),
+            torrents_reversed: false,
+            files: default_sort_files(),
+            search: default_sort_search(),
+            search_reversed: false,
+        }
+    }
+}
+
+fn default_sort_torrents() -> String {
+    "index".to_string()
+}
+
+fn default_sort_files() -> String {
+    "torrent".to_string()
+}
+
+fn default_sort_search() -> String {
+    "seeders".to_string()
+}
+
 fn default_download_dir() -> String {
     dirs::download_dir()
         .unwrap_or_else(|| PathBuf::from("./downloads"))
@@ -521,10 +579,47 @@ impl Config {
     pub fn save_theme(theme: &str) -> Result<()> {
         save_theme_at(&Self::config_path(), theme)
     }
+
+    /// Persist sorts changed in the app by editing only the named `[sort]`
+    /// `keys` in the file on disk, for the same reasons as
+    /// [`Config::save_theme`] — and so that a `-c sort.…` override for this
+    /// run is never written back along with a different change.
+    pub fn save_sort(sort: &SortConfig, keys: &[&str]) -> Result<()> {
+        save_sort_at(&Self::config_path(), sort, keys)
+    }
 }
 
 /// [`Config::save_theme`] against an explicit path, for tests.
 fn save_theme_at(path: &Path, theme: &str) -> Result<()> {
+    save_values_at(path, "ui", &[("theme", toml_edit::Value::from(theme))])
+}
+
+/// [`Config::save_sort`] against an explicit path, for tests.
+fn save_sort_at(path: &Path, sort: &SortConfig, keys: &[&str]) -> Result<()> {
+    let values: Vec<(&str, toml_edit::Value)> = [
+        ("torrents", toml_edit::Value::from(sort.torrents.as_str())),
+        (
+            "torrents_reversed",
+            toml_edit::Value::from(sort.torrents_reversed),
+        ),
+        ("files", toml_edit::Value::from(sort.files.as_str())),
+        ("search", toml_edit::Value::from(sort.search.as_str())),
+        (
+            "search_reversed",
+            toml_edit::Value::from(sort.search_reversed),
+        ),
+    ]
+    .into_iter()
+    .filter(|(key, _)| keys.contains(key))
+    .collect();
+    save_values_at(path, "sort", &values)
+}
+
+/// Set `values` in the `[section]` table of the config file at `path`,
+/// touching nothing else: comments, key order, unknown keys and each replaced
+/// value's own spacing and trailing comment all survive. Adds the keys, or
+/// the table, when they are missing.
+fn save_values_at(path: &Path, section: &str, values: &[(&str, toml_edit::Value)]) -> Result<()> {
     // Write through a symlink rather than replacing it: dotfile managers link
     // config.toml into a repo, and a rename onto the link would cut it loose.
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -544,19 +639,21 @@ fn save_theme_at(path: &Path, theme: &str) -> Result<()> {
             None => anyhow::anyhow!("config.toml: {}", e.message()),
         }
     })?;
-    let ui = doc.entry("ui").or_insert(toml_edit::table());
-    let Some(ui) = ui.as_table_like_mut() else {
-        anyhow::bail!("config.toml: `ui` is not a table");
+    let table = doc.entry(section).or_insert(toml_edit::table());
+    let Some(table) = table.as_table_like_mut() else {
+        anyhow::bail!("config.toml: `{section}` is not a table");
     };
-    match ui.get_mut("theme").and_then(toml_edit::Item::as_value_mut) {
-        // Replace just the value, keeping its spacing and trailing comment.
-        Some(value) => {
-            let decor = value.decor().clone();
-            *value = toml_edit::Value::from(theme);
-            *value.decor_mut() = decor;
-        }
-        None => {
-            ui.insert("theme", toml_edit::value(theme));
+    for (key, new_value) in values {
+        match table.get_mut(key).and_then(toml_edit::Item::as_value_mut) {
+            // Replace just the value, keeping its spacing and trailing comment.
+            Some(value) => {
+                let decor = value.decor().clone();
+                *value = new_value.clone();
+                *value.decor_mut() = decor;
+            }
+            None => {
+                table.insert(key, toml_edit::Item::Value(new_value.clone()));
+            }
         }
     }
     write_atomic(&path, &doc.to_string())
@@ -785,6 +882,12 @@ mod tests {
         assert_eq!(config.ui.refresh_rate_ms, 100);
         assert!(config.ui.enable_notifications);
         assert_eq!(config.ui.theme, "system");
+        assert_eq!(config.sort, SortConfig::default());
+        assert_eq!(config.sort.torrents, "index");
+        assert!(!config.sort.torrents_reversed);
+        assert_eq!(config.sort.files, "torrent");
+        assert_eq!(config.sort.search, "seeders");
+        assert!(!config.sort.search_reversed);
         assert!(config.player.command.is_empty());
         assert!(config.player.args.is_empty());
         assert!(config.search.enable_apibay);
@@ -1200,6 +1303,98 @@ theme = "system"              # colour theme; see Themes below
             std::fs::read_to_string(&real).unwrap(),
             "[ui]\ntheme = \"nord\"\n"
         );
+    }
+
+    const ALL_SORT_KEYS: [&str; 5] = [
+        "torrents",
+        "torrents_reversed",
+        "files",
+        "search",
+        "search_reversed",
+    ];
+
+    #[test]
+    fn saving_the_sort_writes_only_the_keys_that_changed() {
+        // This run was started with `-c sort.torrents=name`; the user then
+        // changed only the file order. The override must not land in the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[sort]\ntorrents = \"index\"\n").unwrap();
+        let mut sort = newest_first_by_name();
+        sort.torrents = "name".to_string();
+        save_sort_at(&path, &sort, &["files"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[sort]\ntorrents = \"index\"\nfiles = \"name\"\n"
+        );
+    }
+
+    fn newest_first_by_name() -> SortConfig {
+        SortConfig {
+            torrents: "index".to_string(),
+            torrents_reversed: true,
+            files: "name".to_string(),
+            search: "age".to_string(),
+            search_reversed: false,
+        }
+    }
+
+    #[test]
+    fn saving_the_sort_adds_a_section_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let before = "# mine\n[ui]\ntheme = \"nord\"\n";
+        std::fs::write(&path, before).unwrap();
+        save_sort_at(&path, &newest_first_by_name(), &ALL_SORT_KEYS).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with(before), "{after}");
+        let config: Config = toml::from_str(&after).unwrap();
+        assert_eq!(config.sort, newest_first_by_name());
+        assert_eq!(config.ui.theme, "nord");
+    }
+
+    #[test]
+    fn saving_the_sort_again_edits_values_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let before = r#"[sort]
+# newest at the top
+torrents = "index"      # see README
+torrents_reversed = true
+files = "torrent"
+search = "seeders"
+search_reversed = false
+
+[ui]
+theme = "nord"
+"#;
+        std::fs::write(&path, before).unwrap();
+        save_sort_at(&path, &newest_first_by_name(), &ALL_SORT_KEYS).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before
+                .replace(r#"files = "torrent""#, r#"files = "name""#)
+                .replace(r#"search = "seeders""#, r#"search = "age""#)
+        );
+    }
+
+    #[test]
+    fn a_bad_sort_value_does_not_cost_the_rest_of_the_file() {
+        // An enum would fail the parse and drop the whole file to defaults.
+        let config: Config = toml::from_str(
+            "[sort]\ntorrents = \"sideways\"\n[privacy]\nproxy_url = \"socks5://h:1\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.sort.torrents, "sideways");
+        assert_eq!(config.privacy.proxy_url, "socks5://h:1");
+    }
+
+    #[test]
+    fn sort_settings_are_settable_with_set() {
+        let o = parse_override("sort.torrents_reversed=true").unwrap();
+        assert_eq!(o.arg(), "sort.torrents_reversed=true");
+        assert!(parse_override("sort.files=name").is_ok());
+        assert!(parse_override("sort.torrents_reversed=yes").is_err());
     }
 
     // -- profiles -------------------------------------------------------------

@@ -47,6 +47,7 @@ pub enum ActionId {
     ToggleFileSelection,
     ApplyFileSelection,
     StreamFile,
+    CycleFileSort,
     DetailBack,
     // Search results
     DownloadResult,
@@ -483,7 +484,7 @@ pub const ACTIONS: &[ActionInfo] = &[
         scope: Scope::SearchResults,
         section: Section::Search,
         keys: "`Tab`",
-        description: "Cycle sort column (Seeders → Size → Title → Leechers)",
+        description: "Cycle sort column (Seeders → Size → Title → Leechers → Age)",
         short: Some("Cycle result sort column"),
         hint: Some("Tab:sort"),
         hint_when_empty: false,
@@ -594,6 +595,20 @@ pub const ACTIONS: &[ActionInfo] = &[
         keys: "`s`",
         description: "Stream selected file in default media player (Files tab)",
         short: Some("Stream selected file (Files tab)"),
+        hint: None,
+        hint_when_empty: false,
+        in_palette: true,
+        available: on_files_tab_with_files,
+    },
+    ActionInfo {
+        id: Some(ActionId::CycleFileSort),
+        scope: Scope::Detail,
+        section: Section::Detail,
+        keys: "`r`",
+        description: "Cycle file order: torrent order → size → name (Files tab; the add picker shares it)",
+        short: Some("Cycle file order (Files tab)"),
+        // The Files tab's title carries `r:sort`; the Detail hint line is
+        // shared by every tab.
         hint: None,
         hint_when_empty: false,
         in_palette: true,

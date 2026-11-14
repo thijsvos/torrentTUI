@@ -16,8 +16,7 @@ pub fn search_url(query: &str) -> String {
 }
 
 /// The subset of apibay's fields we read; serde ignores the rest (`num_files`,
-/// `username`, `added`, `status`, `category`, `imdb`). All strings per the
-/// live API.
+/// `username`, `status`, `category`, `imdb`). All strings per the live API.
 #[derive(Deserialize)]
 struct Entry {
     #[serde(default)]
@@ -32,6 +31,9 @@ struct Entry {
     leechers: String,
     #[serde(default)]
     size: String,
+    /// Unix seconds, as a string like every other field.
+    #[serde(default)]
+    added: String,
 }
 
 pub fn parse_response(body: &[u8]) -> Result<Vec<SearchResult>, String> {
@@ -59,6 +61,7 @@ pub fn parse_response(body: &[u8]) -> Result<Vec<SearchResult>, String> {
             size_bytes: entry.size.trim().parse::<u64>().ok(),
             seeders: entry.seeders.trim().parse::<u64>().unwrap_or(0),
             leechers: entry.leechers.trim().parse::<u64>().unwrap_or(0),
+            added: super::listing_time(entry.added.trim().parse::<u64>().ok()),
             source: SourceSet {
                 apibay: true,
                 torrents_csv: false,
@@ -95,6 +98,8 @@ mod tests {
         assert_eq!(results[0].size_bytes, Some(735051776));
         assert_eq!(results[1].seeders, 41);
         assert_eq!(results[1].leechers, 2);
+        assert_eq!(results[0].added, Some(1455746145));
+        assert_eq!(results[1].added, Some(1609604656));
         assert!(results[0].source.apibay);
         assert!(!results[0].source.torrents_csv);
     }
@@ -125,6 +130,18 @@ mod tests {
         assert_eq!(results[0].seeders, 0);
         assert_eq!(results[0].leechers, 0);
         assert_eq!(results[0].size_bytes, None);
+        assert_eq!(results[0].added, None, "no `added` at all");
+    }
+
+    #[test]
+    fn a_bad_or_zero_listing_time_is_unknown_not_fatal() {
+        let body = r#"[
+            {"id":"1","name":"a","info_hash":"88066B90278F2DE655EE2DD44E784C340B54E45C","seeders":"1","added":"yesterday"},
+            {"id":"2","name":"b","info_hash":"22B8F63218F1E726EC2F1FB9B38239F95FC6A629","seeders":"1","added":"0"}
+        ]"#;
+        let results = parse_response(body.as_bytes()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.added.is_none()));
     }
 
     #[test]

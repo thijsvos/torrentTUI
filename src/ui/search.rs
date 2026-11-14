@@ -73,7 +73,7 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
         "\u{25b2}"
     };
     let header = Row::new(
-        ["", "Title", "Size", "Seed", "Leech", "Source"]
+        ["", "Title", "Size", "Seed", "Leech", "Age", "Source"]
             .iter()
             .enumerate()
             .map(|(i, h)| {
@@ -91,6 +91,7 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
     )
     .height(1);
 
+    let now = unix_now();
     let rows: Vec<Row> = app
         .search
         .results
@@ -108,6 +109,7 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(size),
                 Cell::from(r.seeders.to_string()).style(Style::default().fg(theme.success)),
                 Cell::from(r.leechers.to_string()).style(Style::default().fg(theme.error)),
+                Cell::from(format_age(r.added, now)),
                 Cell::from(r.source.label()).style(Style::default().fg(theme.muted)),
             ])
         })
@@ -121,6 +123,7 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(10), // Size
             Constraint::Length(7),  // Seeders (room for the sort arrow)
             Constraint::Length(8),  // Leechers (room for the sort arrow)
+            Constraint::Length(6),  // Age (room for the sort arrow)
             Constraint::Length(7),  // Source
         ],
     )
@@ -137,6 +140,40 @@ pub fn render_search_view(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 const EMPTY_HINTS: &str = "r: retry   s: edit query   Esc: back";
+
+/// Seconds since the Unix epoch by the wall clock; 0 if the clock is set
+/// before 1970, which only makes every result read as brand new.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How long ago a result was listed, in at most four columns: `<1h`, `5h`,
+/// `12d`, `11mo`, `3y`. Coarse on purpose — the column is for telling a fresh
+/// upload from a years-old one, and a full date would cost the title ten
+/// columns on an 80-column terminal. A listing time in the future (a clock
+/// off on either side) reads as `<1h` rather than going negative.
+fn format_age(added: Option<u64>, now: u64) -> String {
+    const HOUR: u64 = 3600;
+    const DAY: u64 = 24 * HOUR;
+    let Some(added) = added else {
+        return "?".to_string();
+    };
+    let age = now.saturating_sub(added);
+    if age < HOUR {
+        "<1h".to_string()
+    } else if age < DAY {
+        format!("{}h", age / HOUR)
+    } else if age < 30 * DAY {
+        format!("{}d", age / DAY)
+    } else if age < 365 * DAY {
+        format!("{}mo", age / (30 * DAY))
+    } else {
+        format!("{}y", age / (365 * DAY))
+    }
+}
 
 /// The block title carries the query, the count, and any partial-failure note
 /// so a degraded search is visibly degraded without blocking anything.
@@ -177,6 +214,7 @@ mod tests {
             size_bytes: None,
             seeders: 0,
             leechers: 0,
+            added: None,
             source: SourceSet::default(),
         }
     }
@@ -214,6 +252,63 @@ mod tests {
             .draw(|f| render_search_view(f, f.area(), &mut app))
             .unwrap();
         assert!(screen(&terminal).contains("Size \u{25b2}"));
+    }
+
+    #[test]
+    fn age_is_coarse_and_never_negative() {
+        const DAY: u64 = 86_400;
+        let now = 1_800_000_000;
+        assert_eq!(format_age(None, now), "?");
+        assert_eq!(format_age(Some(now), now), "<1h");
+        assert_eq!(
+            format_age(Some(now + DAY), now),
+            "<1h",
+            "listed in the future"
+        );
+        assert_eq!(format_age(Some(now - 3_599), now), "<1h");
+        assert_eq!(format_age(Some(now - 3_600), now), "1h");
+        assert_eq!(format_age(Some(now - DAY + 1), now), "23h");
+        assert_eq!(format_age(Some(now - DAY), now), "1d");
+        assert_eq!(format_age(Some(now - 29 * DAY), now), "29d");
+        assert_eq!(format_age(Some(now - 30 * DAY), now), "1mo");
+        assert_eq!(format_age(Some(now - 364 * DAY), now), "12mo");
+        assert_eq!(format_age(Some(now - 365 * DAY), now), "1y");
+        assert_eq!(format_age(Some(1), now), "57y");
+        // Every value fits the column next to its sort arrow.
+        for days in 0..20_000 {
+            let s = format_age(Some(now - days * DAY / 3), now);
+            assert!(s.len() <= 4, "{s}");
+        }
+    }
+
+    #[test]
+    fn age_column_fits_an_80_column_terminal() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut r = result();
+        r.title = "Some.Show.S01E01.1080p".to_string();
+        r.added = Some(unix_now() - 3 * 86_400);
+        r.source.apibay = true;
+        let mut app = app_with_results(vec![r]);
+        app.search.sort_column = crate::app::ResultSortColumn::Age;
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        terminal
+            .draw(|f| render_search_view(f, f.area(), &mut app))
+            .unwrap();
+        let rows: Vec<String> = (0..6)
+            .map(|y| {
+                (0..80)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let screen = rows.join("\n");
+        assert!(screen.contains("Age \u{25b2}"), "{screen}");
+        assert!(screen.contains("Some.Show.S01E01.1080p"), "{screen}");
+        assert!(screen.contains("3d"), "{screen}");
+        assert!(
+            screen.contains("TPB"),
+            "the last column still fits: {screen}"
+        );
     }
 
     #[test]
