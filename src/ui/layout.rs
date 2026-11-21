@@ -151,6 +151,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         AppMode::ConfirmDetach => "y:detach  n:cancel".to_string(),
         AppMode::Filter => "Enter:apply  Esc:clear & close".to_string(),
         AppMode::ThrottleInput => "Enter:confirm  Esc:cancel".to_string(),
+        AppMode::MoveInput => "Enter:move  Tab:complete  Esc:cancel".to_string(),
         AppMode::Search => "Enter:search  Esc:back".to_string(),
         AppMode::SearchResults => {
             crate::actions::hint_line(crate::actions::Scope::SearchResults, false)
@@ -300,6 +301,10 @@ pub fn render_filter_bar(f: &mut Frame, area: Rect, input: &InputWidget, theme: 
 
 pub fn render_search_bar(f: &mut Frame, area: Rect, input: &InputWidget, theme: Theme) {
     render_field_bar(f, area, " Search torrents: ", input, theme);
+}
+
+pub fn render_move_bar(f: &mut Frame, area: Rect, input: &InputWidget, theme: Theme) {
+    render_field_bar(f, area, " Move to folder: ", input, theme);
 }
 
 pub fn render_throttle_bar(f: &mut Frame, area: Rect, step: u8, input: &InputWidget, theme: Theme) {

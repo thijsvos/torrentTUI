@@ -366,6 +366,8 @@ pub struct App {
     pub throttle_input: InputWidget,
     pub throttle_download_value: u64,
     pub throttle_upload_value: u64,
+    /// Where the move-folder input returns after confirmation or cancellation.
+    pub move_return_mode: AppMode,
     pub speed_limit_download_kbps: u64,
     pub speed_limit_upload_kbps: u64,
     /// Where the torrent table was drawn last frame, so mouse clicks can be
@@ -524,6 +526,7 @@ impl App {
             }),
             throttle_download_value: 0,
             throttle_upload_value: 0,
+            move_return_mode: AppMode::Normal,
             speed_limit_download_kbps: 0,
             speed_limit_upload_kbps: 0,
             table_area: None,

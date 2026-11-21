@@ -29,6 +29,7 @@ A terminal-based BitTorrent client built with Rust, ratatui, and librqbit.
 - **Bandwidth limits** — session-wide download/upload rate limits, applied smoothly by librqbit's token-bucket limiter and adjustable live with `t`
 - **Privacy pack** — SOCKS5 proxy with honest lockdown (no DHT/UDP leaking around it), PeerGuardian IP blocklists, and VPN interface binding; see [Privacy](#privacy)
 - **Selective file download** — press `A` to pick which files to download and where to save them *before* anything starts; change the selection later in the Files tab
+- **Move torrents** — press `m` to move selected or marked torrent data to another folder, including active downloads and completed torrents
 - **Reveal in file manager** — press `o` to open the selected torrent's data in Finder, Explorer, or your Linux file manager
 - **Detail view** — inspect torrent info, individual file progress, and peer details
 - **Why is it slow?** — press `w` and the Health tab says *why* a torrent is stalled (no way to find peers, peers unreachable, swarm has no seeders, your own cap) and what to change; see [the Health tab](#why-is-it-slow--the-health-tab)
@@ -150,6 +151,7 @@ torrenttui --stop
 | `p` | Pause/unpause selected (or all marked) torrents |
 | `P` | Pause/unpause all torrents |
 | `d` | Delete selected (or all marked) torrents |
+| `m` | Move selected (or all marked) torrents to another folder |
 | `o` | Reveal the selected torrent in your file manager (Finder/Explorer/xdg-open); falls back to the download folder while data is still arriving |
 | `Enter` | Open detail view |
 | `w` | Why is it slow? Open the Health tab for the selected torrent |
@@ -228,9 +230,12 @@ before pressing `a`, since the bulk keys act on whatever the list shows.
 Good to know:
 
 - **The folder is per torrent and is remembered across restarts**, but it is
-  fixed once the torrent is added: librqbit has no way to move a torrent's
-  data afterwards. The file selection is not fixed — change it any time in the
-  detail view's Files tab.
+  remembered across restarts. Press `m` in the torrent list to choose a new
+  parent folder; marked torrents move together. Downloads pause while their
+  data is relocated, then resume automatically, and completed torrents remain
+  available for seeding. A multi-file torrent keeps its existing content
+  folder name inside the destination. The file selection is not fixed — change
+  it any time in the detail view's Files tab.
 - **The proxy is not a per-torrent choice.** `[privacy]` applies to the whole
   session, and has to: DHT and the listener belong to the session, so a
   torrent "outside" the proxy would still be announced from your real address.
@@ -250,7 +255,7 @@ Good to know:
 ### Text fields
 
 Every text box — the add bar, the filter, search, the command palette, the
-speed-limit dialog, and the add picker's filter and save folder — edits the
+speed-limit dialog, the move destination, and the add picker's filter and save folder — edits the
 same way, with the keys a shell uses:
 
 | Key | Action |
@@ -269,8 +274,8 @@ Undo takes back a word of typing, a run of deletes, or a paste at a time.
 
 `Tab` completes paths: in the add bar, `.torrent` files and the folders on the
 way to them (relative paths start where TorrentTUI was launched, as the add
-itself does); in the picker's save folder, folders. When more than one name
-fits, `Tab` fills in what they share and opens a menu of them:
+itself does); in the move destination and the picker's save folder, folders.
+When more than one name fits, `Tab` fills in what they share and opens a menu of them:
 
 | Key | In the completion menu |
 |-----|------------------------|

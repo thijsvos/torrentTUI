@@ -1433,6 +1433,19 @@ async fn run_app(
                             app.theme,
                         );
                     }
+                    AppMode::MoveInput => {
+                        ui::layout::render_move_bar(f, chunks[2], &input_widget, app.theme);
+                        if let Some(menu) = input_widget.menu() {
+                            ui::input::render_menu(
+                                f,
+                                chunks[2],
+                                f.area(),
+                                chunks[2].x + 1,
+                                menu,
+                                app.theme,
+                            );
+                        }
+                    }
                     // An active error outranks the input bar: the errors fired
                     // while staying in Search mode (providers disabled, client
                     // build failure) mean the search cannot proceed, and the
@@ -1590,6 +1603,7 @@ async fn run_app(
                             AppMode::ConfirmDetach => handle_detach_mode(&mut app, key),
                             AppMode::Filter => handle_filter_mode(&mut app, key),
                             AppMode::ThrottleInput => handle_throttle_mode(&mut app, key, &cmd_tx).await,
+                            AppMode::MoveInput => handle_move_input_mode(&mut app, &mut input_widget, key, &cmd_tx).await,
                             AppMode::Search => handle_search_input_mode(&mut app, key, &search_tx, &mut search_client),
                             AppMode::SearchResults => handle_search_results_mode(&mut app, key, &cmd_tx, &search_tx, &mut search_client).await,
                             AppMode::Palette => handle_palette_mode(&mut app, key, &mut input_widget, &cmd_tx, &search_tx, &mut search_client).await,
@@ -1643,6 +1657,14 @@ async fn run_app(
                     Some(Ok(Event::Paste(s))) if app.mode == AppMode::ThrottleInput => {
                         // Digits only, like typing.
                         app.throttle_input.insert_str(&s);
+                        needs_render = true;
+                    }
+                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::MoveInput => {
+                        input_widget.insert_str(&s);
+                        needs_render = true;
+                    }
+                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::MoveInput => {
+                        input_widget.insert_str(&s);
                         needs_render = true;
                     }
                     Some(Ok(Event::Resize(_, _))) => {
@@ -1902,6 +1924,15 @@ fn open_throttle(app: &mut App) {
         .set(&limit_text(app.speed_limit_download_kbps));
 }
 
+fn open_move_input(app: &mut App, input_widget: &mut InputWidget) {
+    if !app.has_marks() && app.selected_torrent().is_none() {
+        return;
+    }
+    app.move_return_mode = app.mode.clone();
+    app.mode = AppMode::MoveInput;
+    input_widget.clear();
+}
+
 /// What the speed-limit dialog starts with: the current limit, or nothing
 /// for unlimited.
 fn limit_text(kbps: u64) -> String {
@@ -1942,6 +1973,7 @@ async fn handle_normal_mode(
         KeyCode::Char('p') => pause_toggle(app, cmd_tx).await,
         KeyCode::Char('P') => pause_all(app, cmd_tx).await,
         KeyCode::Char('d') => open_delete_confirm(app),
+        KeyCode::Char('m') => open_move_input(app, input_widget),
         KeyCode::Enter => open_detail(app, cmd_tx).await,
         KeyCode::Char('w') => open_health(app, cmd_tx).await,
         KeyCode::Char('?') => open_help(app),
@@ -2003,6 +2035,66 @@ async fn handle_input_mode(
                     app.mode = AppMode::Normal;
                 }
             }
+        }
+        _ => {
+            input_widget.handle_key(key);
+        }
+    }
+}
+
+async fn handle_move_input_mode(
+    app: &mut App,
+    input_widget: &mut InputWidget,
+    key: crossterm::event::KeyEvent,
+    cmd_tx: &mpsc::Sender<EngineCommand>,
+) {
+    if input_widget.menu_key(key) == MenuKey::Used {
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => app.mode = std::mem::replace(&mut app.move_return_mode, AppMode::Normal),
+        KeyCode::Tab => {
+            let done = completion::complete_path(
+                input_widget.before_cursor(),
+                ".",
+                completion::list_subdirs,
+            );
+            input_widget.complete(done);
+        }
+        KeyCode::Enter => {
+            let destination = config::expand_tilde(input_widget.value().trim());
+            if destination.trim().is_empty() {
+                app.set_error("Destination folder cannot be empty".to_string());
+                app.mode = std::mem::replace(&mut app.move_return_mode, AppMode::Normal);
+                return;
+            }
+            let mut ids = if app.has_marks() {
+                app.marked_ids.iter().copied().collect::<Vec<_>>()
+            } else {
+                app.selected_torrent()
+                    .map(|torrent| vec![torrent.id])
+                    .unwrap_or_default()
+            };
+            ids.sort_unstable();
+            if ids.is_empty() {
+                app.set_error("No torrents selected to move".to_string());
+                app.mode = std::mem::replace(&mut app.move_return_mode, AppMode::Normal);
+                return;
+            }
+            let had_marks = app.has_marks();
+            send_cmd(
+                cmd_tx,
+                EngineCommand::MoveMany {
+                    ids,
+                    destination: PathBuf::from(destination),
+                },
+                app,
+            )
+            .await;
+            if had_marks {
+                app.clear_marks();
+            }
+            app.mode = std::mem::replace(&mut app.move_return_mode, AppMode::Normal);
         }
         _ => {
             input_widget.handle_key(key);
@@ -2621,6 +2713,7 @@ async fn execute_action(
         A::PauseToggle => pause_toggle(app, cmd_tx).await,
         A::PauseAll => pause_all(app, cmd_tx).await,
         A::Delete => open_delete_confirm(app),
+        A::MoveTorrent => open_move_input(app, input_widget),
         A::RevealFolder => handle_open_folder(app),
         A::OpenDetail => open_detail(app, cmd_tx).await,
         A::OpenHealth => open_health(app, cmd_tx).await,
@@ -3251,6 +3344,50 @@ mod tests {
             other => panic!("expected SetSpeedLimits, got {other:?}"),
         }
         assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn move_input_sends_selected_torrent_and_returns_to_list() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut input = InputWidget::new();
+        app.handle_state_push(vec![torrent(7, types::TorrentStatus::Downloading)]);
+
+        handle_normal_mode(&mut app, &mut input, key(KeyCode::Char('m')), &tx).await;
+        assert_eq!(app.mode, AppMode::MoveInput);
+        input.insert_str("/tmp/new-location");
+        handle_move_input_mode(&mut app, &mut input, key(KeyCode::Enter), &tx).await;
+
+        match rx.try_recv().expect("a move command should have been sent") {
+            EngineCommand::MoveMany { ids, destination } => {
+                assert_eq!(ids, vec![7]);
+                assert_eq!(destination, PathBuf::from("/tmp/new-location"));
+            }
+            other => panic!("expected MoveMany, got {other:?}"),
+        }
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn move_input_uses_marked_torrents_and_clears_marks() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut input = InputWidget::new();
+        app.handle_state_push(vec![
+            torrent(3, types::TorrentStatus::Downloading),
+            torrent(7, types::TorrentStatus::Seeding),
+        ]);
+        app.marked_ids.extend([7, 3]);
+
+        handle_normal_mode(&mut app, &mut input, key(KeyCode::Char('m')), &tx).await;
+        input.insert_str("/tmp/new-location");
+        handle_move_input_mode(&mut app, &mut input, key(KeyCode::Enter), &tx).await;
+
+        match rx.try_recv().expect("a move command should have been sent") {
+            EngineCommand::MoveMany { ids, .. } => assert_eq!(ids, vec![3, 7]),
+            other => panic!("expected MoveMany, got {other:?}"),
+        }
+        assert!(app.marked_ids.is_empty());
     }
 
     #[tokio::test]

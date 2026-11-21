@@ -425,6 +425,7 @@ pub enum AppMode {
     ConfirmDetach,
     Filter,
     ThrottleInput,
+    MoveInput,
     /// Typing an indexer-search query in the bottom bar. The main area keeps
     /// showing whatever was there (torrent table, or previous results).
     Search,

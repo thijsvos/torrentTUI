@@ -41,6 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -212,6 +213,12 @@ pub enum EngineCommand {
         ids: Vec<usize>,
         delete_files: bool,
     },
+    /// Move torrents to a new parent folder. Each torrent keeps its existing
+    /// content-folder name and file selection.
+    MoveMany {
+        ids: Vec<usize>,
+        destination: PathBuf,
+    },
     PauseAll,
     ResumeAll,
     SetSpeedLimits {
@@ -297,6 +304,9 @@ pub struct TorrentEngine {
     /// since session start. `--quit-when-done` reads it: a run whose only
     /// magnet nobody seeded has nothing left to download, but did not succeed.
     failed_adds: std::sync::atomic::AtomicU64,
+    /// Serializes torrent registration with relocation, which temporarily
+    /// removes a torrent from librqbit before re-adding it with its existing id.
+    mutation_lock: tokio::sync::Mutex<()>,
 }
 
 /// What the engine knows about an add before librqbit has created the
@@ -590,6 +600,7 @@ impl TorrentEngine {
             download_dir,
             preview_tasks: std::sync::Mutex::new(HashMap::new()),
             failed_adds: std::sync::atomic::AtomicU64::new(0),
+            mutation_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -722,7 +733,37 @@ impl TorrentEngine {
     /// and size-capped before reading, so a symlink pointing at something
     /// enormous cannot be read into memory.
     pub async fn add_torrent(&self, source: &str) -> Result<(usize, ManagedTorrentHandle, bool)> {
-        let add_torrent = read_add_source(source).await?;
+        if let Some(handle) = librqbit::Magnet::parse(source)
+            .ok()
+            .and_then(|magnet| magnet.as_id20())
+            .and_then(|hash| self.session.get(TorrentIdOrHash::Hash(hash)))
+        {
+            return Ok((handle.id(), handle, true));
+        }
+        let response = self
+            .session
+            .add_torrent(
+                read_add_source(source).await?,
+                Some(AddTorrentOptions {
+                    list_only: true,
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let listed = match response {
+            AddTorrentResponse::ListOnly(listed) => listed,
+            other => return added_handle(other),
+        };
+        let _guard = self.mutation_lock.lock().await;
+        if let Some(handle) = self.session.get(TorrentIdOrHash::Hash(listed.info_hash)) {
+            return Ok((handle.id(), handle, true));
+        }
+        let output_folder = listed
+            .output_folder
+            .to_str()
+            .context("the download folder is not valid UTF-8")?
+            .to_string();
 
         // `overwrite` lets librqbit open files that already exist. Without it
         // adding a torrent whose data is already on disk fails outright with
@@ -737,9 +778,12 @@ impl TorrentEngine {
         let response = self
             .session
             .add_torrent(
-                add_torrent,
+                AddTorrent::from_bytes(listed.torrent_bytes.to_vec()),
                 Some(AddTorrentOptions {
                     overwrite: true,
+                    only_files: listed.only_files,
+                    output_folder: Some(output_folder),
+                    initial_peers: (!listed.seen_peers.is_empty()).then_some(listed.seen_peers),
                     ..Default::default()
                 }),
             )
@@ -783,6 +827,7 @@ impl TorrentEngine {
             AddTorrentResponse::ListOnly(listed) => listed,
             other => return added_handle(other),
         };
+        let _guard = self.mutation_lock.lock().await;
         if let Some(handle) = self.session.get(TorrentIdOrHash::Hash(listed.info_hash)) {
             return Ok((handle.id(), handle, true));
         }
@@ -895,6 +940,7 @@ impl TorrentEngine {
         output_folder: &Path,
     ) -> Result<(usize, ManagedTorrentHandle, bool)> {
         anyhow::ensure!(!only_files.is_empty(), "no files selected");
+        let _guard = self.mutation_lock.lock().await;
         let output_folder = output_folder
             .to_str()
             .context("the save folder is not valid UTF-8")?
@@ -936,6 +982,197 @@ impl TorrentEngine {
     pub async fn unpause(&self, handle: &ManagedTorrentHandle) -> Result<()> {
         self.session.unpause(handle).await?;
         Ok(())
+    }
+
+    /// Move a torrent's content and recreate its librqbit handle at the new
+    /// location. librqbit fixes `output_folder` when a torrent is added, so
+    /// retaining the metadata and file selection while re-adding is required
+    /// for the engine and fastresume state to agree with the filesystem.
+    pub async fn move_torrent(&self, id: usize, destination: &Path) -> Result<bool> {
+        let _guard = self.mutation_lock.lock().await;
+        let handle = self
+            .get_handle(id)
+            .with_context(|| format!("torrent {id} is no longer in the session"))?;
+        let old_output_folder = handle.output_folder().to_path_buf();
+        let was_paused = handle.is_paused();
+        let only_files = handle.only_files();
+        let trackers = handle
+            .shared()
+            .trackers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let (torrent_bytes, files) = handle.with_metadata(|metadata| {
+            (
+                metadata.torrent_bytes.to_vec(),
+                metadata
+                    .file_infos
+                    .iter()
+                    .map(|file| file.relative_filename.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+        anyhow::ensure!(!files.is_empty(), "torrent has no files to move");
+        let single_file = (files.len() == 1).then(|| files[0].clone());
+
+        let destination = destination.to_path_buf();
+        let plan_file = single_file.clone();
+        let (old_output_folder, new_output_folder) = tokio::task::spawn_blocking(move || {
+            move_output_folders(&old_output_folder, &destination, plan_file.as_deref())
+        })
+        .await
+        .context("move path preparation task failed")??;
+
+        if old_output_folder == new_output_folder {
+            return Ok(false);
+        }
+        old_output_folder
+            .to_str()
+            .context("current torrent path is not valid UTF-8")?;
+        new_output_folder
+            .to_str()
+            .context("torrent destination is not valid UTF-8")?;
+
+        let hash = handle.info_hash();
+        if !was_paused {
+            self.pause(&handle)
+                .await
+                .context("could not pause torrent before moving")?;
+        }
+        if let Err(error) = self
+            .session
+            .delete(TorrentIdOrHash::Hash(hash), false)
+            .await
+        {
+            if self.is_present(hash) {
+                if !was_paused {
+                    if let Some(handle) = self.get_handle(id) {
+                        if let Err(resume_error) = self.unpause(&handle).await {
+                            tracing::error!(
+                                "Could not resume torrent {id} after move was refused: {resume_error:#}"
+                            );
+                        }
+                    }
+                }
+                return Err(error).context("could not unregister torrent before moving");
+            }
+            tracing::warn!("Torrent {id} was removed despite a move-time delete error: {error:#}");
+        }
+
+        let move_result = {
+            let source = old_output_folder.clone();
+            let target = new_output_folder.clone();
+            let relative_file = single_file.clone();
+            tokio::task::spawn_blocking(move || {
+                move_torrent_payload(&source, &target, relative_file.as_deref())
+            })
+            .await
+            .context("filesystem move task failed")?
+        };
+        if let Err(error) = move_result {
+            let restore = self
+                .add_moved_torrent(
+                    id,
+                    &old_output_folder,
+                    torrent_bytes,
+                    only_files,
+                    was_paused,
+                    trackers,
+                )
+                .await;
+            return match restore {
+                Ok(()) => Err(error).context("could not move torrent data; torrent restored at its original location"),
+                Err(restore_error) => Err(anyhow::anyhow!(
+                    "could not move torrent data: {error:#}; the torrent could not be restored to the session: {restore_error:#}"
+                )),
+            };
+        }
+
+        if let Err(error) = self
+            .add_moved_torrent(
+                id,
+                &new_output_folder,
+                torrent_bytes.clone(),
+                only_files.clone(),
+                was_paused,
+                trackers.clone(),
+            )
+            .await
+        {
+            let source = new_output_folder.clone();
+            let target = old_output_folder.clone();
+            let relative_file = single_file;
+            let rollback = tokio::task::spawn_blocking(move || {
+                move_torrent_payload(&source, &target, relative_file.as_deref())
+            })
+            .await
+            .context("filesystem rollback task failed")?;
+            if let Err(rollback_error) = rollback {
+                return Err(anyhow::anyhow!(
+                    "could not register torrent at its new location: {error:#}; data rollback failed: {rollback_error:#}; data remains at {}",
+                    new_output_folder.display()
+                ));
+            }
+            let recovery = self
+                .add_moved_torrent(
+                    id,
+                    &old_output_folder,
+                    torrent_bytes,
+                    only_files,
+                    was_paused,
+                    trackers,
+                )
+                .await;
+            return match recovery {
+                Err(recovery_error) => Err(anyhow::anyhow!(
+                    "could not register torrent at its new location: {error:#}; data was rolled back but the torrent could not be restored: {recovery_error:#}"
+                )),
+                Ok(()) => Err(anyhow::anyhow!(
+                    "could not register torrent at its new location: {error:#}; data was rolled back and the torrent was restored"
+                )),
+            };
+        }
+
+        Ok(true)
+    }
+
+    async fn add_moved_torrent(
+        &self,
+        id: usize,
+        output_folder: &Path,
+        torrent_bytes: Vec<u8>,
+        only_files: Option<Vec<usize>>,
+        paused: bool,
+        trackers: Vec<String>,
+    ) -> Result<()> {
+        let output_folder = output_folder
+            .to_str()
+            .context("torrent destination is not valid UTF-8")?
+            .to_string();
+        let response = self
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent_bytes),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    only_files,
+                    output_folder: Some(output_folder),
+                    paused,
+                    preferred_id: Some(id),
+                    trackers: Some(trackers),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        match response {
+            AddTorrentResponse::Added(_, _) => Ok(()),
+            AddTorrentResponse::AlreadyManaged(_, _) => {
+                anyhow::bail!("torrent was re-added concurrently at a different location")
+            }
+            AddTorrentResponse::ListOnly(_) => {
+                anyhow::bail!("librqbit unexpectedly treated a moved torrent as list-only")
+            }
+        }
     }
 
     /// Apply session-wide speed limits, live. librqbit swaps the governor
@@ -1588,6 +1825,323 @@ fn added_handle(response: AddTorrentResponse) -> Result<(usize, ManagedTorrentHa
 
 fn display_name(handle: &ManagedTorrentHandle) -> String {
     sanitize_display(&handle.name().unwrap_or_else(|| "Unknown".to_string()))
+}
+
+fn move_output_folders(
+    source: &Path,
+    destination: &Path,
+    single_file: Option<&Path>,
+) -> Result<(PathBuf, PathBuf)> {
+    anyhow::ensure!(
+        !destination.as_os_str().is_empty(),
+        "destination folder cannot be empty"
+    );
+    std::fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "could not create destination folder {}",
+            destination.display()
+        )
+    })?;
+    let destination = std::fs::canonicalize(destination).with_context(|| {
+        format!(
+            "could not resolve destination folder {}",
+            destination.display()
+        )
+    })?;
+    let source = if path_exists(source)? {
+        std::fs::canonicalize(source)
+            .with_context(|| format!("could not resolve torrent folder {}", source.display()))?
+    } else if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(source)
+    };
+
+    let new_output = if single_file.is_some() {
+        destination
+    } else {
+        destination.join(
+            source
+                .file_name()
+                .context("torrent folder has no final path component")?,
+        )
+    };
+    if source == new_output {
+        return Ok((source, new_output));
+    }
+    anyhow::ensure!(
+        single_file.is_some() || !new_output.starts_with(&source),
+        "destination cannot be inside the torrent's current folder"
+    );
+    if let Some(relative_file) = single_file {
+        validate_torrent_relative_path(relative_file)?;
+        let target_file = new_output.join(relative_file);
+        anyhow::ensure!(
+            target_file == source.join(relative_file) || !path_exists(&target_file)?,
+            "destination already contains {}",
+            target_file.display()
+        );
+    } else {
+        anyhow::ensure!(
+            !path_exists(&new_output)?,
+            "destination already contains {}",
+            new_output.display()
+        );
+    }
+    Ok((source, new_output))
+}
+
+/// Move the torrent root (multi-file) or its sole payload file. A single-file
+/// torrent's output folder is often shared with other torrents, so never move
+/// that containing folder.
+fn move_torrent_payload(source: &Path, target: &Path, single_file: Option<&Path>) -> Result<()> {
+    if let Some(relative_file) = single_file {
+        validate_torrent_relative_path(relative_file)?;
+        let source_file = source.join(relative_file);
+        let target_file = target.join(relative_file);
+        if source_file == target_file {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !path_exists(&target_file)?,
+            "destination already contains {}",
+            target_file.display()
+        );
+        match std::fs::symlink_metadata(&source_file) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "torrent payload {} is not a regular file",
+                source_file.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not inspect {}", source_file.display()));
+            }
+        }
+        if let Some(parent) = target_file.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        move_path(&source_file, &target_file, false)
+    } else {
+        if source == target {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !path_exists(target)?,
+            "destination already contains {}",
+            target.display()
+        );
+        if !path_exists(source)? {
+            std::fs::create_dir(target)
+                .with_context(|| format!("could not create {}", target.display()))?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            source.is_dir(),
+            "torrent data folder {} is not a directory",
+            source.display()
+        );
+        move_path(source, target, true)
+    }
+}
+
+fn validate_torrent_relative_path(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_relative()
+            && !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "torrent contains an unsafe file path"
+    );
+    Ok(())
+}
+
+fn move_path(source: &Path, target: &Path, directory: bool) -> Result<()> {
+    if !directory {
+        return match std::fs::hard_link(source, target) {
+            Ok(()) => {
+                if let Err(error) = std::fs::remove_file(source) {
+                    tracing::warn!(
+                        "Linked torrent file at {} but could not remove the original {}: {error}",
+                        target.display(),
+                        source.display()
+                    );
+                }
+                Ok(())
+            }
+            Err(error) if path_exists(target)? => Err(error)
+                .with_context(|| format!("destination already contains {}", target.display())),
+            Err(_) => copy_file_across_devices(source, target),
+        };
+    }
+
+    match std::fs::rename(source, target) {
+        Ok(()) => return Ok(()),
+        Err(error) if is_cross_device_error(&error) => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not move {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            });
+        }
+    }
+
+    if directory {
+        copy_directory_across_devices(source, target)
+    } else {
+        copy_file_across_devices(source, target)
+    }
+}
+
+fn is_cross_device_error(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(17)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn path_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("could not inspect {}", path.display())),
+    }
+}
+
+static MOVE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn temporary_sibling(target: &Path) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .context("destination has no parent directory")?;
+    let name = target
+        .file_name()
+        .context("destination has no file name")?
+        .to_string_lossy();
+    for _ in 0..100 {
+        let id = MOVE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{name}.torrenttui-moving-{}-{id}",
+            std::process::id()
+        ));
+        if !path_exists(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "could not allocate a temporary destination near {}",
+        target.display()
+    )
+}
+
+fn copy_file_across_devices(source: &Path, target: &Path) -> Result<()> {
+    let mut created_target = false;
+    let copy_result = (|| -> Result<()> {
+        let mut input = std::fs::File::open(source)
+            .with_context(|| format!("could not open {}", source.display()))?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)
+            .with_context(|| format!("could not create {}", target.display()))?;
+        created_target = true;
+        std::io::copy(&mut input, &mut output)
+            .with_context(|| format!("could not copy {}", source.display()))?;
+        output.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        if created_target {
+            if let Err(cleanup) = std::fs::remove_file(target) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "Could not remove incomplete move file {}: {cleanup}",
+                        target.display()
+                    );
+                }
+            }
+        }
+        return Err(error);
+    }
+    if let Err(error) = std::fs::remove_file(source) {
+        tracing::warn!(
+            "Copied torrent file to {} but could not remove the original {}: {error}",
+            target.display(),
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_directory_across_devices(source: &Path, target: &Path) -> Result<()> {
+    let temporary = temporary_sibling(target)?;
+    std::fs::create_dir(&temporary)
+        .with_context(|| format!("could not create {}", temporary.display()))?;
+    let copy_result = (|| -> Result<()> {
+        for entry in walkdir::WalkDir::new(source).min_depth(1) {
+            let entry = entry.with_context(|| format!("could not read {}", source.display()))?;
+            let relative = entry.path().strip_prefix(source)?;
+            let copied = temporary.join(relative);
+            let file_type = entry.file_type();
+            anyhow::ensure!(
+                !file_type.is_symlink(),
+                "refusing to move symlink {}",
+                entry.path().display()
+            );
+            if file_type.is_dir() {
+                std::fs::create_dir_all(&copied)
+                    .with_context(|| format!("could not create {}", copied.display()))?;
+            } else if file_type.is_file() {
+                if let Some(parent) = copied.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("could not create {}", parent.display()))?;
+                }
+                std::fs::copy(entry.path(), &copied).with_context(|| {
+                    format!(
+                        "could not copy {} to {}",
+                        entry.path().display(),
+                        copied.display()
+                    )
+                })?;
+            } else {
+                anyhow::bail!("refusing to move special file {}", entry.path().display());
+            }
+        }
+        std::fs::rename(&temporary, target)
+            .with_context(|| format!("could not place copied folder at {}", target.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        if let Err(cleanup) = std::fs::remove_dir_all(&temporary) {
+            tracing::warn!(
+                "Could not remove temporary move folder {}: {cleanup}",
+                temporary.display()
+            );
+        }
+        return Err(error);
+    }
+    if let Err(error) = std::fs::remove_dir_all(source) {
+        tracing::warn!(
+            "Copied torrent folder to {} but could not remove the original {}: {error}",
+            target.display(),
+            source.display()
+        );
+    }
+    Ok(())
 }
 
 /// The picker's view of a torrent's files. Padding files (BEP 47) are
@@ -2524,6 +3078,44 @@ pub async fn run_engine(
                                 .await;
                         }
                     }
+                    Some(EngineCommand::MoveMany { ids, destination }) => {
+                        let _ = msg_tx
+                            .send(format!("Moving {} torrent(s)…", ids.len()))
+                            .await;
+                        let mut moved = 0usize;
+                        let mut skipped = 0usize;
+                        let mut failures = 0usize;
+                        let mut first_error = String::new();
+                        for id in ids {
+                            match engine.move_torrent(id, &destination).await {
+                                Ok(true) => moved += 1,
+                                Ok(false) => skipped += 1,
+                                Err(e) => {
+                                    tracing::error!("Failed to move torrent {}: {e:#}", id);
+                                    if failures == 0 {
+                                        first_error = e.to_string();
+                                    }
+                                    failures += 1;
+                                }
+                            }
+                        }
+                        if moved > 0 {
+                            let _ = msg_tx
+                                .send(format!("✓ Moved {moved} torrent(s) to {}", destination.display()))
+                                .await;
+                        } else if skipped > 0 && failures == 0 {
+                            let _ = msg_tx
+                                .send("Selected torrent(s) are already in that folder".to_string())
+                                .await;
+                        }
+                        if failures > 0 {
+                            let _ = msg_tx
+                                .send(format!(
+                                    "⚠ Move failed for {failures} torrent(s): {first_error}"
+                                ))
+                                .await;
+                        }
+                    }
                     Some(EngineCommand::PauseAll) => {
                         // Pauses every handle and lets the benign-error filter
                         // absorb the already-paused ones — real failures get
@@ -2638,6 +3230,8 @@ pub async fn run_engine(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     /// A multi-file `.torrent` with a BEP 47 padding file between its two
     /// real files, bencoded by hand (keys sorted, as the format requires).
     fn padded_torrent() -> Vec<u8> {
@@ -3231,6 +3825,152 @@ mod tests {
         t.extend(std::iter::repeat_n(0u8, hash_bytes));
         t.extend_from_slice(b"ee");
         t
+    }
+
+    async fn test_engine(downloads: &Path, session_dir: &Path) -> super::TorrentEngine {
+        let plan = super::NetworkPlan {
+            dht: false,
+            listen_port: None,
+            upnp: false,
+            disable_lsd: true,
+            proxy_url: None,
+            blocklist_url: None,
+            bind_interface: None,
+        };
+        let session = super::Session::new_with_opts(
+            downloads.to_path_buf(),
+            super::build_session_opts(&plan, super::LimitsConfig::default(), session_dir.into()),
+        )
+        .await
+        .unwrap();
+        super::TorrentEngine {
+            session,
+            proxy_active: false,
+            privacy_status: None,
+            migration_note: None,
+            capture: super::HealthCapture::new(),
+            utp_enabled: false,
+            started_at: std::time::Instant::now(),
+            pending_adds: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_pending_ticket: std::sync::atomic::AtomicU64::new(0),
+            download_dir: downloads.to_path_buf(),
+            preview_tasks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            failed_adds: std::sync::atomic::AtomicU64::new(0),
+            mutation_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn moving_single_file_does_not_move_other_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("downloads");
+        let destination = dir.path().join("new");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("movie.mkv"), b"payload").unwrap();
+        std::fs::write(source.join("other.mkv"), b"leave here").unwrap();
+
+        super::move_torrent_payload(
+            &source,
+            &destination,
+            Some(std::path::Path::new("movie.mkv")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("movie.mkv")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            std::fs::read(source.join("other.mkv")).unwrap(),
+            b"leave here"
+        );
+        assert!(!source.join("movie.mkv").exists());
+    }
+
+    #[test]
+    fn move_refuses_to_overwrite_an_existing_destination_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("downloads");
+        let destination = dir.path().join("new");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(source.join("movie.mkv"), b"original").unwrap();
+        std::fs::write(destination.join("movie.mkv"), b"keep").unwrap();
+
+        let error = super::move_output_folders(
+            &source,
+            &destination,
+            Some(std::path::Path::new("movie.mkv")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("destination already contains"));
+        assert_eq!(
+            std::fs::read(source.join("movie.mkv")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("movie.mkv")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn moving_multi_file_torrent_keeps_its_content_folder_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("downloads").join("release");
+        let destination = dir.path().join("new");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/file.bin"), b"payload").unwrap();
+
+        let (source, target) = super::move_output_folders(&source, &destination, None).unwrap();
+        super::move_torrent_payload(&source, &target, None).unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("nested/file.bin")).unwrap(),
+            b"payload"
+        );
+        assert!(!source.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn moving_torrent_preserves_pause_state_and_partial_data() {
+        for was_paused in [true, false] {
+            const NAME: &str = "move-check.bin";
+            let dir = tempfile::tempdir().unwrap();
+            let downloads = dir.path().join("downloads");
+            let destination = dir.path().join("new-location");
+            std::fs::create_dir_all(&downloads).unwrap();
+            let engine = test_engine(&downloads, &dir.path().join("session")).await;
+            let response = engine
+                .session()
+                .add_torrent(
+                    super::AddTorrent::from_bytes(single_file_torrent(NAME, 1)),
+                    Some(super::AddTorrentOptions {
+                        overwrite: true,
+                        paused: true,
+                        trackers: Some(vec!["http://127.0.0.1:9/announce".to_string()]),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let (id, handle, _) = super::added_handle(response).unwrap();
+            handle.wait_until_initialized().await.unwrap();
+            std::fs::write(downloads.join(NAME), b"x").unwrap();
+            if !was_paused {
+                engine.session().unpause(&handle).await.unwrap();
+            }
+
+            assert!(engine.move_torrent(id, &destination).await.unwrap());
+
+            let moved = engine.get_handle(id).expect("same torrent id is retained");
+            assert_eq!(moved.is_paused(), was_paused);
+            assert_eq!(moved.output_folder(), destination);
+            assert_eq!(std::fs::read(destination.join(NAME)).unwrap(), b"x");
+            assert!(!downloads.join(NAME).exists());
+            engine.session().stop().await;
+        }
     }
 
     /// On Windows a download's file has to be marked sparse before it grows,
