@@ -169,7 +169,9 @@ torrenttui --stop
 | `Ctrl+C` | Quit (double press to force) |
 
 Deleting prompts for `[K]eep files` or `[D]elete files` — that choice is about the
-*downloaded data*. Either way, if a watch folder is configured, the matching
+*downloaded data*. `[K]eep files` keeps what you downloaded and cleans up what is left
+of the files you didn't select (see [below](#choosing-files-and-a-folder-before-downloading));
+the dialog says how many. Either way, if a watch folder is configured, the matching
 `.torrent`/`.magnet` is removed from it so the torrent does not come back on the next
 launch. See [Watch folder](#watch-folder).
 
@@ -239,9 +241,15 @@ Good to know:
   creates every file of a torrent when it starts it, and a piece that
   straddles a ticked and an unticked file has to be downloaded whole to be
   checked, so librqbit writes all of it, the unticked file's part included.
-  Nothing else of an unticked file is downloaded. Some clients keep those
-  boundary bytes in a separate parts file instead; librqbit does not yet
-  ([#109](https://github.com/thijsvos/torrentTUI/issues/109)).
+  Nothing else of an unticked file is downloaded, and on disks with sparse
+  files (NTFS, ext4, APFS) such a file takes up at most a piece at either
+  end, whatever size it shows. Some clients keep those boundary bytes in a separate parts file
+  instead; librqbit does not yet
+  ([#109](https://github.com/thijsvos/torrentTUI/issues/109)). They have to
+  stay while the torrent is in the list, because it seeds those pieces.
+  Deleting it with `[K]eep files` cleans them up: every unticked file that
+  is not complete goes, along with any folder that leaves empty. A complete
+  one stays.
 - `A` works on a search result too: choose its files and folder, and `Enter`
   takes you back to the results.
 - The recent folders (the last ten) are kept in `recent_folders.json` next to

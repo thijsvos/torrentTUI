@@ -17,6 +17,7 @@
 
 use crate::config::Config;
 use crate::engine::health_capture::HealthCapture;
+use crate::engine::leftovers::{self, FileFacts, Leftovers};
 use crate::engine::watch;
 use crate::types::{
     ConnectHealth, DhtHealth, FileInfo, NetworkHealth, PeerBreakdown, PeerInfo, PreparedTorrent,
@@ -1216,6 +1217,17 @@ impl TorrentEngine {
                     Vec::new()
                 };
 
+                // `None` from `only_files` is librqbit's "every file", the
+                // common case, so most torrents stop at the first read.
+                let leftover_files = handle.only_files().map_or(0, |only| {
+                    handle
+                        .with_metadata(|meta| {
+                            let facts = file_facts(&meta.file_infos, &stats.file_progress);
+                            leftovers::leftover_indices(&facts, Some(&only)).len()
+                        })
+                        .unwrap_or(0)
+                });
+
                 TorrentInfo {
                     id,
                     name,
@@ -1235,10 +1247,17 @@ impl TorrentEngine {
                     piece_length,
                     content_path,
                     health,
+                    leftover_files,
                 }
             })
             .collect()
         })
+    }
+
+    /// What deleting this torrent with "Keep files" cleans up. Read before
+    /// the delete: the handle that knows the files is gone afterwards.
+    pub fn leftovers(&self, hash: Id20) -> Option<Leftovers> {
+        leftovers_of(&self.session.get(TorrentIdOrHash::Hash(hash))?)
     }
 
     /// Session-wide facts for the doctor. Allocates one `stats_snapshot` and
@@ -1991,6 +2010,98 @@ async fn report_op_error(
 /// Create/Modify, and an add already in flight is holding the file's bytes in
 /// memory anyway. The trade-off is that this is best-effort: a crash between
 /// the delete and the walk leaves the file behind.
+/// The leftover rule's view of a torrent's files, in librqbit's file order.
+fn file_facts(infos: &librqbit::FileInfos, progress: &[u64]) -> Vec<FileFacts> {
+    infos
+        .iter()
+        .enumerate()
+        .map(|(i, fi)| FileFacts {
+            len: fi.len,
+            progress: progress.get(i).copied().unwrap_or(0),
+            padding: fi.attrs.padding,
+        })
+        .collect()
+}
+
+/// The files a "Keep files" delete of this torrent removes (see
+/// [`leftovers`]). `None` when there are none: every file is selected, or the
+/// metadata has not resolved.
+fn leftovers_of(handle: &ManagedTorrentHandle) -> Option<Leftovers> {
+    let only = handle.only_files()?;
+    let progress = handle.stats().file_progress;
+    handle
+        .with_metadata(|meta| {
+            let facts = file_facts(&meta.file_infos, &progress);
+            Leftovers {
+                root: handle.output_folder().to_path_buf(),
+                files: leftovers::leftover_indices(&facts, Some(&only))
+                    .into_iter()
+                    .map(|i| meta.file_infos[i].relative_filename.clone())
+                    .collect(),
+            }
+        })
+        .ok()
+        .filter(|l| !l.files.is_empty())
+}
+
+/// Remove what is left of unselected files after "Keep files" deletes, off
+/// the engine loop (a torrent can have thousands of files). Like the watch
+/// cleanup, it reports in at most two status messages for the whole batch.
+fn spawn_leftover_cleanup(
+    tasks: &mut tokio::task::JoinSet<()>,
+    batch: Vec<Leftovers>,
+    msg_tx: &mpsc::Sender<String>,
+) {
+    while tasks.try_join_next().is_some() {}
+    if batch.is_empty() {
+        return;
+    }
+    let msg_tx = msg_tx.clone();
+    tasks.spawn(async move {
+        let outcome = match tokio::task::spawn_blocking(move || {
+            let mut total = leftovers::Outcome::default();
+            for item in &batch {
+                let outcome = leftovers::remove(item);
+                total.removed += outcome.removed;
+                total.errors.extend(outcome.errors);
+            }
+            total
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!("leftover cleanup task failed: {}", e);
+                return;
+            }
+        };
+        match outcome.removed {
+            0 => {}
+            1 => {
+                let _ = msg_tx
+                    .send("Cleaned up 1 file you didn't select".to_string())
+                    .await;
+            }
+            n => {
+                let _ = msg_tx
+                    .send(format!("Cleaned up {n} files you didn't select"))
+                    .await;
+            }
+        }
+        if !outcome.errors.is_empty() {
+            for err in &outcome.errors {
+                tracing::warn!("leftover cleanup: {}", err);
+            }
+            let _ = msg_tx
+                .send(format!(
+                    "\u{26a0} Could not clean up {} file(s) you didn't select; see the log",
+                    outcome.errors.len()
+                ))
+                .await;
+        }
+    });
+}
+
 fn spawn_watch_cleanup(
     tasks: &mut tokio::task::JoinSet<()>,
     cleanup: &Option<WatchCleanup>,
@@ -2430,6 +2541,13 @@ pub async fn run_engine(
                         // stay quiet rather than surfacing librqbit's
                         // "no such torrent in db".
                         if let Some(hash) = engine.info_hash(id) {
+                            // "Keep files" keeps what was downloaded, not what
+                            // is left of the files the user deselected (#109).
+                            let leftovers = if delete_files {
+                                None
+                            } else {
+                                engine.leftovers(hash)
+                            };
                             if let Err(e) = engine
                                 .delete(TorrentIdOrHash::Hash(hash), delete_files)
                                 .await
@@ -2450,6 +2568,11 @@ pub async fn run_engine(
                                     &mut cleanup_tasks,
                                     &watch_cleanup,
                                     HashSet::from([hash.as_string()]),
+                                    &msg_tx,
+                                );
+                                spawn_leftover_cleanup(
+                                    &mut cleanup_tasks,
+                                    leftovers.into_iter().collect(),
                                     &msg_tx,
                                 );
                             }
@@ -2493,9 +2616,15 @@ pub async fn run_engine(
                         // loop could pick up a recycled id's new torrent.
                         let batch: HashMap<usize, Id20> = engine.info_hashes(&ids);
                         let mut deleted_hashes: HashSet<String> = HashSet::new();
+                        let mut leftover_batch: Vec<Leftovers> = Vec::new();
                         let mut failures = 0usize;
                         for id in ids {
                             if let Some(&hash) = batch.get(&id) {
+                                let leftovers = if delete_files {
+                                    None
+                                } else {
+                                    engine.leftovers(hash)
+                                };
                                 if let Err(e) = engine
                                     .delete(TorrentIdOrHash::Hash(hash), delete_files)
                                     .await
@@ -2505,6 +2634,7 @@ pub async fn run_engine(
                                 }
                                 if !engine.is_present(hash) {
                                     deleted_hashes.insert(hash.as_string());
+                                    leftover_batch.extend(leftovers);
                                 }
                             }
                             finished_set.remove(&id);
@@ -2518,6 +2648,7 @@ pub async fn run_engine(
                             deleted_hashes,
                             &msg_tx,
                         );
+                        spawn_leftover_cleanup(&mut cleanup_tasks, leftover_batch, &msg_tx);
                         if failures > 0 {
                             let _ = msg_tx
                                 .send(format!("\u{26a0} {} torrent(s) failed to delete", failures))
@@ -3307,6 +3438,111 @@ mod tests {
                  the first write past its start (#107)"
             );
         }
+
+        session.stop().await;
+    }
+
+    /// A multi-file `.torrent` named `name`, built like `single_file_torrent`:
+    /// no tracker, zero piece hashes, 1 MiB pieces. Paths use `/`.
+    fn multi_file_torrent(name: &str, files: &[(&str, u64)]) -> Vec<u8> {
+        const PIECE: u64 = 1 << 20;
+        let total: u64 = files.iter().map(|&(_, len)| len).sum();
+        let hash_bytes = total.div_ceil(PIECE) as usize * 20;
+        let mut t = b"d4:infod5:filesl".to_vec();
+        for (path, len) in files {
+            t.extend_from_slice(format!("d6:lengthi{len}e4:pathl").as_bytes());
+            for seg in path.split('/') {
+                t.extend_from_slice(format!("{}:{seg}", seg.len()).as_bytes());
+            }
+            t.extend_from_slice(b"ee");
+        }
+        t.extend_from_slice(
+            format!(
+                "e4:name{}:{name}12:piece lengthi{PIECE}e6:pieces{hash_bytes}:",
+                name.len()
+            )
+            .as_bytes(),
+        );
+        t.extend(std::iter::repeat_n(0u8, hash_bytes));
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    /// #109: librqbit creates every file of a torrent, selected or not, and
+    /// leaves them all behind when the torrent is deleted with its files
+    /// kept. The leftovers read from the handle before the delete are exactly
+    /// the unselected files, and removing them afterwards leaves the selected
+    /// file and the torrent's folder alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keep_files_delete_cleans_up_what_is_left_of_unselected_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let plan = NetworkPlan {
+            dht: false,
+            listen_port: None,
+            upnp: false,
+            disable_lsd: true,
+            proxy_url: None,
+            blocklist_url: None,
+            bind_interface: None,
+        };
+        let opts = build_session_opts(&plan, LimitsConfig::default(), dir.path().join("session"));
+        let session = Session::new_with_opts(downloads.clone(), opts)
+            .await
+            .unwrap();
+        let files = [
+            ("S01/e01.mkv", 3 << 20),
+            ("S01/e02.mkv", 2 << 20),
+            ("S02/e01.mkv", 1 << 20),
+        ];
+        let response = session
+            .add_torrent(
+                AddTorrent::from_bytes(multi_file_torrent("Show", &files)),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    only_files: Some(vec![0]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let (_, handle, _) = added_handle(response).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            handle.wait_until_initialized(),
+        )
+        .await
+        .expect("the torrent never finished initializing")
+        .unwrap();
+
+        let root = handle.output_folder().to_path_buf();
+        for (path, _) in files {
+            assert!(root.join(path).is_file(), "librqbit did not create {path}");
+        }
+
+        let leftovers = leftovers_of(&handle).expect("two files were not selected");
+        assert_eq!(leftovers.root, root);
+        assert_eq!(
+            leftovers.files,
+            vec![PathBuf::from("S01/e02.mkv"), PathBuf::from("S02/e01.mkv")]
+        );
+
+        session
+            .delete(TorrentIdOrHash::Hash(handle.info_hash()), false)
+            .await
+            .unwrap();
+        drop(handle);
+        let outcome = leftovers::remove(&leftovers);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.removed, 2);
+        assert!(
+            root.join("S01/e01.mkv").is_file(),
+            "the selected file stays"
+        );
+        assert!(!root.join("S01/e02.mkv").exists());
+        assert!(!root.join("S02").exists(), "the emptied folder goes");
+        assert!(root.is_dir(), "the torrent's own folder stays");
 
         session.stop().await;
     }

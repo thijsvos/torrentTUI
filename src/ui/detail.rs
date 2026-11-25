@@ -853,6 +853,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            leftover_files: 0,
         }
     }
 
