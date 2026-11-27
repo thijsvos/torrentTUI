@@ -898,7 +898,7 @@ mod tests {
             "peer counts missing: {text}"
         );
         // 393_216_000 / 786_432_000 is exactly half.
-        assert!(text.contains("50.0%"), "progress missing: {text}");
+        assert!(text.contains("50.0"), "progress missing: {text}");
     }
 
     #[test]

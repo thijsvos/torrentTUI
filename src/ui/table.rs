@@ -10,13 +10,13 @@ use crate::app::App;
 use crate::theme::Theme;
 use crate::types::TorrentStatus;
 use crate::ui::layout::{format_eta, format_size, format_speed};
-use crate::ui::progress::{render_progress_bar, SPINNER_FRAMES};
+use crate::ui::progress::{render_progress_spans, SPINNER_FRAMES};
 
 const HEADER_LABELS: [&str; 9] = [
     "#",
     "Name",
     "Size",
-    "Progress",
+    "Progress %",
     "\u{2193} Speed",
     "\u{2191} Speed",
     "Peers",
@@ -24,24 +24,24 @@ const HEADER_LABELS: [&str; 9] = [
     "Status",
 ];
 
-/// Cells in the progress bar; the Progress column is this plus " 100.0%".
+/// Cells in the progress bar, including the centred numeric percentage.
 const BAR_CELLS: usize = 11;
 
 /// Each fixed column is exactly as wide as the widest thing it renders —
-/// "1023.9 KB/s", "999h 59m", "Fetching Metadata" — because ratatui honours
+/// "1023.9 KB/s", "999h 59m", "Downloading" — because ratatui honours
 /// Name's `Min` before any `Length`: when the row is too wide it clips the
 /// fixed columns, not the name. Sized so the whole row, borders and the
 /// selection marker included, fits 120 columns with Name at its minimum.
 const COLUMN_WIDTHS: [Constraint; 9] = [
-    Constraint::Length(5),                    // #
-    Constraint::Min(20),                      // Name
-    Constraint::Length(10),                   // Size
-    Constraint::Length(BAR_CELLS as u16 + 7), // Progress
-    Constraint::Length(11),                   // ↓ Speed
-    Constraint::Length(11),                   // ↑ Speed
-    Constraint::Length(8),                    // Peers
-    Constraint::Length(8),                    // ETA
-    Constraint::Length(17),                   // Status
+    Constraint::Length(5),                // #
+    Constraint::Min(20),                  // Name
+    Constraint::Length(10),               // Size
+    Constraint::Length(BAR_CELLS as u16), // Progress %
+    Constraint::Length(11),               // ↓ Speed
+    Constraint::Length(11),               // ↑ Speed
+    Constraint::Length(8),                // Peers
+    Constraint::Length(8),                // ETA
+    Constraint::Length(11),               // Status
 ];
 
 /// Height of the strip that lists magnets still waiting for metadata: two
@@ -152,26 +152,36 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     // Build rows from sorted view (all owned data)
     let rows: Vec<Row> = sorted
         .iter()
-        .map(|torrent| {
+        .enumerate()
+        .map(|(row_index, torrent)| {
             let is_marked = marked_ids.contains(&torrent.id);
+            let is_selected = app.table_state.selected() == Some(row_index);
+            let row_bg = if is_selected {
+                Some(theme.selection_bg)
+            } else if is_marked {
+                Some(theme.bg_element)
+            } else {
+                None
+            };
             let percent = torrent.progress_percent();
-            let progress_bar = match torrent.status {
+            let progress_cell = match torrent.status {
                 TorrentStatus::FetchingMetadata => {
                     let spinner = SPINNER_FRAMES[spinner_tick];
-                    format!("{} Fetching...", spinner)
+                    Cell::from(format!("{} Fetching...", spinner))
+                        .style(Style::default().fg(theme.accent))
                 }
-                _ => render_progress_bar(percent, BAR_CELLS),
+                _ => {
+                    let fill = theme.progress_color(percent);
+                    Cell::from(Line::from(render_progress_spans(
+                        percent, BAR_CELLS, fill, row_bg,
+                    )))
+                }
             };
 
             let (status_text, status_style) = if stalled_ids.contains(&torrent.id) {
                 stalled_cell_style(theme)
             } else {
                 status_cell_style(&torrent.status, theme)
-            };
-
-            let progress_style = match torrent.status {
-                TorrentStatus::FetchingMetadata => Style::default().fg(theme.accent),
-                _ => Style::default().fg(theme.progress_color(percent)),
             };
 
             let id_text = if is_marked {
@@ -184,7 +194,7 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                 Cell::from(id_text),
                 Cell::from(torrent.name.clone()),
                 Cell::from(format_size(torrent.size_bytes)),
-                Cell::from(progress_bar).style(progress_style),
+                progress_cell,
                 Cell::from(format_speed(torrent.download_speed)),
                 Cell::from(format_speed(torrent.upload_speed)),
                 Cell::from(format!(
@@ -229,14 +239,16 @@ pub fn render_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
 /// pseudo-status any more — a limited torrent simply shows Downloading (or
 /// Seeding) at a capped speed.
 pub fn status_cell_style(status: &TorrentStatus, theme: Theme) -> (String, Style) {
-    let style = match status {
-        TorrentStatus::Downloading => Style::default().fg(theme.info),
-        TorrentStatus::Seeding => Style::default().fg(theme.success),
-        TorrentStatus::Paused => Style::default().fg(theme.warning),
-        TorrentStatus::FetchingMetadata => Style::default().fg(theme.accent),
-        TorrentStatus::Error(_) => Style::default().fg(theme.error),
+    let (text, style) = match status {
+        TorrentStatus::Downloading => ("Downloading".to_string(), Style::default().fg(theme.info)),
+        TorrentStatus::Seeding => ("Seeding".to_string(), Style::default().fg(theme.success)),
+        TorrentStatus::Paused => ("Paused".to_string(), Style::default().fg(theme.warning)),
+        TorrentStatus::FetchingMetadata => {
+            ("Fetching".to_string(), Style::default().fg(theme.accent))
+        }
+        TorrentStatus::Error(_) => (status.to_string(), Style::default().fg(theme.error)),
     };
-    (status.to_string(), style)
+    (text, style)
 }
 
 /// The Status cell for a downloading torrent that has not received a byte in
@@ -397,11 +409,12 @@ mod tests {
         );
         for cell in [
             "debian-13.1.0-amd64",
-            "1.0%",
+            "1.0",
+            "Progress %",
             "999/9999",
             "999h 59m",
             "Downloading",
-            "Fetching Metadata",
+            "Fetching",
         ] {
             assert!(text.contains(cell), "{cell:?} clipped: {text}");
         }
