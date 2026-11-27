@@ -688,6 +688,7 @@ mod tests {
             piece_length: None,
             content_path: None,
             health: TorrentHealth::default(),
+            leftover_files: 0,
         }
     }
 

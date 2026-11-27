@@ -1475,6 +1475,7 @@ async fn run_app(
                             f.area(),
                             &label,
                             app.watch_dir_configured,
+                            app.delete_leftover_count(),
                             app.theme,
                         );
                     }
@@ -3625,6 +3626,7 @@ mod tests {
             piece_length: None,
             content_path: None,
             health: types::TorrentHealth::default(),
+            leftover_files: 0,
         }
     }
 

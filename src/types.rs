@@ -99,6 +99,11 @@ pub struct TorrentInfo {
     pub content_path: Option<String>,
     /// The raw material for the stall doctor — see [`TorrentHealth`].
     pub health: TorrentHealth,
+    /// How many files a "Keep files" delete would clean up: unselected files
+    /// that are not complete (see `engine::leftovers`). Filled for every
+    /// torrent, like `health`, because the delete dialog states it; it is
+    /// zero without reading anything for a torrent with every file selected.
+    pub leftover_files: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +581,7 @@ mod tests {
             piece_length: None,
             content_path: None,
             health: TorrentHealth::default(),
+            leftover_files: 0,
         }
     }
 

@@ -18,19 +18,33 @@ use crate::ui::util::truncate;
 /// note also shows in the cases where the engine disables cleanup at startup
 /// (watch folder equal to the download dir, unavailable, or a home/root path).
 /// Erring toward the warning is deliberate; it is not a guarantee.
+///
+/// `leftovers` is how many files `[K]eep files` cleans up (what is left of
+/// unselected files, #109); when there are any, a line says so, because
+/// "keep" removing files must not come as a surprise.
 pub fn render_delete_dialog(
     f: &mut Frame,
     area: Rect,
     torrent_name: &str,
     watch_dir_configured: bool,
+    leftovers: usize,
     theme: Theme,
 ) {
     let mut popup = centered_rect(50, 25, area);
     // The percentage height is only 6 rows on an 80x24 terminal, which is
-    // exactly the borders plus the four base lines. Grow it so the watch-folder
-    // note is not clipped off the bottom.
-    let needed = if watch_dir_configured { 8 } else { 6 };
+    // exactly the borders plus the four base lines. Grow it so the optional
+    // notes are not clipped off the bottom.
+    let needed = 6 + 2 * u16::from(watch_dir_configured) + u16::from(leftovers > 0);
     popup.height = popup.height.max(needed).min(area.height);
+    // Half of an 80-column terminal is 40 columns, which cuts either note off
+    // mid-sentence; same idea as the quit dialog's floor.
+    if watch_dir_configured || leftovers > 0 {
+        popup.width = popup.width.max(56.min(area.width));
+    }
+    // Re-centre: `centered_rect` placed the popup for its original size, and
+    // a grown one would otherwise run off the right or bottom edge.
+    popup.x = area.x + area.width.saturating_sub(popup.width) / 2;
+    popup.y = area.y + area.height.saturating_sub(popup.height) / 2;
     f.render_widget(Clear, popup);
 
     let mut text = vec![
@@ -46,6 +60,18 @@ pub fn render_delete_dialog(
             "  Also removes the .torrent from your watch folder",
             Style::default().fg(theme.muted),
         )));
+    }
+
+    match leftovers {
+        0 => {}
+        1 => text.push(Line::from(Span::styled(
+            "  Keep also cleans up 1 file you didn't select",
+            Style::default().fg(theme.muted),
+        ))),
+        n => text.push(Line::from(Span::styled(
+            format!("  Keep also cleans up {n} files you didn't select"),
+            Style::default().fg(theme.muted),
+        ))),
     }
 
     text.extend([
@@ -286,6 +312,81 @@ mod tests {
         // than index past the area.
         let _ = screen(10, 4, true);
         let _ = screen(1, 1, false);
+    }
+
+    fn delete_screen(watch: bool, leftovers: usize) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|f| render_delete_dialog(f, f.area(), "Show", watch, leftovers, Theme::system()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn delete_dialog_says_when_keep_cleans_up_unselected_files() {
+        // #109: "keep" removing files must not come as a surprise.
+        let none = delete_screen(false, 0);
+        assert!(!none.contains("cleans up"), "{none}");
+        let one = delete_screen(false, 1);
+        assert!(
+            one.contains("Keep also cleans up 1 file you didn't select"),
+            "{one}"
+        );
+        let many = delete_screen(true, 3);
+        assert!(
+            many.contains("Keep also cleans up 3 files you didn't select"),
+            "{many}"
+        );
+        assert!(many.contains("watch folder"), "{many}");
+        // The answer keys survive both notes.
+        assert!(
+            many.contains("[K]") && many.contains("[D]") && many.contains("[C]"),
+            "{many}"
+        );
+    }
+
+    #[test]
+    fn delete_dialog_fits_both_notes_on_a_small_terminal() {
+        // 80x24: the percentage height alone is 6 rows, the base content.
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render_delete_dialog(f, f.area(), "Show", true, 2, Theme::system()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("[K]"), "{text}");
+        assert!(
+            text.contains("Keep also cleans up 2 files you didn't select"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Also removes the .torrent from your watch folder"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn delete_dialog_stays_on_screen_on_a_narrow_terminal() {
+        for (w, h) in [(60, 20), (30, 8), (10, 4), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    render_delete_dialog(f, area, "Show", true, 5, Theme::system());
+                })
+                .unwrap();
+        }
     }
 
     fn quit_screen(resolving: usize) -> String {

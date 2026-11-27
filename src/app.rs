@@ -1696,6 +1696,22 @@ impl App {
     pub fn marked_count(&self) -> usize {
         self.marked_ids.len()
     }
+
+    /// How many files the delete dialog's "Keep files" would clean up: what
+    /// is left of unselected files, summed over the torrents the delete acts
+    /// on — the marked ones when there are marks (filtered out of view or
+    /// not), otherwise the selected row. Same targets as `handle_delete_mode`.
+    pub fn delete_leftover_count(&self) -> usize {
+        if self.has_marks() {
+            self.torrents
+                .iter()
+                .filter(|t| self.marked_ids.contains(&t.id))
+                .map(|t| t.leftover_files)
+                .sum()
+        } else {
+            self.selected_torrent().map_or(0, |t| t.leftover_files)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1723,10 +1739,37 @@ mod tests {
             piece_length: None,
             content_path: None,
             health: crate::types::TorrentHealth::default(),
+            leftover_files: 0,
         }
     }
 
     // -- the stall clock ------------------------------------------------------
+
+    #[test]
+    fn delete_leftover_count_follows_the_delete_targets() {
+        // The dialog's "Keep also cleans up N files" must count the torrents
+        // `handle_delete_mode` will delete: the selected row without marks,
+        // every marked torrent with them, including ones the filter hides.
+        let mut app = App::new();
+        let mut a = make_torrent(1, "alpha", 1000, TorrentStatus::Seeding);
+        a.leftover_files = 2;
+        let mut b = make_torrent(2, "beta", 1000, TorrentStatus::Seeding);
+        b.leftover_files = 5;
+        let c = make_torrent(3, "gamma", 1000, TorrentStatus::Seeding);
+        app.handle_state_push_at(vec![a, b, c], Instant::now());
+
+        app.selected_index = app
+            .sorted_torrents()
+            .iter()
+            .position(|t| t.id == 2)
+            .unwrap();
+        assert_eq!(app.delete_leftover_count(), 5);
+
+        app.marked_ids = HashSet::from([1, 3]);
+        assert_eq!(app.delete_leftover_count(), 2, "marks win over the cursor");
+        app.marked_ids = HashSet::from([1, 2]);
+        assert_eq!(app.delete_leftover_count(), 7);
+    }
 
     #[test]
     fn stall_clock_counts_only_while_bytes_stand_still() {
